@@ -21,9 +21,16 @@ ema:
   min_value: 0.0
   power: 0.75
   update_after_step: 0
+
 exp_name: default
-horizon: 10
+horizon: 16
 keypoint_visible_rate: 1.0
+n_action_steps: 8
+n_latency_steps: 0
+n_obs_steps: 2
+name: train_diffusion_transformer_hybrid
+obs_as_cond: true
+
 logging:
   group: null
   id: null
@@ -35,11 +42,7 @@ logging:
 multi_run:
   run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
-n_action_steps: 8
-n_latency_steps: 0
-n_obs_steps: 2
-name: train_diffusion_transformer_hybrid
-obs_as_cond: true
+
 optimizer:
   betas:
   - 0.9
@@ -51,7 +54,7 @@ past_action_visible: false
 policy:
   # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
-  use_da: true
+  use_da: false
   domain_adapt:
     src_ckpt: "data/experiments/image/pusht/diffusion_policy_transformer/train_0/epoch=0100-test_mean_score=0.748.ckpt"
 
@@ -98,13 +101,13 @@ policy:
   - 84
   - 84
   eval_fixed_crop: true
-  horizon: 10
+  horizon: ${horizon}
   n_action_steps: 8
   n_cond_layers: 0
   n_emb: 256
   n_head: 4
   n_layer: 8
-  n_obs_steps: 2
+  n_obs_steps: ${n_obs_steps}
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
     beta_end: 0.02
@@ -136,19 +139,21 @@ shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!
 task:
   dataset:  # Source domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
-    horizon: 10
+    shape_meta: *shape_meta
+    horizon: ${horizon}
     max_train_episodes: 90
-    pad_after: 7
-    pad_before: 1
+    pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+    pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
     zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
-    horizon: 10
+    shape_meta: *shape_meta
+    horizon: ${horizon}
     max_train_episodes: 200  # ori:90
-    pad_after: 7
-    pad_before: 1
+    pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+    pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
     zarr_path: data/pusht/pusht_size_random.zarr
@@ -159,7 +164,7 @@ task:
     max_steps: 300
     n_action_steps: 8
     n_envs: null
-    n_obs_steps: 2
+    n_obs_steps: ${n_obs_steps}
     n_test: 25  # ori:50
     n_test_vis: 4
     n_train: 6
