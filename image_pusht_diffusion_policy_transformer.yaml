@@ -79,12 +79,12 @@ policy:
     action_da:
       _target_: diffusion_policy.model.domain_adapt.wgan.WGAN_GP
       _recursive_: false
-      in_dim: "256*8,"  # ori:`1536*12`, kv:(1536,2), q/mlp:(512,3), attn:(512,3), softmax:(8,4)
-      in_ndim: "3*8,"  # ori:`2*12`
+      in_dim: "2*1,"  # ori:`1536*12`, kv:(1536,2), q/mlp:(512,3), attn:(512,3), softmax:(8,4)
+      in_ndim: "3*1,"  # ori:`2*12`
       inner_dim: 8  # ori:64
       use_bn: false  # ori:true
       gamma: 10  # ori:10
-      num_layers: 8  # v:6 layers, k:6 layers
+      num_layers: 1  # v:6 layers, k:6 layers
       use_ada: true
       use_cond_dist: false
 

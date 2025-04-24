@@ -27,7 +27,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             obs_as_cond: bool=False,
             n_cond_layers: int = 0,
             # DA params
-
+            is_da: bool = False,
         ) -> None:
         super().__init__()
 
@@ -93,15 +93,30 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 batch_first=True,
                 norm_first=True # important for stability
             )
-            # Monkey Patching to replace forward()
-            decoder_layer.multihead_attn.forward = types.MethodType(
-                forward_with_adapter, decoder_layer.multihead_attn
-            )
+            if is_da:
+                # Monkey Patching to replace forward()
+                decoder_layer.register_buffer('cache_mlp_out', torch.zeros(1), persistent=False)
+                decoder_layer.forward = types.MethodType(
+                    forward_with_cache, decoder_layer
+                )
+                decoder_layer.multihead_attn.forward = types.MethodType(
+                    forward_with_adapter, decoder_layer.multihead_attn
+                )
+                decoder_layer.multihead_attn.register_parameter('ia3_k', nn.Parameter(torch.ones(n_emb), requires_grad=True))
+                decoder_layer.multihead_attn.register_parameter('ia3_v', nn.Parameter(torch.ones(n_emb), requires_grad=True))
+                print("[TransformerForDiffusion] ia3_kv registered!")
 
             self.decoder = nn.TransformerDecoder(
                 decoder_layer=decoder_layer,
                 num_layers=n_layer
             )
+            if is_da:
+                self.decoder.forward = types.MethodType(
+                    forward_return_middles, self.decoder
+                )
+                self.decoder.cache_mlp_outputs = []
+                self.cache_time_emb = None
+            print(f"[TransformerForDiffusion] is_da: {is_da}")
         else:
             # encoder only BERT
             encoder_only = True
@@ -163,6 +178,40 @@ class TransformerForDiffusion(ModuleAttrMixin):
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
+
+    def register_adapter(self):
+        adapter_layer_cnt = 0
+        for layer in self.decoder.layers:
+            if hasattr(layer.multihead_attn, 'ia3_k'):
+                adapter_layer_cnt += 1
+            if hasattr(layer.multihead_attn, 'ia3_v'):
+                adapter_layer_cnt += 1
+        print(f"[TransformerForDiffusion] Registered adapter cnt={adapter_layer_cnt} (ia3_k and ia3_v)")
+
+    @staticmethod
+    def unfreeze_module(module: nn.Module):
+        for p in module.parameters():
+            p.requires_grad = True
+
+    def freeze_backbone(self, unfreeze_params: str):
+        for name, param in self.named_parameters():
+            param.requires_grad = False
+        if "ca" in unfreeze_params:
+            self.decoder.unfreeze_cross_attention()
+        if "mlp" in unfreeze_params:
+            self.decoder.unfreeze_mlp()
+        if "adapter" in unfreeze_params:
+            for layer in self.decoder.layers:
+                layer.multihead_attn.ia3_k.requires_grad = True
+                layer.multihead_attn.ia3_v.requires_grad = True
+        cnt = 0
+        for p in self.parameters():
+            if p.requires_grad:
+                cnt += 1
+        print(f'[DEBUG] trainable: {cnt}, unfreeze_params={unfreeze_params}')
+
+    def trainable_params(self):
+        return filter(lambda p: p.requires_grad, self.parameters())
 
     def _init_weights(self, module):
         ignore_types = (nn.Dropout, 
@@ -233,6 +282,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
                     # weights of blacklist modules will NOT be weight decayed
                     no_decay.add(fpn)
+                elif ".ia3_" in pn:  # for IA3 Adapter
+                    decay.add(fpn)
 
         # special case the position embedding parameter in the root GPT module as not decayed
         no_decay.add("pos_emb")
@@ -297,6 +348,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps.expand(sample.shape[0])
         time_emb = self.time_emb(timesteps).unsqueeze(1)
+        self.cache_time_emb = time_emb
         # (B,1,n_emb)
 
         # process input
@@ -338,7 +390,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 :, :t, :
             ]  # each position maps to a (learnable) vector
             x = self.drop(token_embeddings + position_embeddings)
-            # (B,T,n_emb)
+            # (B,T,n_emb), (56,10,256)
             x = self.decoder(
                 tgt=x,
                 memory=memory,
@@ -427,7 +479,198 @@ def test():
     out = transformer(sample, timestep)
 
 
-# Used by HDFree domain adaptation
+# Used by HDFree domain adaptation: TransformerDecoder
+def forward_return_middles(self, tgt: torch.Tensor, memory: torch.Tensor, tgt_mask: Optional[torch.Tensor] = None,
+            memory_mask: Optional[torch.Tensor] = None, tgt_key_padding_mask: Optional[torch.Tensor] = None,
+            memory_key_padding_mask: Optional[torch.Tensor] = None, tgt_is_causal: Optional[bool] = None,
+            memory_is_causal: bool = False) -> torch.Tensor:
+    r"""Pass the inputs (and mask) through the decoder layer in turn.
+
+    Args:
+        tgt: the sequence to the decoder (required).
+        memory: the sequence from the last layer of the encoder (required).
+        tgt_mask: the mask for the tgt sequence (optional).
+        memory_mask: the mask for the memory sequence (optional).
+        tgt_key_padding_mask: the mask for the tgt keys per batch (optional).
+        memory_key_padding_mask: the mask for the memory keys per batch (optional).
+        tgt_is_causal: If specified, applies a causal mask as ``tgt mask``.
+            Default: ``None``; try to detect a causal mask.
+            Warning:
+            ``tgt_is_causal`` provides a hint that ``tgt_mask`` is
+            the causal mask. Providing incorrect hints can result in
+            incorrect execution, including forward and backward
+            compatibility.
+        memory_is_causal: If specified, applies a causal mask as
+            ``memory mask``.
+            Default: ``False``.
+            Warning:
+            ``memory_is_causal`` provides a hint that
+            ``memory_mask`` is the causal mask. Providing incorrect
+            hints can result in incorrect execution, including
+            forward and backward compatibility.
+
+    Shape:
+        see the docs in Transformer class.
+    """
+    output = tgt
+
+    ###############################################################
+    ##### (Start) Copied from torch.nn.modules.transformer.py
+    def _get_seq_len(
+            src: torch.Tensor,
+            batch_first: bool
+    ) -> Optional[int]:
+
+        if src.is_nested:
+            return None
+        else:
+            src_size = src.size()
+            if len(src_size) == 2:
+                # unbatched: S, E
+                return src_size[0]
+            else:
+                # batched: B, S, E if batch_first else S, B, E
+                seq_len_pos = 1 if batch_first else 0
+                return src_size[seq_len_pos]
+
+    def _detect_is_causal_mask(
+            mask: Optional[torch.Tensor],
+            is_causal: Optional[bool] = None,
+            size: Optional[int] = None,
+    ) -> bool:
+        """Return whether the given attention mask is causal.
+
+        Warning:
+        If ``is_causal`` is not ``None``, its value will be returned as is.  If a
+        user supplies an incorrect ``is_causal`` hint,
+
+        ``is_causal=False`` when the mask is in fact a causal attention.mask
+           may lead to reduced performance relative to what would be achievable
+           with ``is_causal=True``;
+        ``is_causal=True`` when the mask is in fact not a causal attention.mask
+           may lead to incorrect and unpredictable execution - in some scenarios,
+           a causal mask may be applied based on the hint, in other execution
+           scenarios the specified mask may be used.  The choice may not appear
+           to be deterministic, in that a number of factors like alignment,
+           hardware SKU, etc influence the decision whether to use a mask or
+           rely on the hint.
+        ``size`` if not None, check whether the mask is a causal mask of the provided size
+           Otherwise, checks for any causal mask.
+        """
+        # Prevent type refinement
+        make_causal = (is_causal is True)
+
+        if is_causal is None and mask is not None:
+            sz = size if size is not None else mask.size(-2)
+            causal_comparison = _generate_square_subsequent_mask(
+                sz, device=mask.device, dtype=mask.dtype)
+
+            # Do not use `torch.equal` so we handle batched masks by
+            # broadcasting the comparison.
+            if mask.size() == causal_comparison.size():
+                make_causal = bool((mask == causal_comparison).all())
+            else:
+                make_causal = False
+
+        return make_causal
+
+    def _generate_square_subsequent_mask(
+            sz: int,
+            device: torch.device = torch.device(torch._C._get_default_device()),  # torch.device('cpu'),
+            dtype: torch.dtype = torch.get_default_dtype(),
+    ) -> torch.Tensor:
+        r"""Generate a square causal mask for the sequence. The masked positions are filled with float('-inf').
+            Unmasked positions are filled with float(0.0).
+        """
+        return torch.triu(
+            torch.full((sz, sz), float('-inf'), dtype=dtype, device=device),
+            diagonal=1,
+        )
+
+    ##### (End) Copied from torch.nn.modules.transformer.py
+    ###############################################################
+
+    seq_len = _get_seq_len(tgt, self.layers[0].self_attn.batch_first)
+    tgt_is_causal = _detect_is_causal_mask(tgt_mask, tgt_is_causal, seq_len)
+    tgt_is_causal = False  # To prevent [ERROR]: AssertionError: Only allow causal mask or attn_mask
+
+    if hasattr(self, 'cache_mlp_outputs'):
+        self.cache_mlp_outputs = []
+
+    for idx, mod in enumerate(self.layers):
+        output = mod(output, memory, tgt_mask=tgt_mask,
+                     memory_mask=memory_mask,
+                     tgt_key_padding_mask=tgt_key_padding_mask,
+                     memory_key_padding_mask=memory_key_padding_mask,
+                     tgt_is_causal=tgt_is_causal,
+                     memory_is_causal=memory_is_causal)
+        if getattr(mod, 'cache_mlp_out', None) is not None:
+            assert hasattr(self, 'cache_mlp_outputs'), "TransformerDecoder should register cache_mlp_outputs"
+            self.cache_mlp_outputs.append(output)
+
+    if self.norm is not None:
+        output = self.norm(output)
+
+    return output
+
+
+# Used by HDFree domain adaptation: TransformerDecoderLayer
+def forward_with_cache(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_is_causal: bool = False,
+        memory_is_causal: bool = False,
+) -> torch.Tensor:
+    r"""Pass the inputs (and mask) through the decoder layer.
+
+    Args:
+        tgt: the sequence to the decoder layer (required).
+        memory: the sequence from the last layer of the encoder (required).
+        tgt_mask: the mask for the tgt sequence (optional).
+        memory_mask: the mask for the memory sequence (optional).
+        tgt_key_padding_mask: the mask for the tgt keys per batch (optional).
+        memory_key_padding_mask: the mask for the memory keys per batch (optional).
+        tgt_is_causal: If specified, applies a causal mask as ``tgt mask``.
+            Default: ``False``.
+            Warning:
+            ``tgt_is_causal`` provides a hint that ``tgt_mask`` is
+            the causal mask. Providing incorrect hints can result in
+            incorrect execution, including forward and backward
+            compatibility.
+        memory_is_causal: If specified, applies a causal mask as
+            ``memory mask``.
+            Default: ``False``.
+            Warning:
+            ``memory_is_causal`` provides a hint that
+            ``memory_mask`` is the causal mask. Providing incorrect
+            hints can result in incorrect execution, including
+            forward and backward compatibility.
+
+    Shape:
+        see the docs in Transformer class.
+    """
+    # see Fig. 1 of https://arxiv.org/pdf/2002.04745v1.pdf
+
+    x = tgt
+    if self.norm_first:
+        x = x + self._sa_block(self.norm1(x), tgt_mask, tgt_key_padding_mask, tgt_is_causal)
+        x = x + self._mha_block(self.norm2(x), memory, memory_mask, memory_key_padding_mask, memory_is_causal)
+        x = x + self._ff_block(self.norm3(x))
+    else:
+        x = self.norm1(x + self._sa_block(x, tgt_mask, tgt_key_padding_mask, tgt_is_causal))
+        x = self.norm2(x + self._mha_block(x, memory, memory_mask, memory_key_padding_mask, memory_is_causal))
+        x = self.norm3(x + self._ff_block(x))
+
+    self.cache_mlp_out = x
+    return x
+
+
+# Used by HDFree domain adaptation: MultiheadAttention
 def forward_with_adapter(
         self,
         query: torch.Tensor,
@@ -504,7 +747,7 @@ Outputs:
 
     is_batched = query.dim() == 3
 
-    # key_padding_mask = F._canonical_mask(
+    # key_padding_mask = _canonical_mask(
     #     mask=key_padding_mask,
     #     mask_name="key_padding_mask",
     #     other_type=F._none_or_dtype(attn_mask),
@@ -512,14 +755,14 @@ Outputs:
     #     target_type=query.dtype
     # )
 
-    # attn_mask = F._canonical_mask(
-    #     mask=attn_mask,
-    #     mask_name="attn_mask",
-    #     other_type=None,
-    #     other_name="",
-    #     target_type=query.dtype,
-    #     check_other=False,
-    # )
+    attn_mask = _canonical_mask(
+        mask=attn_mask,
+        mask_name="attn_mask",
+        other_type=None,
+        other_name="",
+        target_type=query.dtype,
+        check_other=False,
+    )
 
 
     if not is_batched:
@@ -628,7 +871,8 @@ Outputs:
             average_attn_weights=average_attn_weights,
             is_causal=is_causal)
     else:  # go here
-        # print("[DEBUG] Calling F.multi_head_attention_forward")
+        ia3_k = getattr(self, 'ia3_k', None)
+        ia3_v = getattr(self, 'ia3_v', None)
         # attn_output, attn_output_weights = F.multi_head_attention_forward(
         attn_output, attn_output_weights = multi_head_attention_forward_with_adapter(  # Overload
             query, key, value, self.embed_dim, self.num_heads,
@@ -640,12 +884,44 @@ Outputs:
             need_weights=need_weights,
             attn_mask=attn_mask,
             average_attn_weights=average_attn_weights,
-            # is_causal=is_causal)  Warn: is_causal not supported in torch=1.12.1
+            # is_causal=is_causal)  Warn: is_causal not supported in torch==1.12.1
+            ia3_k=ia3_k,
+            ia3_v=ia3_v,
         )
     if self.batch_first and is_batched:
         return attn_output.transpose(1, 0), attn_output_weights
     else:
         return attn_output, attn_output_weights
+
+
+# Copied from F.multi_head_attention_forward
+def _canonical_mask(
+        mask: Optional[torch.Tensor],
+        mask_name: str,
+        other_type,
+        other_name: str,
+        target_type,
+        check_other: bool = True,
+) -> Optional[torch.Tensor]:
+
+    if mask is not None:
+        _mask_dtype = mask.dtype
+        _mask_is_float = torch.is_floating_point(mask)
+        if _mask_dtype != torch.bool and not _mask_is_float:
+            raise AssertionError(
+                f"only bool and floating types of {mask_name} are supported")
+        if check_other and other_type is not None:
+            if _mask_dtype != other_type:
+                warnings.warn(
+                    f"Support for mismatched {mask_name} and {other_name} "
+                    "is deprecated. Use same type for both instead."
+                )
+        if not _mask_is_float:
+            mask = (
+                torch.zeros_like(mask, dtype=target_type)
+                .masked_fill_(mask, float("-inf"))
+            )
+    return mask
 
 
 def multi_head_attention_forward_with_adapter(
@@ -674,6 +950,9 @@ def multi_head_attention_forward_with_adapter(
     static_v: Optional[torch.Tensor] = None,
     average_attn_weights: bool = True,
     is_causal: bool = False,
+    # IA3 Adapter
+    ia3_k: torch.Tensor = None,
+    ia3_v: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""
     Args:
@@ -820,14 +1099,14 @@ def multi_head_attention_forward_with_adapter(
         # indicator to SDPA.
         attn_mask = None
     else:
-        # attn_mask = _canonical_mask(
-        #     mask=attn_mask,
-        #     mask_name="attn_mask",
-        #     other_type=None,
-        #     other_name="",
-        #     target_type=query.dtype,
-        #     check_other=False,
-        # )
+        attn_mask = _canonical_mask(
+            mask=attn_mask,
+            mask_name="attn_mask",
+            other_type=None,
+            other_name="",
+            target_type=query.dtype,
+            check_other=False,
+        )
 
         if key_padding_mask is not None:
             # We have the attn_mask, and use that to merge kpm into it.
@@ -929,8 +1208,12 @@ def multi_head_attention_forward_with_adapter(
             b_q, b_k, b_v = in_proj_bias.chunk(3)
         q, k, v = _in_projection(query, key, value, q_proj_weight, k_proj_weight, v_proj_weight, b_q, b_k, b_v)
 
-    # prep attention mask
+    # HDFree: IA3 Adapter
+    if ia3_k is not None:
+        k = k * ia3_k
+        v = v * ia3_v
 
+    # prep attention mask
     if attn_mask is not None:
         # ensure attn_mask's dim is 3
         if attn_mask.dim() == 2:

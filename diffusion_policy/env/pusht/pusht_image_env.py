@@ -10,13 +10,19 @@ class PushTImageEnv(PushTEnv):
             legacy=False,
             block_cog=None, 
             damping=None,
-            render_size=96):
+            render_size=96,
+            reset_to_state=None,
+            domain_shift=None,
+            ):
         super().__init__(
             legacy=legacy, 
             block_cog=block_cog,
             damping=damping,
             render_size=render_size,
-            render_action=False)
+            render_action=False,
+            reset_to_state=reset_to_state,
+            domain_shift=domain_shift,
+        )
         ws = self.window_size
         self.observation_space = spaces.Dict({
             'image': spaces.Box(
@@ -35,6 +41,7 @@ class PushTImageEnv(PushTEnv):
         self.render_cache = None
     
     def _get_obs(self):
+        # print("[DEBUG] PushTImageEnv _get_obs() is called.")
         img = super()._render_frame(mode='rgb_array')
 
         agent_pos = np.array(self.agent.position)

@@ -1,5 +1,6 @@
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Union
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,6 +53,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             time_as_cond=True,
             obs_as_cond=True,
             pred_action_steps_only=False,
+            # da
+            use_da=False,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -162,7 +165,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             causal_attn=causal_attn,
             time_as_cond=time_as_cond,
             obs_as_cond=obs_as_cond,
-            n_cond_layers=n_cond_layers
+            n_cond_layers=n_cond_layers,
+            is_da=use_da,
         )
 
         self.obs_encoder = obs_encoder
@@ -403,8 +407,8 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         self.load_from_src_ckpt(self.src_ckpt)  # will have 2 copies: one is for target; another is for source (fixed)
 
         # (Source) Create model copies for domain adaptation AFTER loading pretrained weights
-        self.src_obs_encoder = copy.deepcopy(self.obs_encoder)
-        self.src_model = copy.deepcopy(self.model)
+        self.src_obs_encoder: ObservationEncoder = copy.deepcopy(self.obs_encoder)
+        self.src_model: TransformerForDiffusion = copy.deepcopy(self.model)
         self.placeholder_param = torch.nn.Parameter(torch.ones([1]))
 
         # (Loss) For domain adaptation
@@ -416,23 +420,34 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         self.act_weights: str = domain_adapt.act_weights
 
         # (Target) Register Adapter blocks for trainable modules
+        from diffusion_policy.model.domain_adapt.wgan import WGAN_GP
         if 'adapter' in domain_adapt.act_weights:
-            pass
-            # self.model.inner_model.decoder.register_adapter()
+            self.model.register_adapter()
         debug_diff_loss = domain_adapt.debug_diff_loss
         if debug_diff_loss:
             self.use_da_vis1 = self.use_da_vis2 = False
         if self.use_da_vis1:
-            self.da_vis1_loss = copy.deepcopy(domain_adapt.visual_da).to(self.device)
+            self.da_vis1_loss: WGAN_GP = copy.deepcopy(domain_adapt.visual_da).to(self.device)
         if self.use_da_vis2:
-            self.da_vis2_loss = copy.deepcopy(domain_adapt.visual_da).to(self.device)
+            self.da_vis2_loss: WGAN_GP = copy.deepcopy(domain_adapt.visual_da).to(self.device)
         if self.use_da_act:
-            self.da_act_loss = copy.deepcopy(domain_adapt.action_da).to(self.device)
+            self.da_act_loss: WGAN_GP = copy.deepcopy(domain_adapt.action_da).to(self.device)
+        self.cache_da_d_loss = 0.
+        self.cache_wdist = 0.
+        self.cache_da_g_loss = 0.
+        self.shuffle_target_goal = domain_adapt.shuffle_target_goal
+        self.cfg_drop_ratio = domain_adapt.cfg_drop_ratio
+        self.reg_source_diff_loss = domain_adapt.reg_source_diff_loss
+        self.use_dann_lambda = domain_adapt.use_dann_lambda
+        self.debug_diff_loss = domain_adapt.debug_diff_loss
+
+        self.optimizer_config = domain_adapt.optimizer_config
 
         # (Target) Using Monkey Patching trick to replace class method
         def forward_with_da(self: VisualCore, inputs):
             """
             Forward pass through visual core.
+            inputs: (112, 3, 84, 84)
             """
             ndim = len(self.input_shape)
             assert tuple(inputs.shape)[-ndim:] == tuple(self.input_shape)
@@ -440,15 +455,17 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             # print(x.shape, x.mean(), x.min(), x.max())
             x = self.nets[-2](x)
             # print(x.shape, x.mean(), x.min(), x.max())
-            x = self.nets[-1](x)
-            # print(x.shape, x.mean(), x.min(), x.max())
+            x = self.nets[-1](x)  # (112, 64)
+            self.cache_vis_out = x
+            # print("[DEBUG] forward_with_da:", inputs.shape, x.shape, x.mean(), x.min(), x.max())
             if list(self.output_shape(list(inputs.shape)[1:])) != list(x.shape)[1:]:
                 raise ValueError('Size mismatch: expect size %s, but got size %s' % (
                     str(self.output_shape(list(inputs.shape)[1:])), str(list(x.shape)[1:]))
                                  )
-            # print("[DEBUG] with_da_forward")
             return x
 
+        self.src_obs_encoder.obs_nets['image'].forward = types.MethodType(
+            forward_with_da, self.src_obs_encoder.obs_nets['image'])
         self.obs_encoder.obs_nets['image'].forward = types.MethodType(
             forward_with_da, self.obs_encoder.obs_nets['image'])
 
@@ -457,11 +474,60 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         path = pathlib.Path(src_ckpt)
         payload = torch.load(path.open('rb'), pickle_module=dill)
 
-        # print(payload['state_dicts'].keys())
+        def load_state_dict_partial(model, state_dict, skip_keys=[]):
+            """
+            加载状态字典时跳过某些键
+            Args:
+                model (nn.Module): 模型
+                state_dict (dict): 要加载的状态字典
+                skip_keys (list): 需要跳过的键列表
+            """
+            # 过滤掉需要跳过的键
+            filtered_state_dict = {}
+            for k, v in state_dict.items():
+                if k not in skip_keys:
+                    need_skip = False
+                    for skip_key in skip_keys:  # skip_keys may contain short keywords
+                        if skip_key in k:
+                            need_skip = True
+                    if not need_skip:
+                        filtered_state_dict[k] = v
+
+            # 加载过滤后的状态字典
+            # 获取模型的 state_dict 键和 filtered_state_dict 键
+            model_keys = set(model.state_dict().keys())
+            state_dict_keys = set(filtered_state_dict.keys())
+
+            # 找到 missing_keys 和 unexpected_keys
+            missing_keys = list(model_keys - state_dict_keys)
+            unexpected_keys = list(state_dict_keys - model_keys)
+
+            for k in missing_keys:
+                filtered_state_dict[k] = model.state_dict()[k]
+
+            model.load_state_dict(filtered_state_dict, strict=True)
+
+            # Load normalizer
+            norm_keys = set({k: None for k in state_dict.keys() if 'normalizer.' in k}.keys())
+            norm_state_dict = {k[len("normalizer."):]: v for k, v in state_dict.items() if 'normalizer.' in k}
+            model.normalizer.load_state_dict(norm_state_dict)
+
+            # 打印结果
+            print("Skip keys:", skip_keys)
+            print("Normalizer keys:", norm_keys)
+            print("Missing keys:", missing_keys)
+            print("Unexpected keys:", list(set(unexpected_keys) - norm_keys))
+
+        # print(payload['state_dicts']['model'].keys())
+        # print(self.normalizer.state_dict().keys())
+        # exit()
+        skip_keys = [
+            '.ia3_',  # IA3 Adapter
+        ]
         if use_ema:
-            self.load_state_dict(payload['state_dicts']['ema_model'])
+            load_state_dict_partial(self, payload['state_dicts']['ema_model'], skip_keys)
         else:
-            self.load_state_dict(payload['state_dicts']['model'])
+            load_state_dict_partial(self, payload['state_dicts']['model'], skip_keys)
         print(f"[DiffusionTransformerHybridImagePolicyHDFree] Loaded src_ckpt (use_ema={use_ema}) "
               f"from: {self.src_ckpt}")
 
@@ -489,6 +555,7 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
+            # cond: torch.Size([56, 2, 66]) timesteps: torch.Size([]) noisy_trajectory torch.Size([56, 10, 2])
             model_output = model(trajectory, t, cond)
 
             # 3. compute previous image: x_t -> x_t-1
@@ -528,7 +595,7 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         cond_mask = None
         if self.obs_as_cond:
             this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            nobs_features = self.obs_encoder(this_nobs)  # (B,66)
             # reshape back to B, To, Do
             cond = nobs_features.reshape(B, To, -1)
             shape = (B, T, Da)
@@ -549,11 +616,14 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             cond_mask[:, :To, Da:] = True
 
         # run sampling
+        ## remove useless args
+        useless_keys = ['use_da', 'domain_adapt']
+        passed_kwargs = {k: v for k, v in self.kwargs.items() if k not in useless_keys}
         nsample = self.conditional_sample(
             cond_data,
             cond_mask,
             cond=cond,
-            **self.kwargs)
+            **passed_kwargs)
 
         # unnormalize prediction
         naction_pred = nsample[..., :Da]
@@ -577,47 +647,262 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
+    @staticmethod
+    def set_requires_grad(model, requires_grad=True):
+        for param in model.parameters():
+            param.requires_grad = requires_grad
+        if requires_grad:
+            model.train()
+        else:
+            model.eval()
+
+    @staticmethod
+    def freeze_params(model):
+        def set_parameter_requires_grad(model, requires_grad):
+            for name, child in model.named_children():
+                for param in child.parameters():
+                    param.requires_grad = requires_grad
+        set_parameter_requires_grad(model, requires_grad=False)
+
+    @staticmethod
+    def trainable_params(model, sub_name: str = None):
+        m = model
+        if sub_name is not None:
+            m = getattr(model, sub_name)
+        return filter(lambda p: p.requires_grad, m.parameters())
+
+    def calc_grad_and_param_norm(self, module: Union[nn.Module, List[nn.Module]],
+                                 sqrt_out: bool = True,
+                                 ):
+        total_grad_norm = 0.0
+        total_param_norm = 0.0
+        total_ratio_norm = 0.0
+        if isinstance(module, list):
+            for m in module:
+                m_grad, m_param, m_ratio = self.calc_grad_and_param_norm(m, sqrt_out=False)  # recursive
+                total_grad_norm += m_grad
+                total_param_norm += m_param
+                total_ratio_norm += m_ratio
+        else:
+            assert isinstance(module, nn.Module)
+            for name, p in module.named_parameters():
+                if p.grad is not None:
+                    total_grad_norm += p.grad.norm().item() ** 2
+                    total_ratio_norm += (p.grad.norm().item() / (1e-8 + p.data.norm().item())) ** 2
+                total_param_norm += p.norm().item() ** 2
+        if sqrt_out:
+            total_grad_norm = total_grad_norm ** 0.5
+            total_param_norm = total_param_norm ** 0.5
+            total_ratio_norm = total_ratio_norm ** 0.5
+        return total_grad_norm, total_param_norm, total_ratio_norm
+
     def get_optimizer(
             self,
             transformer_weight_decay: float,
             obs_encoder_weight_decay: float,
             learning_rate: float,
             betas: Tuple[float, float]
-    ) -> torch.optim.Optimizer:
-        optim_groups = self.model.get_optim_groups(
-            weight_decay=transformer_weight_decay)
-        optim_groups.append({
-            "params": self.obs_encoder.parameters(),
-            "weight_decay": obs_encoder_weight_decay
-        })
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas
-        )
-        return optimizer
+    ) -> List[torch.optim.Optimizer]:
+        g_vis1_optim_groups = []
+        d_vis1_optim_groups = []
+        g_act_optim_groups = []
+        d_act_optim_groups = []
 
-    def compute_loss(self, batch):
+        ''' Frozen modules '''
+        self.set_requires_grad(self.src_obs_encoder, False)
+        self.set_requires_grad(self.src_model, False)
+
+        ''' Visual Encoder '''
+        self.set_requires_grad(self.obs_encoder, False)
+        if self.use_da_vis1:
+            self.freeze_params(self.obs_encoder)
+            self.set_requires_grad(self.obs_encoder.obs_nets['image'].nets[-1], True)
+            g_vis1_optim_groups.extend([
+                {"params": self.trainable_params(self.obs_encoder), "lr": self.optimizer_config.vis1_lr},
+            ])
+        else:
+            g_vis1_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])  # placeholder
+
+        ''' Transformer Encoder & Decoder '''
+        self.set_requires_grad(self.model, False)
+        if self.use_da_act:
+            self.set_requires_grad(self.model, True)
+            unfreeze_ca = "ca" in self.act_weights
+            unfreeze_adapter = "adapter" in self.act_weights
+            if not self.debug_diff_loss:  # when NOT debug diff loss, finetuning CA params of diffusion policy
+                self.model.freeze_backbone(
+                    unfreeze_params=self.act_weights,
+                )
+            else:
+                # Debug diff loss
+                self.model.inner_model.freeze_backbone(
+                    unfreeze_params=self.act_weights
+                )  # using the same setting with da_act
+                pass  # finetuning all params
+            g_act_optim_groups.extend([
+                {"params": self.model.trainable_params(), "lr": self.optimizer_config.act_lr},
+            ])
+        else:
+            g_act_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])  # placeholder
+
+        ''' Adaptation Discriminator '''
+        if self.use_da_vis1:
+            self.set_requires_grad(self.da_vis1_loss, True)
+            d_vis1_optim_groups.extend([
+                {"params": self.da_vis1_loss.parameters(), "lr": self.optimizer_config.vis1_lr},
+            ])
+        else:
+            d_vis1_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])
+
+        if self.use_da_act:
+            self.set_requires_grad(self.da_act_loss, True)
+            d_act_optim_groups.extend([
+                {"params": self.da_act_loss.parameters(),
+                 "lr": self.optimizer_config.act_lr},
+            ])
+        else:
+            d_act_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])
+
+        ''' Optimizer '''
+        g_vis1_optimizer = torch.optim.AdamW(g_vis1_optim_groups,
+                                             weight_decay=obs_encoder_weight_decay,
+                                             betas=betas)
+        d_vis1_optimizer = torch.optim.AdamW(d_vis1_optim_groups,
+                                             weight_decay=obs_encoder_weight_decay,
+                                             betas=betas)
+
+        g_act_optimizer = torch.optim.AdamW(g_act_optim_groups,
+                                            weight_decay=transformer_weight_decay,
+                                            betas=betas)
+        d_act_optimizer = torch.optim.AdamW(d_act_optim_groups,
+                                            weight_decay=transformer_weight_decay,
+                                            betas=betas)
+
+        param_obs_cnt = sum(p.numel() for p in self.trainable_params(self.obs_encoder))
+        param_act_cnt = sum(p.numel() for p in self.trainable_params(self.model))
+        param_dis_cnt = 0
+        if self.use_da_vis1:
+            param_dis_cnt += sum(p.numel() for p in self.trainable_params(self, "da_vis1_loss"))
+        if self.use_da_act:
+            param_dis_cnt += sum(p.numel() for p in self.trainable_params(self, "da_act_loss"))
+        param_all_cnt = sum(p.numel() for p in self.trainable_params(self))
+        print(f"[DiffusionTransformerHybridImagePolicyHDFree] Optimizer configured. "
+              f"Obs trainable params: {param_obs_cnt}, "
+              f"Act trainable params: {param_act_cnt}, "
+              f"Discriminator trainable params: {param_dis_cnt / 1e6:.2f}M, "
+              f"Total trainable params: {param_all_cnt / 1e6:.2f}M. "
+              f"All params: {sum(p.numel() for p in self.parameters()) / 1e6:.2f}M.")
+        return (g_vis1_optimizer, d_vis1_optimizer,
+                g_act_optimizer, d_act_optimizer,
+                )
+
+        ## Vanilla optimizer
+        # optim_groups = self.model.get_optim_groups(
+        #     weight_decay=transformer_weight_decay)
+        # optim_groups.append({
+        #     "params": self.obs_encoder.parameters(),
+        #     "weight_decay": obs_encoder_weight_decay
+        # })
+        # optimizer = torch.optim.AdamW(
+        #     optim_groups, lr=learning_rate, betas=betas
+        # )
+        # return optimizer
+
+    def compute_loss(self, batch: dict, optimizers = None, lr_schedulers = None, batch_idx: int = None):
+        """ Called by BaseWorkspace.run() """
+        ''' (1) Vanilla batch'''
+        if batch.get("src") is None:
+            return super().compute_loss(batch)
+        
+        ''' (2) Source-Target batch'''
+        (g_vis1_opt, d_vis1_opt, g_act_opt, d_act_opt) = optimizers
+        (g_vis1_sch, d_vis1_sch, g_act_sch, d_act_sch) = lr_schedulers
+
+        (total_loss, action_loss, cont_loss, id_loss, img_gen_loss,
+         da_d1_loss, da_g1_loss, da_d2_loss, da_g2_loss, da_d_act_loss, da_g_act_loss,
+         w_dist_1, gp_1, w_dist_2, gp_2, w_dist_act, gp_act) = (
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+            torch.tensor(0.0).to(self.device),
+        )
+        losses = {
+            'total_loss': total_loss,
+            'action_loss': action_loss,
+            'cont_loss': cont_loss,
+            'img_gen_loss': img_gen_loss,
+            'da_d1_loss': da_d1_loss,
+            'da_g1_loss': da_g1_loss,
+            'da_d2_loss': da_d2_loss,
+            'da_g2_loss': da_g2_loss,
+            'da_d_act_loss': da_d_act_loss,
+            'da_g_act_loss': da_g_act_loss,
+            'w_dist_1': w_dist_1,
+            'gp_1': gp_1,
+            'w_dist_2': w_dist_2,
+            'gp_2': gp_2,
+            'w_dist_act': w_dist_act,
+            'gp_act': gp_act,
+        }
+        s_batch_len = 0
+        t_batch_len = 0
+        total_bs = 0
+
+        source_act_0 = None
+        common_noise = None
+        common_sigmas = None
+        common_sigma_emb = None
+        max_bs = None
+        use_zero_goal = np.random.uniform(0, 1) <= self.cfg_drop_ratio
+
         # normalize input
         assert 'valid_mask' not in batch
-        nobs = self.normalizer.normalize(batch['obs'])
-        nactions = self.normalizer['action'].normalize(batch['action'])
-        batch_size = nactions.shape[0]
-        horizon = nactions.shape[1]
+        s_batch, t_batch = batch["src"], batch["tgt"]
+
+        s_nobs = self.normalizer.normalize(s_batch['obs'])
+        s_nactions = self.normalizer['action'].normalize(s_batch['action'])
+        batch_size = s_nactions.shape[0]
+        horizon = s_nactions.shape[1]
         To = self.n_obs_steps
+
+        t_nobs = self.normalizer.normalize(t_batch['obs'])
+        t_nactions = self.normalizer['action'].normalize(t_batch['action'])
 
         # handle different ways of passing observation
         cond = None
-        trajectory = nactions
-        if self.obs_as_cond:
+        s_trajectory = s_nactions
+        t_trajectory = t_nactions
+        if self.obs_as_cond:  # go here
             # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs,
+            s_this_nobs = dict_apply(s_nobs,
                                    lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            s_nobs_features = self.src_obs_encoder(s_this_nobs)
+            t_this_nobs = dict_apply(t_nobs,
+                                     lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
+            t_nobs_features = self.obs_encoder(t_this_nobs)
+            s_vis_emb = self.src_obs_encoder.obs_nets['image'].cache_vis_out  # (B,64)
+            t_vis_emb = self.obs_encoder.obs_nets['image'].cache_vis_out  # (B,64)
             # reshape back to B, T, Do
-            cond = nobs_features.reshape(batch_size, To, -1)
+            s_cond = s_nobs_features.reshape(batch_size, To, -1)
+            t_cond = t_nobs_features.reshape(batch_size, To, -1)
             if self.pred_action_steps_only:
                 start = To - 1
                 end = start + self.n_action_steps
-                trajectory = nactions[:, start:end]
+                s_trajectory = s_nactions[:, start:end]
+                t_trajectory = t_nactions[:, start:end]
         else:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
@@ -628,42 +913,191 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
 
         # generate impainting mask
         if self.pred_action_steps_only:
-            condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
+            s_condition_mask = torch.zeros_like(s_trajectory, dtype=torch.bool)
+            t_condition_mask = torch.zeros_like(t_trajectory, dtype=torch.bool)
         else:
-            condition_mask = self.mask_generator(trajectory.shape)
+            s_condition_mask = self.mask_generator(s_trajectory.shape)
+            t_condition_mask = self.mask_generator(t_trajectory.shape)
 
         # Sample noise that we'll add to the images
-        noise = torch.randn(trajectory.shape, device=trajectory.device)
-        bsz = trajectory.shape[0]
+        # (1) Source
+        s_noise = torch.randn(s_trajectory.shape, device=s_trajectory.device)
+        bsz = s_trajectory.shape[0]
         # Sample a random timestep for each image
         timesteps = torch.randint(
             0, self.noise_scheduler.config.num_train_timesteps,
-            (bsz,), device=trajectory.device
+            (bsz,), device=s_trajectory.device
         ).long()
         # Add noise to the clean images according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
-        noisy_trajectory = self.noise_scheduler.add_noise(
-            trajectory, noise, timesteps)
+        s_noisy_trajectory = self.noise_scheduler.add_noise(
+            s_trajectory, s_noise, timesteps)
+        # (2) Target
+        t_noise = torch.randn(t_trajectory.shape, device=t_trajectory.device)
+        bsz = t_trajectory.shape[0]
+        # DO NOT: Sample a random timestep for each image
+        # timesteps = torch.randint(
+        #     0, self.noise_scheduler.config.num_train_timesteps,
+        #     (bsz,), device=t_trajectory.device
+        # ).long()
+        # Add noise to the clean images according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        t_noisy_trajectory = self.noise_scheduler.add_noise(
+            s_trajectory, t_noise, timesteps)  # Should be the same
 
         # compute loss mask
-        loss_mask = ~condition_mask
+        s_loss_mask = ~s_condition_mask
 
         # apply conditioning
-        noisy_trajectory[condition_mask] = trajectory[condition_mask]
+        s_noisy_trajectory[s_condition_mask] = s_trajectory[s_condition_mask]
 
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, cond)
+        s_pred = self.src_model(s_noisy_trajectory, timesteps, s_cond)
+        t_pred = self.model(t_noisy_trajectory, timesteps, t_cond)
 
-        pred_type = self.noise_scheduler.config.prediction_type
-        if pred_type == 'epsilon':
-            target = noise
-        elif pred_type == 'sample':
-            target = trajectory
+        # print(s_pred.shape, t_pred.shape)
+        noise_loss = torch.nn.MSELoss()
+        # print(noise_loss(s_pred, t_pred).item())
+
+        common_sigma_emb = self.src_model.cache_time_emb.squeeze(1)  # (B,1,256)
+        s_mlp_list = self.src_model.decoder.cache_mlp_outputs
+        t_mlp_list = self.model.decoder.cache_mlp_outputs
+
+        if self.act_layers < 0:
+            left, right = self.act_layers, None
         else:
-            raise ValueError(f"Unsupported prediction type {pred_type}")
+            left, right = None, self.act_layers
+        t_feat_for_da_act = []
+        s_feat_for_da_act = []
+        if 'mlp' in self.act_loss_from:
+            # s_feat_for_da_act.extend(s_mlp_list[left:right])
+            # t_feat_for_da_act.extend(t_mlp_list[left:right])
+            s_feat_for_da_act.append(s_pred)
+            t_feat_for_da_act.append(t_pred)
 
-        loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
-        return loss
+        t_feat_for_da_vis1 = t_vis_emb
+        s_feat_for_da_vis1 = s_vis_emb
+        # print(s_vis_emb.shape, t_vis_emb.shape)  # (B,64)
+        # print(len(s_feat_for_da_act), len(t_feat_for_da_act))  # 6
+        # print(s_feat_for_da_act[0].shape, t_feat_for_da_act[0].shape)  # (B,10,256)
+
+        ''' 1. Update D '''
+        if self.use_da_vis1:
+            da_loss_dict = self.da_vis1_loss.forward(
+                [t_feat_for_da_vis1.clone().detach()],  # avoid grad of G_target
+                [s_feat_for_da_vis1.detach()],  # avoid grad of G_source
+                is_discriminator_batch=True,
+            )
+            da_d_1_loss = da_loss_dict['loss']
+            w_dist = da_loss_dict['w_dist']
+            gp = da_loss_dict['gp']  # just for log
+            losses['da_d1_loss'] += da_d_1_loss / 1
+            losses['w_dist_1'] += w_dist
+            losses['gp_1'] += gp
+
+            d_vis1_opt.zero_grad()
+            # self.manual_backward(losses['da_d1_loss'], retain_graph=False)  # no need to retrain graph
+            losses['da_d1_loss'].backward(retain_graph=False)
+            d_vis1_opt.step()
+            d_vis1_sch.step()
+
+        if self.use_da_act:
+            da_act_loss_dict = self.da_act_loss.forward(
+                [x.clone().detach() for x in t_feat_for_da_act],  # avoid grad of G_target
+                [x.clone().detach() for x in s_feat_for_da_act],  # avoid grad of G_source
+                is_discriminator_batch=True,
+                sigmas=common_sigma_emb,
+            )
+            da_d_act_loss = da_act_loss_dict['loss']
+            w_dist = da_act_loss_dict['w_dist']
+            gp = da_act_loss_dict['gp']  # just for log
+            losses['da_d_act_loss'] += da_d_act_loss / 1
+            losses['w_dist_act'] += w_dist
+            losses['gp_act'] += gp
+
+            d_act_opt.zero_grad()
+            # self.manual_backward(losses['da_d_act_loss'], retain_graph=False)  # no need to retrain graph
+            losses['da_d_act_loss'].backward(retain_graph=True)
+            d_act_opt.step()
+            d_act_sch.step()
+
+        ''' 2. Update G'''
+        backward_loss = torch.tensor(0.0).to(self.device)
+        if self.use_da_act:
+            da_act_loss_dict = self.da_act_loss.forward(
+                t_feat_for_da_act,  # update G_target
+                s_feat_for_da_act,  # avoid grad of G_source
+                is_discriminator_batch=False,
+                sigmas=common_sigma_emb,
+            )
+            da_g_act_loss = da_act_loss_dict['loss']
+            gp = da_act_loss_dict['gp']  # just for log
+            losses['da_g_act_loss'] += da_g_act_loss / 1
+
+            g_act_opt.zero_grad()
+            retain_graph = self.use_da_vis1 or self.use_da_vis2  # Keep backward graph for later modules
+            if not self.debug_diff_loss:
+                act_back_loss = losses['da_g_act_loss'] + losses['action_loss']
+                # self.manual_backward(act_back_loss, retain_graph=retain_graph)
+                act_back_loss.backward(retain_graph=retain_graph)
+            elif self.current_epoch >= 1 or batch_idx > 10:  # Only for debug
+                # self.manual_backward(backward_loss)
+                backward_loss.backward()
+            g_act_opt.step()
+            g_act_sch.step()
+
+        if self.use_da_vis1:
+            da_loss_dict = self.da_vis1_loss.forward(
+                [t_feat_for_da_vis1],  # update G_target
+                [s_feat_for_da_vis1],  # avoid grad of G_source
+                is_discriminator_batch=False,
+            )
+            da_g1_loss = da_loss_dict['loss']
+            gp = da_loss_dict['gp']  # just for log
+            losses['da_g1_loss'] += da_g1_loss / 1
+
+            backward_loss += losses['da_g1_loss']
+            g_vis1_opt.zero_grad()
+
+        losses['total_loss'] += backward_loss + losses['da_g_act_loss']
+        if self.use_da_vis1:
+            # self.manual_backward(backward_loss)  # backward vis1 and vis2 together
+            backward_loss.backward()
+
+        if self.use_da_vis1:
+            g_vis1_opt.step()
+        g_vis1_sch.step()
+
+        # Get grad_norm
+        vis1_grad_norm, vis1_total_norm, _ = self.calc_grad_and_param_norm(self.obs_encoder)
+        act_grad_norm, act_total_norm, _ = self.calc_grad_and_param_norm(self.model)
+        losses["train/vis1_grad_norm"] = vis1_grad_norm
+        losses["train/vis1_total_norm"] = vis1_total_norm
+        losses["train/act_grad_norm"] = act_grad_norm
+        losses["train/act_total_norm"] = act_total_norm
+
+        # if not self.automatic_optimization:
+        #     self.on_before_zero_grad()
+        # Log the metrics
+        # self._log_training_metrics(losses, total_bs)
+
+        # print(losses)
+        # exit(0)
+
+        return losses
+
+
+        ## Compute MSE diffusion loss
+        # pred_type = self.noise_scheduler.config.prediction_type
+        # if pred_type == 'epsilon':
+        #     target = s_noise
+        # elif pred_type == 'sample':
+        #     target = trajectory
+        # else:
+        #     raise ValueError(f"Unsupported prediction type {pred_type}")
+
+        # loss = F.mse_loss(pred, target, reduction='none')
+        # loss = loss * loss_mask.type(loss.dtype)
+        # loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        # loss = loss.mean()
+        # return loss

@@ -16,14 +16,18 @@ class PushTKeypointsEnv(PushTEnv):
             reset_to_state=None,
             render_action=True,
             local_keypoint_map: Dict[str, np.ndarray]=None, 
-            color_map: Optional[Dict[str, np.ndarray]]=None):
+            color_map: Optional[Dict[str, np.ndarray]]=None,
+            domain_shift=None,
+        ):
         super().__init__(
             legacy=legacy, 
             block_cog=block_cog,
             damping=damping,
             render_size=render_size,
             reset_to_state=reset_to_state,
-            render_action=render_action)
+            render_action=render_action,
+            domain_shift=domain_shift,
+        )
         ws = self.window_size
 
         if local_keypoint_map is None:

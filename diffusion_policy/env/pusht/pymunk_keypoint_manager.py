@@ -64,7 +64,7 @@ class PymunkKeypointManager:
                 n_kps = n_block_kps
             
             self.screen = pygame.Surface((512,512))
-            self.screen.fill(pygame.Color("white"))
+            self.screen.fill(pygame.Color("white"))  # Color?
             draw_options = DrawOptions(self.screen)
             self.space.debug_draw(draw_options)
             # pygame.display.flip()

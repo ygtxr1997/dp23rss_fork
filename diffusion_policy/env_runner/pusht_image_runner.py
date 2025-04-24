@@ -7,6 +7,8 @@ import tqdm
 import dill
 import math
 import wandb.sdk.data_types.video as wv
+import matplotlib.pyplot as plt
+
 from diffusion_policy.env.pusht.pusht_image_env import PushTImageEnv
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
 # from diffusion_policy.gym_util.sync_vector_env import SyncVectorEnv
@@ -35,7 +37,10 @@ class PushTImageRunner(BaseImageRunner):
             render_size=96,
             past_action=False,
             tqdm_interval_sec=5.0,
-            n_envs=None
+            n_envs=None,
+            reset_to_state=None,
+            domain_shift=None,
+            save_name=None,
         ):
         super().__init__(output_dir)
         if n_envs is None:
@@ -47,7 +52,9 @@ class PushTImageRunner(BaseImageRunner):
                 VideoRecordingWrapper(
                     PushTImageEnv(
                         legacy=legacy_test,
-                        render_size=render_size
+                        render_size=render_size,
+                        reset_to_state=reset_to_state,
+                        domain_shift=domain_shift,
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -141,6 +148,11 @@ class PushTImageRunner(BaseImageRunner):
         self.past_action = past_action
         self.max_steps = max_steps
         self.tqdm_interval_sec = tqdm_interval_sec
+
+        self.reset_to_state = reset_to_state
+        self.domain_shift = domain_shift
+        self.save_name = save_name
+        self.cache_actions = []
     
     def run(self, policy: BaseImagePolicy):
         device = policy.device
@@ -155,6 +167,9 @@ class PushTImageRunner(BaseImageRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        first_obs_img = None
+        if self.reset_to_state is not None:
+            plt.figure(figsize=(8, 8))
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -178,7 +193,7 @@ class PushTImageRunner(BaseImageRunner):
             past_action = None
             policy.reset()
 
-            pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval PushtImageRunner {chunk_idx+1}/{n_chunks}", 
+            pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval PushtImageRunner shift={self.domain_shift} {chunk_idx+1}/{n_chunks}",
                 leave=False, mininterval=self.tqdm_interval_sec)
             done = False
             while not done:
@@ -188,6 +203,8 @@ class PushTImageRunner(BaseImageRunner):
                     # TODO: not tested
                     np_obs_dict['past_action'] = past_action[
                         :,-(self.n_obs_steps-1):].astype(np.float32)
+                if first_obs_img is None:
+                    first_obs_img = env.call("get_first_obs_frame")[0]
                 
                 # device transfer
                 obs_dict = dict_apply(np_obs_dict, 
@@ -212,6 +229,77 @@ class PushTImageRunner(BaseImageRunner):
                 # update pbar
                 pbar.update(action.shape[1])
             pbar.close()
+
+            if self.reset_to_state is not None:
+                # Save trajectories (positions)
+                plt.imshow(np.flipud(first_obs_img), origin='lower')
+
+                history_pos = env.call_each('get_history_positions')
+                max_len = 0
+                for h in history_pos:
+                    max_len = max(max_len, len(h))
+                all_positions = []
+                for env_idx in range(len(history_pos)):
+                    positions = history_pos[env_idx]
+                    # print(env_idx, len(positions))
+                    np_positions = []
+                    for pos in positions:
+                        x = float(pos[0])
+                        y = float(pos[1])
+                        np_positions.append((x, y))
+                    np_positions = np.array(np_positions)
+
+                    # 定义卡尔曼滤波器参数
+                    initial_state = np.array([0, 0])
+                    initial_covariance = np.eye(2) * 1
+                    transition_matrix = np.eye(2)
+                    observation_matrix = np.eye(2)
+                    process_covariance = np.eye(2) * 0.01
+                    observation_covariance = np.eye(2) * 100
+
+                    np_positions = moving_average_smooth(np_positions, window_size=40)
+                    log_positions = np.pad(np_positions, ((0, max_len - len(np_positions)), (0, 0)), mode='constant')
+                    all_positions.append(log_positions[None, :])
+
+                    # np_positions = kalman_filter(
+                    #     np_positions, initial_state, initial_covariance,
+                    #     transition_matrix, observation_matrix,
+                    #     process_covariance, observation_covariance)
+
+                    x, y = np_positions[:, 0], np_positions[:, 1]
+                    y = 512 - y  # flip across y=512/2
+
+                    # 绘制运动轨迹
+
+                    # plt.plot(x, y, marker="o", linestyle="-", color="blue", markersize=4, label="运动轨迹")
+                    # 颜色和透明度都随着时间变化
+                    colors = np.linspace(0, 1, max_len)[:len(x)]  # 颜色从 0 到 1 的渐变值
+                    alphas_first = np.linspace(1, 0.1, 1000)
+                    alphas_second = np.linspace(0.1, 0.001, max_len - 1000)
+                    alphas = np.concatenate((alphas_first, alphas_second), axis=0)[:len(x)]
+                    # alphas = np.linspace(1, 0.02, max_len)[:len(x)]  # 透明度从 1 到 0.2
+
+                    # 将颜色和透明度结合，生成 RGBA 格式
+                    rgba_colors = plt.cm.viridis(colors)  # 获取渐变颜色
+                    rgba_colors[:, 3] = alphas  # 修改透明度
+                    plt.scatter(x, y, color=rgba_colors, s=1)
+
+            if self.reset_to_state is not None:
+                plt.xlim(0, 512)
+                plt.ylim(0, 512)
+                # plt.xlabel("X 坐标")
+                # plt.ylabel("Y 坐标")
+                # plt.title("运动轨迹绘制")
+                # plt.grid(True)
+                # plt.legend()
+                plt.axis('off')
+
+                # 保存图像
+                save_name = self.save_name
+                plt.savefig(f"data/pusht_eval_output/{save_name}.png", bbox_inches='tight', pad_inches=0)
+                all_positions = np.concatenate(all_positions, axis=0)
+                print("all_positions:", all_positions.shape, "saved to:", save_name)
+                np.save(f"data/pusht_eval_output/{save_name}.npy", all_positions)
 
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
@@ -249,3 +337,61 @@ class PushTImageRunner(BaseImageRunner):
             log_data[name] = value
 
         return log_data
+
+
+def moving_average_smooth(trajectory, window_size):
+    smoothed_trajectory = np.zeros_like(trajectory)
+    for i in range(len(trajectory)):
+        if i < window_size:
+            cur_win = i
+        else:
+            cur_win = window_size
+        start = max(0, i - cur_win)
+        end = min(len(trajectory), i + cur_win + 1)
+        smoothed_trajectory[i] = np.mean(trajectory[start:end], axis=0)
+    return smoothed_trajectory
+
+
+def kalman_filter(observations, initial_state, initial_covariance, transition_matrix, observation_matrix, process_covariance, observation_covariance):
+    """
+    卡尔曼滤波器，初始点位置保持不变
+    :param observations: 观测值，形状为 (N, 2)
+    :param initial_state: 初始状态估计 (2,)
+    :param initial_covariance: 初始协方差矩阵 (2, 2)
+    :param transition_matrix: 状态转移矩阵 (2, 2)
+    :param observation_matrix: 观测矩阵 (2, 2)
+    :param process_covariance: 过程噪声协方差 (2, 2)
+    :param observation_covariance: 观测噪声协方差 (2, 2)
+    :return: 滤波后的状态估计
+    """
+    n_timesteps = observations.shape[0]
+    n_state_vars = initial_state.shape[0]
+
+    # 初始化
+    filtered_states = np.zeros((n_timesteps, n_state_vars))
+    keep_same = 0
+    filtered_states[:keep_same] = observations[:keep_same]  # 初始点保持不变
+    state = initial_state
+    covariance = initial_covariance
+
+    for t in range(keep_same, n_timesteps):  # 从第 1 个点开始滤波
+        # 预测阶段
+        predicted_state = np.dot(transition_matrix, state)
+        predicted_covariance = np.dot(transition_matrix,
+                                      np.dot(covariance, transition_matrix.T)) + process_covariance
+
+        # 更新阶段
+        observation = observations[t]
+        innovation = observation - np.dot(observation_matrix, predicted_state)
+        innovation_covariance = np.dot(observation_matrix,
+                                       np.dot(predicted_covariance, observation_matrix.T)) + observation_covariance
+        kalman_gain = np.dot(predicted_covariance,
+                             np.dot(observation_matrix.T, np.linalg.inv(innovation_covariance)))
+
+        state = predicted_state + np.dot(kalman_gain, innovation)
+        covariance = np.dot(np.eye(n_state_vars) - np.dot(kalman_gain, observation_matrix), predicted_covariance)
+
+        # 保存滤波后的状态
+        filtered_states[t] = state
+
+    return filtered_states

@@ -79,7 +79,7 @@ class BaseWorkspace:
         if include_keys is None:
             include_keys = payload['pickles'].keys()
 
-        for key, value in payload['state_dicts'].items():
+        for key, value in payload['state_dicts'].items():  # model, ema_model, optimizer
             if key not in exclude_keys:
                 self.__dict__[key].load_state_dict(value, **kwargs)
         for key in include_keys:

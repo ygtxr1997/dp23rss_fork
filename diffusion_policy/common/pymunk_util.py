@@ -2,6 +2,10 @@ import pygame
 import pymunk
 import pymunk.pygame_util
 import numpy as np
+from PIL import Image, ImageDraw
+import random
+import math
+
 
 COLLTYPE_DEFAULT = 0
 COLLTYPE_MOUSE = 1
@@ -50,3 +54,54 @@ def get_body_state(body):
     state[3:5] = body.velocity
     state[5] = body.angular_velocity
     return state
+
+
+class ImageLightingEffect:
+    def __init__(self, light_radius=50, light_intensity=200, light_color=(255, 255, 200), num_lights=1):
+        self.light_radius = light_radius
+        self.light_intensity = light_intensity
+        self.light_color = light_color
+        self.num_lights = num_lights
+        self.max_width = 96
+        self.max_height = 96
+
+        self.light_x = random.randint(0, self.max_width)
+        self.light_y = random.randint(0, self.max_height)
+
+    def apply_random_lighting(self, image: Image.Image):
+        """在图像上添加随机点光源效果"""
+        width, height = image.size
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))  # 创建遮罩层
+
+        for _ in range(self.num_lights):
+            # 随机生成光源位置
+            max_delta = int(self.max_width * 0.02)
+            self.light_x += random.randint(-max_delta, max_delta)
+            self.light_y += random.randint(-max_delta, max_delta)
+
+            # 创建光源并叠加到遮罩层
+            light_surface = self._create_light_surface()
+            overlay.paste(light_surface,
+                          (self.light_x - self.light_radius, self.light_y - self.light_radius),
+                          light_surface)
+
+        # 将遮罩层叠加到原图
+        image = Image.alpha_composite(image.convert("RGBA"), overlay)
+        return image
+
+    def _create_light_surface(self):
+        """创建一个渐变的光源图像"""
+        diameter = self.light_radius * 2
+        light_surface = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(light_surface)
+
+        for r in range(self.light_radius, 0, -1):
+            alpha = int(self.light_intensity * (r / self.light_radius))
+            color = (*self.light_color, alpha)
+            draw.ellipse(
+                (self.light_radius - r, self.light_radius - r, self.light_radius + r, self.light_radius + r),
+                fill=color
+            )
+
+        return light_surface
+

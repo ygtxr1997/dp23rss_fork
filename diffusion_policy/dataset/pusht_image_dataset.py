@@ -9,6 +9,8 @@ from diffusion_policy.common.sampler import (
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.common.normalize_util import get_image_range_normalizer
+from diffusion_policy.common.pymunk_util import ImageLightingEffect
+
 
 class PushTImageDataset(BaseImageDataset):
     def __init__(self,
@@ -44,6 +46,7 @@ class PushTImageDataset(BaseImageDataset):
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
+        print(f"[PushTImageDataset] Loaded from: {zarr_path}, len={self.__len__()}.")
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -72,7 +75,13 @@ class PushTImageDataset(BaseImageDataset):
 
     def _sample_to_data(self, sample):
         agent_pos = sample['state'][:,:2].astype(np.float32) # (agent_posx2, block_posex3)
-        image = np.moveaxis(sample['img'],-1,1)/255
+        image = np.moveaxis(sample['img'],-1,1)/255  # (B,H,W,C) -> (B,C,H,W)
+
+        # print(sample.keys(), type(sample['img']))
+        # print(sample['img'].mean(), sample['img'].max(),sample['img'].min())
+        # from PIL import Image
+        # s_img = Image.fromarray(sample['img'][0].astype(np.uint8))
+        # s_img.save("tmp_train_b0.png")
 
         data = {
             'obs': {
@@ -88,6 +97,26 @@ class PushTImageDataset(BaseImageDataset):
         data = self._sample_to_data(sample)
         torch_data = dict_apply(data, torch.from_numpy)
         return torch_data
+
+
+class SourceTargetDataset(torch.utils.data.Dataset):
+    def __init__(self,
+                 src_dataset: PushTImageDataset,
+                 tgt_dataset: PushTImageDataset,
+                 ):
+        self.src_dataset = src_dataset
+        self.tgt_dataset = tgt_dataset
+
+    def __len__(self):
+        return max(len(self.src_dataset), len(self.tgt_dataset))
+
+    def __getitem__(self, idx):
+        src_batch = self.src_dataset[idx % len(self.src_dataset)]
+        tgt_batch = self.tgt_dataset[idx % len(self.tgt_dataset)]
+        return {
+            "src": src_batch,
+            "tgt": tgt_batch,
+        }
 
 
 def test():

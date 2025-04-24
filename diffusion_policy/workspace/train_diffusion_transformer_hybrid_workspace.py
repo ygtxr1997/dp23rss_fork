@@ -1,3 +1,5 @@
+from functools import partial
+
 if __name__ == "__main__":
     import sys
     import os
@@ -28,6 +30,8 @@ from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
+from diffusion_policy.dataset.pusht_image_dataset import SourceTargetDataset
+
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -57,7 +61,11 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         self.global_step = 0
         self.epoch = 0
 
-    def run(self):
+        # Domain adaptation
+        self.is_da = hasattr(cfg.policy, 'use_da') and cfg.policy.use_da
+        print(f"[TrainDiffusionTransformerHybridWorkspace] is_da: {self.is_da}")
+
+    def run(self):  # Main Entry
         cfg = copy.deepcopy(self.cfg)
 
         # resume training
@@ -74,6 +82,20 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
+        # (DA) target dataset
+        if self.is_da:
+            dataset_tgt: BaseImageDataset = hydra.utils.instantiate(cfg.task.dataset_target)
+            assert isinstance(dataset, BaseImageDataset)
+            dataset_src_tgt = SourceTargetDataset(dataset, dataset_tgt)
+            train_dataloader = DataLoader(dataset_src_tgt, **cfg.dataloader)
+
+        # ## Debug dataset
+        # dataset.__getitem__(dataset.__len__() - 1)
+        # dataset_tgt.__getitem__(dataset_tgt.__len__() - 1)
+        # dataset_src_tgt.__getitem__(dataset_src_tgt.__len__() - 1)
+        # print(len(dataset), len(dataset_tgt), len(dataset_src_tgt))
+        # exit()
+
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
@@ -83,17 +105,34 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
-        lr_scheduler = get_scheduler(
-            cfg.training.lr_scheduler,
-            optimizer=self.optimizer,
-            num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
-            # pytorch assumes stepping LRScheduler every epoch
-            # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
-        )
+        if self.is_da:
+            (g_vis1_opt, d_vis1_opt,
+             g_act_opt, d_act_opt) = self.optimizer
+            get_sch = partial(get_scheduler,
+                              name=cfg.training.lr_scheduler,
+                              num_warmup_steps=cfg.training.lr_warmup_steps,
+                              num_training_steps=(len(train_dataloader) * cfg.training.num_epochs) \
+                                                 // cfg.training.gradient_accumulate_every,
+                              # pytorch assumes stepping LRScheduler every epoch
+                              # however huggingface diffusers steps it every batch
+                              last_epoch=self.global_step-1)
+            g_vis1_sch = get_sch(optimizer=g_vis1_opt)
+            d_vis1_sch = get_sch(optimizer=d_vis1_opt)
+            g_act_sch = get_sch(optimizer=g_act_opt)
+            d_act_sch = get_sch(optimizer=d_act_opt)
+            lr_schedulers = (g_vis1_sch, d_vis1_sch, g_act_sch, d_act_sch)
+        else:
+            lr_scheduler = get_scheduler(
+                cfg.training.lr_scheduler,
+                optimizer=self.optimizer,
+                num_warmup_steps=cfg.training.lr_warmup_steps,
+                num_training_steps=(
+                    len(train_dataloader) * cfg.training.num_epochs) \
+                        // cfg.training.gradient_accumulate_every,
+                # pytorch assumes stepping LRScheduler every epoch
+                # however huggingface diffusers steps it every batch
+                last_epoch=self.global_step-1
+            )
 
         # configure ema
         ema: EMAModel = None
@@ -132,7 +171,11 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
-        optimizer_to(self.optimizer, device)
+        if self.is_da:
+            for opt in self.optimizer:
+                optimizer_to(opt, device)
+        else:
+            optimizer_to(self.optimizer, device)
         
         # save batch for sampling
         train_sampling_batch = None
@@ -156,21 +199,53 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
                         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
-                        # device transfer
-                        batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                        if train_sampling_batch is None:
-                            train_sampling_batch = batch
+                        if not self.is_da:
+                            ''' (1) Vanilla training '''
+                            # device transfer
+                            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                            if train_sampling_batch is None:
+                                train_sampling_batch = batch
 
-                        # compute loss
-                        raw_loss = self.model.compute_loss(batch)
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
+                            # compute loss
+                            raw_loss = self.model.compute_loss(batch)
+                            loss = raw_loss / cfg.training.gradient_accumulate_every
+                            loss.backward()
 
-                        # step optimizer
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            lr_scheduler.step()
+                            # step optimizer
+                            if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                                self.optimizer.step()
+                                self.optimizer.zero_grad()
+                                lr_scheduler.step()
+                        else:
+                            ''' (2) Domain adaptation '''
+                            # device transfer
+                            batch_src = batch['src']
+                            batch_tgt = batch['tgt']
+                            batch_src = dict_apply(batch_src, lambda x: x.to(device, non_blocking=True))
+                            batch_tgt = dict_apply(batch_tgt, lambda x: x.to(device, non_blocking=True))
+                            if train_sampling_batch is None:
+                                train_sampling_batch = batch_src
+
+                            # compute loss
+                            losses: dict = self.model.compute_loss(batch, self.optimizer, lr_schedulers,
+                                                               batch_idx=batch_idx)
+                            raw_loss = losses['da_d1_loss']
+                            losses_log = {}
+                            for k, v in losses.items():
+                                if isinstance(v, torch.Tensor):
+                                    losses_log[k] = v.item()
+                                else:
+                                    losses_log[k] = v
+                            lr_scheduler = lr_schedulers[0]
+                            #### Optimizers are updated in self.model.comupute_loss()
+                            # loss = raw_loss / cfg.training.gradient_accumulate_every
+                            # loss.backward()
+
+                            # # step optimizer
+                            # if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                            #     self.optimizer.step()
+                            #     self.optimizer.zero_grad()
+                            #     lr_scheduler.step()
                         
                         # update ema
                         if cfg.training.use_ema:
@@ -184,7 +259,8 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             'train_loss': raw_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0]
+                            'lr': lr_scheduler.get_last_lr()[0],
+                            **losses_log
                         }
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
