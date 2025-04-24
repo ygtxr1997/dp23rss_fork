@@ -1,0 +1,200 @@
+_target_: diffusion_policy.workspace.train_diffusion_transformer_hybrid_workspace.TrainDiffusionTransformerHybridWorkspace
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+    k: 5
+    mode: max
+    monitor_key: test_mean_score
+dataloader:
+  batch_size: 512  # ori:64
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  shuffle: true
+dataset_obs_steps: 2
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+exp_name: default
+horizon: 10
+keypoint_visible_rate: 1.0
+logging:
+  group: null
+  id: null
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  project: diffusion_policy_debug
+  resume: true
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+n_action_steps: 8
+n_latency_steps: 0
+n_obs_steps: 2
+name: train_diffusion_transformer_hybrid
+obs_as_cond: true
+optimizer:
+  betas:
+  - 0.9
+  - 0.95
+  learning_rate: 0.0001
+  obs_encoder_weight_decay: 0.01  # ori:1.0e-06
+  transformer_weight_decay: 0.01  # ori:0.001
+past_action_visible: false
+policy:
+  # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
+  _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
+  use_da: true
+  domain_adapt:
+    src_ckpt: "data/experiments/image/pusht/diffusion_policy_transformer/train_0/epoch=0100-test_mean_score=0.748.ckpt"
+
+    debug_diff_loss: false  # if true, ignore da_act/shuffle_target_goal/cfg_drop_ratio
+    debug_tsne: false
+    shuffle_target_goal: true
+    cfg_drop_ratio: 0.2  # default:0.2
+    reg_source_diff_loss: 0.  # default:1.0
+    use_dann_lambda: false
+
+    use_da_visual: 'false'  # static,gripper,both,false
+    use_da_act: true
+    act_loss_from: "mlp"  # ori:`k,v`, choices:`k`,`v`,`q`,`sa`,`ca`,`attn`,`softmax`,`mlp`
+    act_layers: 8  # ori:6
+    act_weights: "adapter"  # ori:`ca`, choices:`ca`,`adapter`,`mlp`
+
+    visual_da:
+      _target_: diffusion_policy.model.domain_adapt.wgan.WGAN_GP
+      _recursive_: false
+      in_dim: "64*1,"  # trans_enc:1536, res_perceptual:1024, voltron_perceptual:1152, action_emb:10*512
+      in_ndim: "2*1,"
+      use_bn: true  # ori:true
+      gamma: 10
+
+    action_da:
+      _target_: diffusion_policy.model.domain_adapt.wgan.WGAN_GP
+      _recursive_: false
+      in_dim: "2*1,"  # ori:`1536*12`, kv:(1536,2), q/mlp:(512,3), attn:(512,3), softmax:(8,4)
+      in_ndim: "3*1,"  # ori:`2*12`
+      inner_dim: 8  # ori:64
+      use_bn: false  # ori:true
+      gamma: 10  # ori:10
+      num_layers: 1  # v:6 layers, k:6 layers
+      use_ada: true
+      use_cond_dist: false
+
+    optimizer_config:
+      vis1_lr: 5e-7  # ori:1e-6
+      vis2_lr: 1e-5  # not used
+      act_lr: 5e-7  # ori:5e-7
+
+  causal_attn: true
+  crop_shape:
+  - 84
+  - 84
+  eval_fixed_crop: true
+  horizon: 10
+  n_action_steps: 8
+  n_cond_layers: 0
+  n_emb: 256
+  n_head: 4
+  n_layer: 8
+  n_obs_steps: 2
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    beta_start: 0.0001
+    clip_sample: true
+    num_train_timesteps: 100
+    prediction_type: epsilon
+    variance_type: fixed_small
+  num_inference_steps: 100
+  obs_as_cond: true
+  obs_encoder_group_norm: true
+  p_drop_attn: 0.3
+  p_drop_emb: 0.0
+  shape_meta: ${shape_meta}
+  time_as_cond: true
+image_shape: &image_shape [3, 96, 96]
+shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
+  # acceptable types: rgb, low_dim
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+task:
+  dataset:  # Source domain
+    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
+    horizon: 10
+    max_train_episodes: 90
+    pad_after: 7
+    pad_before: 1
+    seed: 42
+    val_ratio: 0.02
+    zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
+  dataset_target:  # Target domain
+    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
+    horizon: 10
+    max_train_episodes: 200  # ori:90
+    pad_after: 7
+    pad_before: 1
+    seed: 42
+    val_ratio: 0.02
+    zarr_path: data/pusht/pusht_size_random.zarr
+  env_runner:
+    _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
+    fps: 10
+    legacy_test: true
+    max_steps: 300
+    n_action_steps: 8
+    n_envs: null
+    n_obs_steps: 2
+    n_test: 25  # ori:50
+    n_test_vis: 4
+    n_train: 6
+    n_train_vis: 2
+    past_action: false
+    test_start_seed: 4300000  # ori:100000, download:4300000, [Note]: Should be totally same with the loading ckpt!!!
+    train_start_seed: 0
+    domain_shift: size
+  image_shape:
+  - 3
+  - 96
+  - 96
+  name: pusht_image
+  shape_meta: ${shape_meta}
+task_name: pusht_image
+training:
+  checkpoint_every: ${training.rollout_every}  # ori:50
+  debug: false
+  device: cuda:0
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  max_train_steps: null
+  max_val_steps: null
+  num_epochs: 3050  # ori:3050
+  resume: true
+  rollout_every: 10  # ori:50
+  sample_every: 5
+  seed: 42
+  tqdm_interval_sec: 1.0
+  use_ema: true
+  val_every: 1
+val_dataloader:
+  batch_size: 64
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  shuffle: false
