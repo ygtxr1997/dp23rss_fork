@@ -192,6 +192,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+
+        # For real-world inference
+        self.infer_frame_idx = 0
+        self.cached_action = None
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -278,11 +282,14 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             cond_mask[:,:To,Da:] = True
 
         # run sampling
+        ## remove useless args
+        useless_keys = ['use_da', 'domain_adapt']
+        passed_kwargs = {k: v for k, v in self.kwargs.items() if k not in useless_keys}
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             cond=cond,
-            **self.kwargs)
+            **passed_kwargs)
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]

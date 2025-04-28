@@ -3,12 +3,12 @@ checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
   topk:
-    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt
     k: 5
-    mode: max
-    monitor_key: test_mean_score
+    mode: min
+    monitor_key: val_loss  # ori: test_mean_score
 dataloader:
-  batch_size: 512  # ori:64
+  batch_size: 64  # ori:64
   num_workers: 8
   persistent_workers: false
   pin_memory: true
@@ -49,11 +49,12 @@ optimizer:
   - 0.95
   learning_rate: 0.0001
   obs_encoder_weight_decay: 0.01  # ori:1.0e-06
-  transformer_weight_decay: 0.01  # ori:0.001
+  transformer_weight_decay: 0.001  # ori:0.001
 past_action_visible: false
 policy:
   # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
+  # hdfree: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
+  _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
   use_da: false
   domain_adapt:
     src_ckpt: "data/experiments/image/pusht/diffusion_policy_transformer/train_0/epoch=0100-test_mean_score=0.748.ckpt"
@@ -97,56 +98,59 @@ policy:
       act_lr: 5e-7  # ori:5e-7
 
   causal_attn: true
-  crop_shape:
-  - 84
-  - 84
+  crop_shape: # h,w
+  - 216  # ori:84
+  - 288
   eval_fixed_crop: true
   horizon: ${horizon}
   n_action_steps: 8
   n_cond_layers: 0
-  n_emb: 256
-  n_head: 4
+  n_emb: 768
+  n_head: 8
   n_layer: 8
   n_obs_steps: ${n_obs_steps}
   noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
     beta_end: 0.02
     beta_schedule: squaredcos_cap_v2
     beta_start: 0.0001
     clip_sample: true
+    set_alpha_to_one: True
     num_train_timesteps: 100
-    prediction_type: epsilon
-    variance_type: fixed_small
-  num_inference_steps: 100
-  obs_as_cond: true
+    steps_offset: 0
+    # prediction_type: epsilon
+    # variance_type: fixed_small
+
+  num_inference_steps: 8
+  obs_as_cond: true  # ori: true
   obs_encoder_group_norm: true
   p_drop_attn: 0.3
   p_drop_emb: 0.0
   shape_meta: ${shape_meta}
   time_as_cond: true
-image_shape: &image_shape [3, 96, 96]
+image_shape: &image_shape [3, 240, 320]
 shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
   # acceptable types: rgb, low_dim
   obs:
     image:
       shape: *image_shape
       type: rgb
-    agent_pos:
-      shape: [2]
+    joint_state:
+      shape: [6]
       type: low_dim
   action:
-    shape: [2]
+    shape: [7]
 task:
   dataset:  # Source domain
-    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
-    shape_meta: *shape_meta
+    _target_: diffusion_policy.dataset.tcl_dataset.TCLImageDataset
+    shape_meta: ${shape_meta}
     horizon: ${horizon}
     max_train_episodes: 90
     pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
-    zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
+    data_root: "/home/geyuan/datasets/TCL/collected_data_0425"
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: *shape_meta
@@ -181,7 +185,7 @@ task:
   shape_meta: ${shape_meta}
 task_name: pusht_image
 training:
-  checkpoint_every: ${training.rollout_every}  # ori:50
+  checkpoint_every: 50  # ori:50
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
@@ -189,14 +193,14 @@ training:
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 3050  # ori:3050
+  num_epochs: 3000  # ori:3050
   resume: true
-  rollout_every: 10  # ori:50
+  rollout_every: 10000  # ori:50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
   use_ema: true
-  val_every: 1
+  val_every: 50
 val_dataloader:
   batch_size: 64
   num_workers: 8

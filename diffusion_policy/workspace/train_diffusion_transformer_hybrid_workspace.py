@@ -199,6 +199,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
                         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
+                        losses_log = {}
                         if not self.is_da:
                             ''' (1) Vanilla training '''
                             # device transfer
@@ -230,7 +231,6 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             losses: dict = self.model.compute_loss(batch, self.optimizer, lr_schedulers,
                                                                batch_idx=batch_idx)
                             raw_loss = losses['da_d1_loss']
-                            losses_log = {}
                             for k, v in losses.items():
                                 if isinstance(v, torch.Tensor):
                                     losses_log[k] = v.item()
@@ -286,7 +286,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                if (self.epoch % cfg.training.rollout_every) == -1:  # TODO: banned
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)
