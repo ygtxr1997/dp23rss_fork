@@ -28,7 +28,9 @@ class TCLImageDataset(BaseImageDataset):
         super().__init__()
         # RoboKit Dataset
         self.data_root = data_root
-        self.tcl_dataset = TCLDataset(data_root, use_extracted=True)
+        self.shape_meta = shape_meta
+        self.load_keys = ["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text"]
+        self.tcl_dataset = TCLDataset(data_root, use_extracted=True, load_keys=self.load_keys)
         self.data_meta = self.tcl_dataset.load_statistics_from_json(os.path.join(data_root, "statistics.json"))
         self.all_rel_actions = self.tcl_dataset.extracted_data["rel_actions"]
         self.dataset_min = np.array(self.data_meta["min"])
@@ -48,18 +50,23 @@ class TCLImageDataset(BaseImageDataset):
             self.task_prefix_lengths[i] = self.task_prefix_lengths[i - 1] + self.task_lengths[i - 1]
 
         # Data format and preprocessing
+
         self.obs_image_shape = shape_meta["obs"]["image"]["shape"]  # [3, H, W]
+        self.obs_gripper_shape = shape_meta["obs"]["gripper"]["shape"] if "gripper" in shape_meta["obs"] else None
         self.joint_state_shape = shape_meta["obs"]["joint_state"]["shape"]
         self.action_shape = shape_meta["action"]["shape"]   # [7,]
+        obs_image_wh_ratio = float(self.obs_image_shape[2]) / float(self.obs_image_shape[1])  # wh 4:3=16:12=12:9
         self.obs_image_transform = transforms.Compose([
-            transforms.ToPILImage(),
+            transforms.ToPILImage(),  # wh 16:9
             transforms.Resize(self.obs_image_shape[1:]),
-            transforms.ColorJitter(brightness=0.04,
-                contrast=0.04,
-                saturation=0.04,
-                hue=0.01),
+            # transforms.RandomResizedCrop(size=self.obs_image_shape[1:], scale=(0.68, 0.82),  # 12/16=0.75
+            #                              ratio=(0.9 * obs_image_wh_ratio, 1.1 * obs_image_wh_ratio)),  # not using this would be better?
+            transforms.ColorJitter(brightness=0.05,
+                contrast=0.05,
+                saturation=0.05,
+                hue=0.05),
             transforms.ToTensor(),
-        ])
+        ])  # Similar augmentation params with OCTO
 
         print(f"[TCLImageDataset] dataset loaded, "
               f"action_min={self.dataset_min}, action_max={self.dataset_max}")
@@ -71,8 +78,11 @@ class TCLImageDataset(BaseImageDataset):
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
-        normalizer['image'] = EmptyNormalizer.create_identity()
-        normalizer['joint_state'] = EmptyNormalizer.create_identity()
+        obs_keys = self.shape_meta["obs"].keys()
+        for obs_key in obs_keys:
+            normalizer[obs_key] = EmptyNormalizer.create_identity()
+        # normalizer['image'] = EmptyNormalizer.create_identity()
+        # normalizer['joint_state'] = EmptyNormalizer.create_identity()
         normalizer['action'] = EmptyNormalizer.create_identity()
         return normalizer
 
@@ -133,27 +143,36 @@ class TCLImageDataset(BaseImageDataset):
         #       f"task_last_ep={self.task_prefix_lengths[task_id] + self.task_lengths[task_id]}"
         #       )
         # print(f"[DEBUG] _get_obs_data: abs_obs_indices={abs_obs_indices} ")
+        obs_keys = self.shape_meta["obs"].keys()
         obs_data = {
-            "image": [],
-            "joint_state": [],
+            k: [] for k in obs_keys
         }
         for idx in abs_obs_indices:
             if idx is None:
                 c, h, w = self.obs_image_shape
-                zero_rgb = torch.ones((c, h, w)).to(torch.float32) * -1
+                zero_rgb = torch.ones((c, h, w)).to(torch.float32) * -1  # all -1
                 primary_rgb = zero_rgb
+                gripper_rgb = zero_rgb
                 tcp_pose = torch.zeros((6,)).to(torch.float32)
             else:
                 sample_dict = self.tcl_dataset.__getitem__(idx)
                 primary_rgb = sample_dict['primary_rgb']  # (H,W,C)
+                gripper_rgb = sample_dict['gripper_rgb']  # (H,W,C)
                 tcp_pose = joint_state = sample_dict['robot_obs'][:6]  # (6,)
                 # Preprocess
-                primary_rgb = self.obs_image_transform(primary_rgb)  # (C,H,W), in [-1,1]
+                primary_rgb = self.obs_image_transform(primary_rgb)  # (C,H,W), in [0, 1]
+                primary_rgb = primary_rgb * 2. - 1.  # in [-1, 1]
                 tcp_pose = torch.from_numpy(tcp_pose).to(torch.float32)  # (6,)
+                if "gripper" in obs_keys:
+                    gripper_rgb = self.obs_image_transform(gripper_rgb)
+                    gripper_rgb = gripper_rgb * 2. - 1.
             obs_data["image"].append(primary_rgb)
             obs_data["joint_state"].append(tcp_pose)
-        obs_data["image"] = torch.stack(obs_data["image"])  # should be (T,C,H,W)
-        obs_data["joint_state"] = torch.stack(obs_data["joint_state"])  # (T,6)
+            if "gripper" in obs_keys:
+                obs_data["gripper"].append(gripper_rgb)
+        obs_data = {k: torch.stack(v) for k, v in obs_data.items()}
+        # obs_data["image"] = torch.stack(obs_data["image"])  # should be (T,C,H,W)
+        # obs_data["joint_state"] = torch.stack(obs_data["joint_state"])  # (T,6)
         return obs_data
 
     def _get_act_data(self, abs_idx: int):

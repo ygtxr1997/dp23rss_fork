@@ -9,7 +9,7 @@ checkpoint:
     monitor_key: val_loss  # ori: test_mean_score
 dataloader:
   batch_size: 64  # ori:64
-  num_workers: 8
+  num_workers: 16
   persistent_workers: false
   pin_memory: true
   shuffle: true
@@ -23,11 +23,11 @@ ema:
   update_after_step: 0
 
 exp_name: default
-horizon: 16
+horizon: 32
 keypoint_visible_rate: 1.0
 n_action_steps: 8
 n_latency_steps: 0
-n_obs_steps: 2
+n_obs_steps: 1  # ori:2
 name: train_diffusion_transformer_hybrid
 obs_as_cond: true
 
@@ -105,8 +105,8 @@ policy:
   horizon: ${horizon}
   n_action_steps: 8
   n_cond_layers: 0
-  n_emb: 768
-  n_head: 8
+  n_emb: 256
+  n_head: 4
   n_layer: 8
   n_obs_steps: ${n_obs_steps}
   noise_scheduler:
@@ -132,7 +132,10 @@ image_shape: &image_shape [3, 240, 320]
 shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
   # acceptable types: rgb, low_dim
   obs:
-    image:
+    image:  # static
+      shape: *image_shape
+      type: rgb
+    gripper:  # gripper
       shape: *image_shape
       type: rgb
     joint_state:
@@ -150,7 +153,7 @@ task:
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
-    data_root: "/home/geyuan/datasets/TCL/collected_data_0425"
+    data_root: "/home/geyuan/local_soft/TCL/collected_data_0507"
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: *shape_meta
@@ -203,7 +206,7 @@ training:
   val_every: 50
 val_dataloader:
   batch_size: 64
-  num_workers: 8
+  num_workers: 48
   persistent_workers: false
   pin_memory: true
   shuffle: false
