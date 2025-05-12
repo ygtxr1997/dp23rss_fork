@@ -46,7 +46,7 @@ def get_agent(device: str):
     from omegaconf import OmegaConf
 
     # 1. Load hydra config
-    train_dir = "/home/geyuan/code/dp23rss_fork/data/outputs/2025.05.08/17.13.22_train_diffusion_transformer_hybrid_pusht_images"
+    train_dir = "/home/geyuan/code/dp23rss_fork/data/outputs/2025.05.11/01.08.40_train_diffusion_transformer_hybrid_pusht_images"
     hydra_config_path = os.path.join(train_dir, ".hydra/config.yaml")
     hydra_config = OmegaConf.load(hydra_config_path)
     model = hydra.utils.instantiate(hydra_config.policy)
@@ -70,7 +70,7 @@ def get_agent(device: str):
     # 3. Other settings
     model.infer_frame_idx = 0
 
-    return model, hydra_config
+    return model, hydra_config, weight_path
 
 
 @gpu_app.get("/")
@@ -80,15 +80,15 @@ def read_root():
 
 @gpu_app.get("/reset")
 def model_reset():
-    agent, image_shape = get_agent("cuda")
+    agent, image_shape, _ = get_agent("cuda")
     agent.reset()
     return {"message": "Done"}
 
 
 @gpu_app.post("/step")
 def model_step(step_request: StepRequestWithObservation):
-    agent, hydra_config = get_agent("cuda")  # shape:[C,H,W]
-    print("[gpu_service] Using cached ckpt from: None. Model type:", type(agent))
+    agent, hydra_config, weight_path = get_agent("cuda")  # shape:[C,H,W]
+    print("[gpu_service] Using cached ckpt from: None. Model type:", type(agent), weight_path)
 
     # 1. Decode observation from received request
     image_shape = hydra_config.image_shape
@@ -141,7 +141,7 @@ def model_step(step_request: StepRequestWithObservation):
     # }
 
     # 3.a Model inference
-    action_idx = agent.infer_frame_idx % 4
+    action_idx = agent.infer_frame_idx % 6
     if action_idx == 0:
         with torch.no_grad():
             action = agent.predict_action(obs_dict)['action_pred']

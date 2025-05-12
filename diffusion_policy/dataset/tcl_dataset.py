@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torchvision.transforms import transforms
 
-from robokit.data.tcl_datasets import TCLDataset
+from robokit.data.tcl_datasets import TCLDataset, TCLDatasetHDF5
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
@@ -24,13 +24,30 @@ class TCLImageDataset(BaseImageDataset):
                  seed: int = 42,
                  val_ratio: float = 0.02,
                  max_train_episodes: int = 90,
+                 # RoboKit Dataset
+                 h5_path: str = None,
+                 use_h5: bool = False,
                  ):
         super().__init__()
         # RoboKit Dataset
         self.data_root = data_root
         self.shape_meta = shape_meta
         self.load_keys = ["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text"]
-        self.tcl_dataset = TCLDataset(data_root, use_extracted=True, load_keys=self.load_keys)
+        self.h5_path = h5_path
+        self.use_h5 = use_h5
+        if not use_h5:
+            self.tcl_dataset = TCLDataset(data_root, use_extracted=True, load_keys=self.load_keys)
+        else:
+            self.tcl_dataset = TCLDatasetHDF5(
+                data_root, h5_path,
+                keys_config={
+                    "primary_rgb": "rgb",
+                    "gripper_rgb": "rgb",
+                    "language_text": "string",
+                    # "rel_actions": "float",
+                    "robot_obs": "float"
+                },
+                use_extracted=True, load_keys=self.load_keys)
         self.data_meta = self.tcl_dataset.load_statistics_from_json(os.path.join(data_root, "statistics.json"))
         self.all_rel_actions = self.tcl_dataset.extracted_data["rel_actions"]
         self.dataset_min = np.array(self.data_meta["min"])
@@ -41,6 +58,11 @@ class TCLImageDataset(BaseImageDataset):
         self.ep_fns = self.tcl_dataset.ep_fns
         self.map_index_to_task_id = self.tcl_dataset.map_index_to_task_id
 
+        # Others
+        self.seed = seed
+        self.val_ratio = val_ratio
+        self.max_train_episodes = max_train_episodes
+
         # Sampling a data sequence
         self.horizon = horizon
         self.pad_before = pad_before
@@ -50,7 +72,6 @@ class TCLImageDataset(BaseImageDataset):
             self.task_prefix_lengths[i] = self.task_prefix_lengths[i - 1] + self.task_lengths[i - 1]
 
         # Data format and preprocessing
-
         self.obs_image_shape = shape_meta["obs"]["image"]["shape"]  # [3, H, W]
         self.obs_gripper_shape = shape_meta["obs"]["gripper"]["shape"] if "gripper" in shape_meta["obs"] else None
         self.joint_state_shape = shape_meta["obs"]["joint_state"]["shape"]
@@ -72,7 +93,21 @@ class TCLImageDataset(BaseImageDataset):
               f"action_min={self.dataset_min}, action_max={self.dataset_max}")
 
     def get_validation_dataset(self):
-        val_set = copy.deepcopy(self)
+        return self.create_val_dataset(self)
+
+    @classmethod
+    def create_val_dataset(cls, instance: 'TCLImageDataset'):
+        val_set = cls(
+            data_root=instance.data_root,
+            horizon=instance.horizon,
+            pad_before=instance.pad_before,
+            pad_after=instance.pad_after,
+            shape_meta=instance.shape_meta,
+            seed=instance.seed,
+            val_ratio=instance.val_ratio,
+            max_train_episodes=instance.max_train_episodes,
+            use_h5=False,  # no need to use h5
+        )
         val_set.tcl_dataset.total_length = 64
         return val_set
 

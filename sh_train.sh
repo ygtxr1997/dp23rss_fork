@@ -18,7 +18,7 @@
 
 
 CONFIG_NAME="tcl_dp_transformer.yaml"
-DEVICE="cuda:3"
+DEVICE="cuda"
 
 export HYDRA_FULL_ERROR=1
 
