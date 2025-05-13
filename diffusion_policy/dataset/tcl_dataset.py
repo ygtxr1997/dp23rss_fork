@@ -24,6 +24,7 @@ class TCLImageDataset(BaseImageDataset):
                  seed: int = 42,
                  val_ratio: float = 0.02,
                  max_train_episodes: int = 90,
+                 transform_color_jitter: bool = True,
                  # RoboKit Dataset
                  h5_path: str = None,
                  use_h5: bool = False,
@@ -40,13 +41,6 @@ class TCLImageDataset(BaseImageDataset):
         else:
             self.tcl_dataset = TCLDatasetHDF5(
                 data_root, h5_path,
-                keys_config={
-                    "primary_rgb": "rgb",
-                    "gripper_rgb": "rgb",
-                    "language_text": "string",
-                    # "rel_actions": "float",
-                    "robot_obs": "float"
-                },
                 use_extracted=True, load_keys=self.load_keys)
         self.data_meta = self.tcl_dataset.load_statistics_from_json(os.path.join(data_root, "statistics.json"))
         self.all_rel_actions = self.tcl_dataset.extracted_data["rel_actions"]
@@ -77,17 +71,19 @@ class TCLImageDataset(BaseImageDataset):
         self.joint_state_shape = shape_meta["obs"]["joint_state"]["shape"]
         self.action_shape = shape_meta["action"]["shape"]   # [7,]
         obs_image_wh_ratio = float(self.obs_image_shape[2]) / float(self.obs_image_shape[1])  # wh 4:3=16:12=12:9
-        self.obs_image_transform = transforms.Compose([
+        transform_list = [
             transforms.ToPILImage(),  # wh 16:9
             transforms.Resize(self.obs_image_shape[1:]),
+        ]
+        if transform_color_jitter:
             # transforms.RandomResizedCrop(size=self.obs_image_shape[1:], scale=(0.68, 0.82),  # 12/16=0.75
             #                              ratio=(0.9 * obs_image_wh_ratio, 1.1 * obs_image_wh_ratio)),  # not using this would be better?
-            transforms.ColorJitter(brightness=0.05,
+            transform_list.append(transforms.ColorJitter(brightness=0.05,
                 contrast=0.05,
                 saturation=0.05,
-                hue=0.05),
-            transforms.ToTensor(),
-        ])  # Similar augmentation params with OCTO
+                hue=0.05))
+        transform_list.append(transforms.ToTensor())
+        self.obs_image_transform = transforms.Compose(transform_list)  # Similar augmentation params with OCTO
 
         print(f"[TCLImageDataset] dataset loaded, "
               f"action_min={self.dataset_min}, action_max={self.dataset_max}")

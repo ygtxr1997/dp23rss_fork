@@ -890,7 +890,7 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
 
         # handle different ways of passing observation
         cond = None
-        s_trajectory = s_nactions
+        s_trajectory = s_nactions  # value will not be used
         t_trajectory = t_nactions
         if self.obs_as_cond:  # go here
             # reshape B, T, ... to B*T
@@ -977,16 +977,17 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         t_feat_for_da_act = []
         s_feat_for_da_act = []
         if 'mlp' in self.act_loss_from:
-            # s_feat_for_da_act.extend(s_mlp_list[left:right])
-            # t_feat_for_da_act.extend(t_mlp_list[left:right])
-            s_feat_for_da_act.append(s_pred)
-            t_feat_for_da_act.append(t_pred)
+            s_feat_for_da_act.extend(s_mlp_list[left:right])
+            t_feat_for_da_act.extend(t_mlp_list[left:right])
+            # s_feat_for_da_act.append(s_pred)
+            # t_feat_for_da_act.append(t_pred)
 
         t_feat_for_da_vis1 = t_vis_emb
         s_feat_for_da_vis1 = s_vis_emb
         # print(s_vis_emb.shape, t_vis_emb.shape)  # (B,64)
-        # print(len(s_feat_for_da_act), len(t_feat_for_da_act))  # 6
-        # print(s_feat_for_da_act[0].shape, t_feat_for_da_act[0].shape)  # (B,10,256)
+        # print(len(s_feat_for_da_act), len(t_feat_for_da_act))  # 8, 8
+        # print(s_feat_for_da_act[0].shape, t_feat_for_da_act[0].shape)  # (B,horizon,256)
+        # exit()
 
         ''' 1. Update D '''
         if self.use_da_vis1:

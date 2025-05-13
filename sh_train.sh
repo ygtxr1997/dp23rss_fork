@@ -17,7 +17,8 @@
 #  hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
 
-CONFIG_NAME="tcl_dp_transformer.yaml"
+#CONFIG_NAME="tcl_dp_transformer.yaml"
+CONFIG_NAME="tcl_hdfree_dp.yaml"
 DEVICE="cuda"
 
 export HYDRA_FULL_ERROR=1

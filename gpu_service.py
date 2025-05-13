@@ -46,7 +46,7 @@ def get_agent(device: str):
     from omegaconf import OmegaConf
 
     # 1. Load hydra config
-    train_dir = "/home/geyuan/code/dp23rss_fork/data/outputs/2025.05.11/01.08.40_train_diffusion_transformer_hybrid_pusht_images"
+    train_dir = "/home/geyuan/code/dp23rss_fork/data/outputs/2025.05.11/22.48.36_train_diffusion_transformer_hybrid_pusht_images"
     hydra_config_path = os.path.join(train_dir, ".hydra/config.yaml")
     hydra_config = OmegaConf.load(hydra_config_path)
     model = hydra.utils.instantiate(hydra_config.policy)
@@ -57,7 +57,7 @@ def get_agent(device: str):
     weight_paths = list(filter(lambda x: x.endswith(".ckpt"), weight_paths))
     weight_paths.sort()
     print(weight_paths)
-    weight_path = os.path.join(train_dir, "checkpoints", weight_paths[4])
+    weight_path = os.path.join(train_dir, "checkpoints", weight_paths[-2])
     weight = torch.load(weight_path, map_location="cpu", weights_only=False)['state_dicts']
     weight = weight['model']
     # for k, v in weight.items():

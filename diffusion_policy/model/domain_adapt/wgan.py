@@ -338,43 +338,43 @@ class Discriminator2d(torch.nn.Module):
         super(Discriminator2d, self).__init__()
         down_scale = min(4, in_dim // 64)
         k_size = (3, 4)
-        # self.stem = nn.Sequential(
-        #     nn.Conv2d(1, inner_dim, k_size, (1, down_scale), 1, bias=False),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Conv2d(inner_dim, inner_dim * 2, k_size, (2, 4), 1, bias=False),
-        # )
-        # self.convs = nn.ModuleList([
-        #     nn.Sequential(
-        #         nn.LeakyReLU(0.2, inplace=True),
-        #         nn.Conv2d(inner_dim * 2, inner_dim * 4, k_size, (2, 4), 1, bias=False),
-        #     ),
-        #     nn.Sequential(
-        #         nn.LeakyReLU(0.2, inplace=True),
-        #         nn.Conv2d(inner_dim * 4, inner_dim * 8, (1, 4), (1, 4), (0, 1), bias=False),
-        #     ),
-        #     nn.Sequential(
-        #         nn.LeakyReLU(0.2, inplace=True),
-        #     ),
-        # ])
-        k_size = (1, 1)
         self.stem = nn.Sequential(
-            nn.Conv2d(1, inner_dim, k_size, (1, 1), 0, bias=False),
+            nn.Conv2d(1, inner_dim, k_size, (1, down_scale), 1, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(inner_dim, inner_dim * 2, k_size, (1, 1), 0, bias=False),
+            nn.Conv2d(inner_dim, inner_dim * 2, k_size, (2, 4), 1, bias=False),
         )
         self.convs = nn.ModuleList([
             nn.Sequential(
                 nn.LeakyReLU(0.2, inplace=True),
-                nn.Conv2d(inner_dim * 2, inner_dim * 4, k_size, (1, 1), 0, bias=False),
+                nn.Conv2d(inner_dim * 2, inner_dim * 4, k_size, (2, 4), 1, bias=False),
             ),
             nn.Sequential(
                 nn.LeakyReLU(0.2, inplace=True),
-                nn.Conv2d(inner_dim * 4, inner_dim * 8, (1, 1), (1, 1), (0, 0), bias=False),
+                nn.Conv2d(inner_dim * 4, inner_dim * 8, (1, 4), (1, 4), (0, 1), bias=False),
             ),
             nn.Sequential(
                 nn.LeakyReLU(0.2, inplace=True),
             ),
         ])
+        # k_size = (1, 1)
+        # self.stem = nn.Sequential(
+        #     nn.Conv2d(1, inner_dim, k_size, (1, 1), 0, bias=False),
+        #     nn.LeakyReLU(0.2, inplace=True),
+        #     nn.Conv2d(inner_dim, inner_dim * 2, k_size, (1, 1), 0, bias=False),
+        # )
+        # self.convs = nn.ModuleList([
+        #     nn.Sequential(
+        #         nn.LeakyReLU(0.2, inplace=True),
+        #         nn.Conv2d(inner_dim * 2, inner_dim * 4, k_size, (1, 1), 0, bias=False),
+        #     ),
+        #     nn.Sequential(
+        #         nn.LeakyReLU(0.2, inplace=True),
+        #         nn.Conv2d(inner_dim * 4, inner_dim * 8, (1, 1), (1, 1), (0, 0), bias=False),
+        #     ),
+        #     nn.Sequential(
+        #         nn.LeakyReLU(0.2, inplace=True),
+        #     ),
+        # ])
         if use_bn:
             self.norms = nn.ModuleList([
                 nn.BatchNorm2d(inner_dim * 2),
@@ -388,7 +388,8 @@ class Discriminator2d(torch.nn.Module):
             # self.logit_out = nn.Linear(inner_dim * 8 * 1, 1, bias=False)
             self.logit_out = nn.Linear(1280, 1, bias=False)
         else:
-            self.logit_out = nn.Linear(inner_dim * 8 * (in_dim // 256) * 3, 1, bias=False)
+            self.logit_out = nn.Linear((inner_dim * 8) * (in_dim // 256) * (32 // 4), 1, bias=False)
+            # (inner_dim*scale), (in_dim//stride), (horizon)
 
         self.use_ada = use_ada
         if use_ada:
@@ -405,6 +406,7 @@ class Discriminator2d(torch.nn.Module):
         if x.ndim == 3:  # (B,T,D)
             x = x.unsqueeze(1)  # (B,1,T,D)
         x = self.stem(x)
+        # print("[DEBUG] stem:", x.shape)
 
         for i in range(len(self.convs)):
             x = self.norms[i](x)
@@ -414,8 +416,10 @@ class Discriminator2d(torch.nn.Module):
                 c_shift, c_scale, c_gate = [c.unsqueeze(-1).unsqueeze(-1) for c in [c_shift, c_scale, c_gate]]
                 x = (1 - c_gate) * x + c_gate * (c_shift + x * (c_scale + 1.))
             x = self.convs[i](x)
+            # print(f"[DEBUG] conv_{i}:", x.shape)
 
         x = x.reshape(x.size(0), -1)
+        # print(f"[DEBUG] reshape:", x.shape)
         output = self.logit_out(self.dropout(x))
         return output
 
