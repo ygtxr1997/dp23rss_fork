@@ -21,6 +21,7 @@ from robokit.service.service_connector import ServiceConnector
 $ CUDA_VISIBLE_DEVICES=9 uvicorn gpu_service:gpu_app --port 6060
 """
 gpu_app = FastAPI()
+max_cache_action = 24
 with open("/mnt/dongxu-fs1/data-hdd/geyuan/datasets/TCL/collected_data_0507/statistics.json", 'r') as json_file:
     statistics = json.load(json_file)
     data_min = torch.from_numpy(np.array(statistics['min']))
@@ -46,7 +47,7 @@ def get_agent(device: str):
     from omegaconf import OmegaConf
 
     # 1. Load hydra config
-    train_dir = "/home/geyuan/code/dp23rss_fork/data/outputs/2025.05.11/22.48.36_train_diffusion_transformer_hybrid_pusht_images"
+    train_dir = "/home/geyuan/code/dp23rss_fork/data/outputs/2025.05.13/16.05.08_train_diffusion_transformer_hybrid_pusht_images"
     hydra_config_path = os.path.join(train_dir, ".hydra/config.yaml")
     hydra_config = OmegaConf.load(hydra_config_path)
     model = hydra.utils.instantiate(hydra_config.policy)
@@ -57,7 +58,7 @@ def get_agent(device: str):
     weight_paths = list(filter(lambda x: x.endswith(".ckpt"), weight_paths))
     weight_paths.sort()
     print(weight_paths)
-    weight_path = os.path.join(train_dir, "checkpoints", weight_paths[-2])
+    weight_path = os.path.join(train_dir, "checkpoints", weight_paths[-1])
     weight = torch.load(weight_path, map_location="cpu", weights_only=False)['state_dicts']
     weight = weight['model']
     # for k, v in weight.items():
@@ -82,7 +83,7 @@ def read_root():
 def model_reset():
     agent, image_shape, _ = get_agent("cuda")
     agent.reset()
-    return {"message": "Done"}
+    return {"max_cache_action": max_cache_action}
 
 
 @gpu_app.post("/step")
@@ -92,56 +93,60 @@ def model_step(step_request: StepRequestWithObservation):
 
     # 1. Decode observation from received request
     image_shape = hydra_config.image_shape
-    primary_imgs = []
-    for idx, primary_img in enumerate(step_request.primary_rgb):
-        primary_img = base64.b64decode(primary_img)
-        primary_img = Image.open(io.BytesIO(primary_img), formats=["JPEG"])
-        primary_img.save(f"tmp_primary_{idx}.jpg")
-
-        rgb_transform = transforms.Compose([
-            transforms.Resize(image_shape[1:]),
-            transforms.ToTensor(),
-        ])
-        primary_img = rgb_transform(primary_img)  # (C,H,W), in [0,1]
-        primary_img = primary_img * 2. - 1.  # in [-1,1]
-        primary_imgs.append(primary_img)
-
-    gripper_imgs = []
-    for idx, gripper_img in enumerate(step_request.gripper_rgb):
-        gripper_img = base64.b64decode(gripper_img)
-        gripper_img = Image.open(io.BytesIO(gripper_img), formats=["JPEG"])
-        gripper_img.save(f"tmp_gripper_{idx}.jpg")
-
-        rgb_transform = transforms.Compose([
-            transforms.Resize(image_shape[1:]),
-            transforms.ToTensor(),
-        ])
-        gripper_img = rgb_transform(gripper_img)  # (C,H,W), in [0,1]
-        gripper_img = gripper_img * 2. - 1.  # in [-1,1]
-        gripper_imgs.append(gripper_img)
 
     instruction_text = step_request.instruction
     joint_state = step_request.joint_state
-
-    # 2. Preprocess, e.g resize, normalize, to_tensor, to_device
-    primary_img = torch.stack(primary_imgs, dim=0)  # (T,C,H,W)
-    primary_img = primary_img.to("cuda").unsqueeze(0)  # (B,T,C,H,W)
-    gripper_img = torch.stack(gripper_imgs, dim=0)
-    gripper_img = gripper_img.to("cuda").unsqueeze(0)
     joint_state = torch.from_numpy(np.array(joint_state)).to("cuda").unsqueeze(0)  # (B,T,6)
     obs_dict = {
-        "image": primary_img,  # should be (B,T,C,H,W)
         "joint_state": joint_state,  # should be (B,T,6)
     }
-    if "gripper" in hydra_config.shape_meta["obs"]:
-        obs_dict["gripper"] = gripper_img
+
+    if agent.infer_frame_idx % max_cache_action == 0:
+        primary_imgs = []
+        for idx, primary_img in enumerate(step_request.primary_rgb):
+            primary_img = base64.b64decode(primary_img)
+            primary_img = Image.open(io.BytesIO(primary_img), formats=["JPEG"])
+            primary_img.save(f"tmp_primary_{idx}.jpg")
+
+            rgb_transform = transforms.Compose([
+                transforms.Resize(image_shape[1:]),
+                transforms.ToTensor(),
+            ])
+            primary_img = rgb_transform(primary_img)  # (C,H,W), in [0,1]
+            primary_img = primary_img * 2. - 1.  # in [-1,1]
+            primary_imgs.append(primary_img)
+
+        gripper_imgs = []
+        for idx, gripper_img in enumerate(step_request.gripper_rgb):
+            gripper_img = base64.b64decode(gripper_img)
+            gripper_img = Image.open(io.BytesIO(gripper_img), formats=["JPEG"])
+            gripper_img.save(f"tmp_gripper_{idx}.jpg")
+
+            rgb_transform = transforms.Compose([
+                transforms.Resize(image_shape[1:]),
+                transforms.ToTensor(),
+            ])
+            gripper_img = rgb_transform(gripper_img)  # (C,H,W), in [0,1]
+            gripper_img = gripper_img * 2. - 1.  # in [-1,1]
+            gripper_imgs.append(gripper_img)
+
+        # 2. Preprocess, e.g resize, normalize, to_tensor, to_device
+        primary_img = torch.stack(primary_imgs, dim=0)  # (T,C,H,W)
+        primary_img = primary_img.to("cuda").unsqueeze(0)  # (B,T,C,H,W)
+        gripper_img = torch.stack(gripper_imgs, dim=0)
+        gripper_img = gripper_img.to("cuda").unsqueeze(0)
+
+        obs_dict["image"] = primary_img  # should be (B,T,C,H,W)
+        if "gripper" in hydra_config.shape_meta["obs"]:
+            obs_dict["gripper"] = gripper_img
+
     # cond = {
     #     "lang_text": instruction_text,
     #     "proprioception": joint_state,
     # }
 
     # 3.a Model inference
-    action_idx = agent.infer_frame_idx % 6
+    action_idx = agent.infer_frame_idx % max_cache_action
     if action_idx == 0:
         with torch.no_grad():
             action = agent.predict_action(obs_dict)['action_pred']
