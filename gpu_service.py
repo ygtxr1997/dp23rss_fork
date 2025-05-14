@@ -22,7 +22,7 @@ $ CUDA_VISIBLE_DEVICES=9 uvicorn gpu_service:gpu_app --port 6060
 """
 gpu_app = FastAPI()
 max_cache_action = 24
-with open("/mnt/dongxu-fs1/data-hdd/geyuan/datasets/TCL/collected_data_0507/statistics.json", 'r') as json_file:
+with open("/home/geyuan/local_soft/TCL/collected_data_0507/statistics.json", 'r') as json_file:
     statistics = json.load(json_file)
     data_min = torch.from_numpy(np.array(statistics['min']))
     data_max = torch.from_numpy(np.array(statistics['max']))
@@ -47,7 +47,7 @@ def get_agent(device: str):
     from omegaconf import OmegaConf
 
     # 1. Load hydra config
-    train_dir = "/home/geyuan/code/dp23rss_fork/data/outputs/2025.05.13/16.05.08_train_diffusion_transformer_hybrid_pusht_images"
+    train_dir = "/home/geyuan/Documents/ckpt/dp/2025.05.11-01.08.40/"
     hydra_config_path = os.path.join(train_dir, ".hydra/config.yaml")
     hydra_config = OmegaConf.load(hydra_config_path)
     model = hydra.utils.instantiate(hydra_config.policy)
@@ -58,8 +58,8 @@ def get_agent(device: str):
     weight_paths = list(filter(lambda x: x.endswith(".ckpt"), weight_paths))
     weight_paths.sort()
     print(weight_paths)
-    weight_path = os.path.join(train_dir, "checkpoints", weight_paths[-1])
-    weight = torch.load(weight_path, map_location="cpu", weights_only=False)['state_dicts']
+    weight_path = os.path.join(train_dir, "checkpoints", weight_paths[-2])
+    weight = torch.load(weight_path, map_location="cpu")['state_dicts']
     weight = weight['model']
     # for k, v in weight.items():
     #     print(k, v.shape)

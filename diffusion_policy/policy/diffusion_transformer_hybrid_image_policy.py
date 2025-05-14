@@ -309,6 +309,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         }
         return result
 
+    def reset(self):
+        self.infer_frame_idx = 0
+        self.cached_action = None
+
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
