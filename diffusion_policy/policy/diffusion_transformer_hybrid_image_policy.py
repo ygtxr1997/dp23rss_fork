@@ -415,7 +415,7 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
                  **kwargs):
         super().__init__(**kwargs)
         self.src_ckpt = domain_adapt.src_ckpt
-        self.load_from_src_ckpt(self.src_ckpt)  # will have 2 copies: one is for target; another is for source (fixed)
+        self.load_from_src_ckpt(self.src_ckpt, use_ema=False)  # will have 2 copies: one is for target; another is for source (fixed)
 
         # (Source) Create model copies for domain adaptation AFTER loading pretrained weights
         self.src_obs_encoder: ObservationEncoder = copy.deepcopy(self.obs_encoder)
@@ -479,6 +479,11 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             forward_with_da, self.src_obs_encoder.obs_nets['image'])
         self.obs_encoder.obs_nets['image'].forward = types.MethodType(
             forward_with_da, self.obs_encoder.obs_nets['image'])
+
+        self.src_obs_encoder.obs_nets['gripper'].forward = types.MethodType(
+            forward_with_da, self.src_obs_encoder.obs_nets['gripper'])
+        self.obs_encoder.obs_nets['gripper'].forward = types.MethodType(
+            forward_with_da, self.obs_encoder.obs_nets['gripper'])
 
     def load_from_src_ckpt(self, src_ckpt, use_ema: bool = True):
         self.src_ckpt = src_ckpt
@@ -716,6 +721,8 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
     ) -> List[torch.optim.Optimizer]:
         g_vis1_optim_groups = []
         d_vis1_optim_groups = []
+        g_vis2_optim_groups = []
+        d_vis2_optim_groups = []
         g_act_optim_groups = []
         d_act_optim_groups = []
 
@@ -725,14 +732,27 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
 
         ''' Visual Encoder '''
         self.set_requires_grad(self.obs_encoder, False)
-        if self.use_da_vis1:
+        if self.use_da_vis1 or self.use_da_vis2:
             self.freeze_params(self.obs_encoder)
-            self.set_requires_grad(self.obs_encoder.obs_nets['image'].nets[-1], True)
-            g_vis1_optim_groups.extend([
-                {"params": self.trainable_params(self.obs_encoder), "lr": self.optimizer_config.vis1_lr},
-            ])
+            if self.use_da_vis1:
+                self.set_requires_grad(self.obs_encoder.obs_nets['image'].nets[-1], True)
+                g_vis1_optim_groups.extend([
+                    {"params": self.trainable_params(self.obs_encoder.obs_nets['image']), "lr": self.optimizer_config.vis1_lr},
+                ])
+            else:
+                g_vis1_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])
+
+            if self.use_da_vis2:
+                self.set_requires_grad(self.obs_encoder.obs_nets['gripper'].nets[-1], True)
+                g_vis2_optim_groups.extend([
+                    {"params": self.trainable_params(self.obs_encoder.obs_nets['gripper']), "lr": self.optimizer_config.vis2_lr},
+                ])
+            else:
+                g_vis2_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])
+
         else:
             g_vis1_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])  # placeholder
+            g_vis2_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])
 
         ''' Transformer Encoder & Decoder '''
         self.set_requires_grad(self.model, False)
@@ -765,6 +785,14 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         else:
             d_vis1_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])
 
+        if self.use_da_vis2:
+            self.set_requires_grad(self.da_vis2_loss, True)
+            d_vis2_optim_groups.extend([
+                {"params": self.da_vis2_loss.parameters(), "lr": self.optimizer_config.vis2_lr},
+            ])
+        else:
+            d_vis2_optim_groups.extend([{"params": self.placeholder_param, "lr": 0.}])
+
         if self.use_da_act:
             self.set_requires_grad(self.da_act_loss, True)
             d_act_optim_groups.extend([
@@ -782,6 +810,13 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
                                              weight_decay=obs_encoder_weight_decay,
                                              betas=betas)
 
+        g_vis2_optimizer = torch.optim.AdamW(g_vis2_optim_groups,
+                                             weight_decay=obs_encoder_weight_decay,
+                                             betas=betas)
+        d_vis2_optimizer = torch.optim.AdamW(d_vis2_optim_groups,
+                                             weight_decay=obs_encoder_weight_decay,
+                                             betas=betas)
+
         g_act_optimizer = torch.optim.AdamW(g_act_optim_groups,
                                             weight_decay=transformer_weight_decay,
                                             betas=betas)
@@ -794,6 +829,8 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         param_dis_cnt = 0
         if self.use_da_vis1:
             param_dis_cnt += sum(p.numel() for p in self.trainable_params(self, "da_vis1_loss"))
+        if self.use_da_vis2:
+            param_dis_cnt += sum(p.numel() for p in self.trainable_params(self, "da_vis2_loss"))
         if self.use_da_act:
             param_dis_cnt += sum(p.numel() for p in self.trainable_params(self, "da_act_loss"))
         param_all_cnt = sum(p.numel() for p in self.trainable_params(self))
@@ -804,6 +841,7 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
               f"Total trainable params: {param_all_cnt / 1e6:.2f}M. "
               f"All params: {sum(p.numel() for p in self.parameters()) / 1e6:.2f}M.")
         return (g_vis1_optimizer, d_vis1_optimizer,
+                g_vis2_optimizer, d_vis2_optimizer,
                 g_act_optimizer, d_act_optimizer,
                 )
 
@@ -826,8 +864,8 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             return super().compute_loss(batch)
         
         ''' (2) Source-Target batch'''
-        (g_vis1_opt, d_vis1_opt, g_act_opt, d_act_opt) = optimizers
-        (g_vis1_sch, d_vis1_sch, g_act_sch, d_act_sch) = lr_schedulers
+        (g_vis1_opt, d_vis1_opt, g_vis2_opt, d_vis2_opt, g_act_opt, d_act_opt) = optimizers
+        (g_vis1_sch, d_vis1_sch, g_vis2_sch, d_vis2_sch, g_act_sch, d_act_sch) = lr_schedulers
 
         (total_loss, action_loss, cont_loss, id_loss, img_gen_loss,
          da_d1_loss, da_g1_loss, da_d2_loss, da_g2_loss, da_d_act_loss, da_g_act_loss,
@@ -904,8 +942,10 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             t_this_nobs = dict_apply(t_nobs,
                                      lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
             t_nobs_features = self.obs_encoder(t_this_nobs)
-            s_vis_emb = self.src_obs_encoder.obs_nets['image'].cache_vis_out  # (B,64)
-            t_vis_emb = self.obs_encoder.obs_nets['image'].cache_vis_out  # (B,64)
+            s_vis1_emb = self.src_obs_encoder.obs_nets['image'].cache_vis_out  # (B,64)
+            t_vis1_emb = self.obs_encoder.obs_nets['image'].cache_vis_out  # (B,64)
+            s_vis2_emb = self.src_obs_encoder.obs_nets['gripper'].cache_vis_out
+            t_vis2_emb = self.obs_encoder.obs_nets['gripper'].cache_vis_out
             # reshape back to B, T, Do
             s_cond = s_nobs_features.reshape(batch_size, To, -1)
             t_cond = t_nobs_features.reshape(batch_size, To, -1)
@@ -986,8 +1026,10 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             # s_feat_for_da_act.append(s_pred)
             # t_feat_for_da_act.append(t_pred)
 
-        t_feat_for_da_vis1 = t_vis_emb
-        s_feat_for_da_vis1 = s_vis_emb
+        t_feat_for_da_vis1 = t_vis1_emb
+        s_feat_for_da_vis1 = s_vis1_emb
+        t_feat_for_da_vis2 = t_vis2_emb
+        s_feat_for_da_vis2 = s_vis2_emb
         # print(s_vis_emb.shape, t_vis_emb.shape)  # (B,64)
         # print(len(s_feat_for_da_act), len(t_feat_for_da_act))  # 8, 8
         # print(s_feat_for_da_act[0].shape, t_feat_for_da_act[0].shape)  # (B,horizon,256)
@@ -1012,6 +1054,25 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             losses['da_d1_loss'].backward(retain_graph=False)
             d_vis1_opt.step()
             d_vis1_sch.step()
+
+        if self.use_da_vis2:
+            da_loss_dict = self.da_vis2_loss.forward(
+                [t_feat_for_da_vis2.clone().detach()],  # avoid grad of G_target
+                [s_feat_for_da_vis2.detach()],  # avoid grad of G_source
+                is_discriminator_batch=True,
+            )
+            da_d_2_loss = da_loss_dict['loss']
+            w_dist = da_loss_dict['w_dist']
+            gp = da_loss_dict['gp']  # just for log
+            losses['da_d2_loss'] += da_d_2_loss / 1
+            losses['w_dist_2'] += w_dist
+            losses['gp_2'] += gp
+
+            d_vis2_opt.zero_grad()
+            # self.manual_backward(losses['da_d2_loss'], retain_graph=False)  # no need to retrain graph
+            losses['da_d2_loss'].backward(retain_graph=False)
+            d_vis2_opt.step()
+            d_vis2_sch.step()
 
         if self.use_da_act:
             da_act_loss_dict = self.da_act_loss.forward(
@@ -1071,20 +1132,39 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             backward_loss += losses['da_g1_loss']
             g_vis1_opt.zero_grad()
 
+        if self.use_da_vis2:
+            da_loss_dict = self.da_vis2_loss.forward(
+                [t_feat_for_da_vis2],  # update G_target
+                [s_feat_for_da_vis2],  # avoid grad of G_source
+                is_discriminator_batch=False,
+            )
+            da_g2_loss = da_loss_dict['loss']
+            gp = da_loss_dict['gp']  # just for log
+            losses['da_g2_loss'] += da_g2_loss / 1
+
+            backward_loss += losses['da_g2_loss']
+            g_vis2_opt.zero_grad()
+
         losses['total_loss'] += backward_loss + losses['da_g_act_loss']
-        if self.use_da_vis1:
+        if self.use_da_vis1 or self.use_da_vis2:
             # self.manual_backward(backward_loss)  # backward vis1 and vis2 together
             backward_loss.backward()
 
         if self.use_da_vis1:
             g_vis1_opt.step()
+        if self.use_da_vis2:
+            g_vis2_opt.step()
         g_vis1_sch.step()
+        g_vis2_sch.step()
 
         # Get grad_norm
-        vis1_grad_norm, vis1_total_norm, _ = self.calc_grad_and_param_norm(self.obs_encoder)
+        vis1_grad_norm, vis1_total_norm, _ = self.calc_grad_and_param_norm(self.obs_encoder.obs_nets['image'])
+        vis2_grad_norm, vis2_total_norm, _ = self.calc_grad_and_param_norm(self.obs_encoder.obs_nets['gripper'])
         act_grad_norm, act_total_norm, _ = self.calc_grad_and_param_norm(self.model)
         losses["train/vis1_grad_norm"] = vis1_grad_norm
         losses["train/vis1_total_norm"] = vis1_total_norm
+        losses["train/vis2_grad_norm"] = vis2_grad_norm
+        losses["train/vis2_total_norm"] = vis2_total_norm
         losses["train/act_grad_norm"] = act_grad_norm
         losses["train/act_total_norm"] = act_total_norm
 

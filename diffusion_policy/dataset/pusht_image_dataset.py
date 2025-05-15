@@ -108,7 +108,7 @@ class SourceTargetDataset(torch.utils.data.Dataset):
         self.tgt_dataset = tgt_dataset
 
     def __len__(self):
-        return max(len(self.src_dataset), len(self.tgt_dataset))
+        return min(len(self.src_dataset), len(self.tgt_dataset))
 
     def __getitem__(self, idx):
         src_batch = self.src_dataset[idx % len(self.src_dataset)]

@@ -13,7 +13,7 @@ dataloader:
   persistent_workers: false
   pin_memory: true
   shuffle: true
-dataset_obs_steps: 2
+dataset_obs_steps: ${n_obs_steps}
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
   inv_gamma: 1.0
@@ -87,14 +87,14 @@ policy:
       in_ndim: "3*8,"  # ori:`2*12`
       inner_dim: 8  # ori:64
       use_bn: false  # ori:true
-      gamma: 10  # ori:10
+      gamma: 1  # ori:10
       num_layers: 8  # v:6 layers, k:6 layers
       use_ada: true
       use_cond_dist: false
 
     optimizer_config:
-      vis1_lr: 5e-7  # ori:1e-6
-      vis2_lr: 1e-5  # not used
+      vis1_lr: 5e-6  # ori:5e-7
+      vis2_lr: 1e-5  # ori:not used
       act_lr: 5e-7  # ori:5e-7
 
   causal_attn: true
@@ -166,8 +166,12 @@ task:
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
-    data_root: "/home/geyuan/local_soft/TCL/collected_data_0507_light_random/"
-    h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0507_light_random.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/collected_data_0507_light_random/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0507_light_random.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/collected_data_0513_banana/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0513_banana.h5"
+    data_root: "/home/geyuan/local_soft/TCL/collected_data_0513_table/"
+    h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0513_table.h5"
     use_h5: true
     transform_color_jitter: false
   env_runner:
@@ -194,7 +198,7 @@ task:
   shape_meta: ${shape_meta}
 task_name: pusht_image
 training:
-  checkpoint_every: 20  # ori:50
+  checkpoint_every: 5  # ori:50
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
@@ -202,14 +206,14 @@ training:
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 1000  # ori:3050
+  num_epochs: 400  # ori:3050
   resume: true
   rollout_every: 10000  # ori:50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
   use_ema: true
-  val_every: 10
+  val_every: 5
 val_dataloader:
   batch_size: 64
   num_workers: 24  # ori:48

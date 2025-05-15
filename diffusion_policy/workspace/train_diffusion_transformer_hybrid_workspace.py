@@ -87,7 +87,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
             dataset_tgt: BaseImageDataset = hydra.utils.instantiate(cfg.task.dataset_target)
             assert isinstance(dataset, BaseImageDataset)
             dataset_src_tgt = SourceTargetDataset(dataset, dataset_tgt)
-            train_dataloader = DataLoader(dataset_src_tgt, **cfg.dataloader)
+            train_dataloader = DataLoader(dataset_src_tgt, drop_last=True, **cfg.dataloader)
 
         # ## Debug dataset
         # dataset.__getitem__(dataset.__len__() - 1)
@@ -98,7 +98,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
-        val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+        val_dataloader = DataLoader(val_dataset, drop_last=True, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -107,6 +107,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         # configure lr scheduler
         if self.is_da:
             (g_vis1_opt, d_vis1_opt,
+             g_vis2_opt, d_vis2_opt,
              g_act_opt, d_act_opt) = self.optimizer
             get_sch = partial(get_scheduler,
                               name=cfg.training.lr_scheduler,
@@ -118,9 +119,13 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                               last_epoch=self.global_step-1)
             g_vis1_sch = get_sch(optimizer=g_vis1_opt)
             d_vis1_sch = get_sch(optimizer=d_vis1_opt)
+            g_vis2_sch = get_sch(optimizer=g_vis2_opt)
+            d_vis2_sch = get_sch(optimizer=d_vis2_opt)
             g_act_sch = get_sch(optimizer=g_act_opt)
             d_act_sch = get_sch(optimizer=d_act_opt)
-            lr_schedulers = (g_vis1_sch, d_vis1_sch, g_act_sch, d_act_sch)
+            lr_schedulers = (g_vis1_sch, d_vis1_sch,
+                             g_vis2_sch, d_vis2_sch,
+                             g_act_sch, d_act_sch)
         else:
             lr_scheduler = get_scheduler(
                 cfg.training.lr_scheduler,

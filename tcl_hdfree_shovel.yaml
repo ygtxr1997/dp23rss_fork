@@ -9,11 +9,11 @@ checkpoint:
     monitor_key: val_loss  # ori: test_mean_score
 dataloader:
   batch_size: 64  # ori:64
-  num_workers: 32
+  num_workers: 48
   persistent_workers: false
   pin_memory: true
   shuffle: true
-dataset_obs_steps: 2
+dataset_obs_steps: ${n_obs_steps}
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
   inv_gamma: 1.0
@@ -54,10 +54,10 @@ past_action_visible: false
 policy:
   # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
   # hdfree: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
-  _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  use_da: false
+  _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
+  use_da: true
   domain_adapt:
-    src_ckpt: "data/experiments/image/pusht/diffusion_policy_transformer/train_0/epoch=0100-test_mean_score=0.748.ckpt"
+    src_ckpt: "data/outputs/2025.05.14/22.47.01_train_diffusion_transformer_hybrid_pusht_images/checkpoints/epoch=0450-val_loss=0.025.ckpt"
 
     debug_diff_loss: false  # if true, ignore da_act/shuffle_target_goal/cfg_drop_ratio
     debug_tsne: false
@@ -66,7 +66,7 @@ policy:
     reg_source_diff_loss: 0.  # default:1.0
     use_dann_lambda: false
 
-    use_da_visual: 'false'  # static,gripper,both,false
+    use_da_visual: 'both'  # static,gripper,both,false
     use_da_act: true
     act_loss_from: "mlp"  # ori:`k,v`, choices:`k`,`v`,`q`,`sa`,`ca`,`attn`,`softmax`,`mlp`
     act_layers: 8  # ori:6
@@ -83,18 +83,18 @@ policy:
     action_da:
       _target_: diffusion_policy.model.domain_adapt.wgan.WGAN_GP
       _recursive_: false
-      in_dim: "2*1,"  # ori:`1536*12`, kv:(1536,2), q/mlp:(512,3), attn:(512,3), softmax:(8,4)
-      in_ndim: "3*1,"  # ori:`2*12`
+      in_dim: "256*8,"  # ori:`1536*12`, kv:(1536,2), q/mlp:(512,3), attn:(512,3), softmax:(8,4)
+      in_ndim: "3*8,"  # ori:`2*12`
       inner_dim: 8  # ori:64
       use_bn: false  # ori:true
-      gamma: 10  # ori:10
-      num_layers: 1  # v:6 layers, k:6 layers
+      gamma: 1  # ori:10
+      num_layers: 8  # v:6 layers, k:6 layers
       use_ada: true
       use_cond_dist: false
 
     optimizer_config:
-      vis1_lr: 5e-7  # ori:1e-6
-      vis2_lr: 1e-5  # not used
+      vis1_lr: 5e-6  # ori:5e-7
+      vis2_lr: 1e-5  # ori:not used
       act_lr: 5e-7  # ori:5e-7
 
   causal_attn: true
@@ -156,16 +156,20 @@ task:
     data_root: "/home/geyuan/local_soft/TCL/collected_data_0514_shovel_source/"
     h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0514_shovel_source_240p.h5"
     use_h5: true
+    transform_color_jitter: false
   dataset_target:  # Target domain
-    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
-    shape_meta: *shape_meta
+    _target_: diffusion_policy.dataset.tcl_dataset.TCLImageDataset
+    shape_meta: ${shape_meta}
     horizon: ${horizon}
     max_train_episodes: 200  # ori:90
     pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
-    zarr_path: data/pusht/pusht_size_random.zarr
+    data_root: "/home/geyuan/local_soft/TCL/collected_data_0514_shovel_table/"
+    h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0514_shovel_table_240p.h5"
+    use_h5: true
+    transform_color_jitter: false
   env_runner:
     _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
     fps: 10
@@ -190,7 +194,7 @@ task:
   shape_meta: ${shape_meta}
 task_name: pusht_image
 training:
-  checkpoint_every: 50  # ori:50
+  checkpoint_every: 2  # ori:50
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
@@ -198,14 +202,14 @@ training:
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 3000  # ori:3050
+  num_epochs: 30  # ori:3050
   resume: true
   rollout_every: 10000  # ori:50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
   use_ema: true
-  val_every: 50
+  val_every: 2
 val_dataloader:
   batch_size: 64
   num_workers: 24  # ori:48
