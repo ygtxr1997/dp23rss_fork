@@ -330,6 +330,12 @@ class AsyncVectorEnv(VectorEnv):
 
         if terminate:
             for process in self.processes:
+                # if process.is_alive():
+                #     process.terminate()
+                # NOTE: is this safer?
+                import os
+                if getattr(process, "_parent_pid", None) != os.getpid():
+                    continue
                 if process.is_alive():
                     process.terminate()
         else:
@@ -344,7 +350,19 @@ class AsyncVectorEnv(VectorEnv):
             if pipe is not None:
                 pipe.close()
         for process in self.processes:
-            process.join()
+            if process is None:
+                continue
+            # 仅 join 属于当前进程的子进程，避免 multiprocessing.join() 中的断言
+            if getattr(process, "_parent_pid", None) != os.getpid():
+                continue
+            try:
+                process.join()
+            except AssertionError:
+                # 忽略 "can only join a child process" 的断言
+                pass
+            except Exception:
+                # 忽略析构/关闭阶段的其他异常（最小改动）
+                pass
 
     def _poll(self, timeout=None):
         self._assert_is_running()

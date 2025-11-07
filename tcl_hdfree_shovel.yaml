@@ -166,6 +166,10 @@ task:
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
+#    data_root: "/home/geyuan/local_soft/TCL/collected_data_0514_shovel_light/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0514_shovel_light_240p.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/collected_data_0514_shovel_obj/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0514_shovel_obj_240p.h5"
     data_root: "/home/geyuan/local_soft/TCL/collected_data_0514_shovel_table/"
     h5_path: "/home/geyuan/local_soft/TCL/hdf5/collected_data_0514_shovel_table_240p.h5"
     use_h5: true
@@ -194,7 +198,7 @@ task:
   shape_meta: ${shape_meta}
 task_name: pusht_image
 training:
-  checkpoint_every: 2  # ori:50
+  checkpoint_every: 1  # ori:50
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
@@ -202,14 +206,14 @@ training:
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 30  # ori:3050
+  num_epochs: 5  # ori:3050
   resume: true
   rollout_every: 10000  # ori:50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
   use_ema: true
-  val_every: 2
+  val_every: 1
 val_dataloader:
   batch_size: 64
   num_workers: 24  # ori:48

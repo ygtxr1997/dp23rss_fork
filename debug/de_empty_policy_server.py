@@ -17,43 +17,15 @@ from torchvision.transforms import transforms
 from robokit.data.data_handler import DataHandler
 from robokit.service.service_connector import ServiceConnector
 
+from diffusion_policy.env_runner.pusht_image_socket_runner import StepRequestFromPolicy, StepRequestFromEvaluator
+
 
 """ How to use me?
-$ CUDA_VISIBLE_DEVICES=9 uvicorn gpu_service:gpu_app --port 6060
+  export PYTHONPATH=~/code/dp23rss_fork/
+  CUDA_VISIBLE_DEVICES=7 uvicorn de_empty_policy_server:gpu_app --port 6060
 """
 gpu_app = FastAPI()
-max_cache_action = 8
-
-log_time = "2025.07.07-16.52.25"
-w_idx = 2
-dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
-
-if "2025.05.11" in log_time or "2025.05.13" in log_time:
-    dataset_dir = "collected_data_0507"
-elif dataset_name == "shovel":
-    dataset_dir = "collected_data_0514_shovel_source"
-elif dataset_name == "pot":
-    dataset_dir = "0627_pot_source"
-elif dataset_name == "pot_light":
-    dataset_dir = "0627_pot_light"
-elif dataset_name == "pot_object":
-    dataset_dir = "0627_pot_object"
-elif dataset_name == "pepper":
-    dataset_dir = "0704_pepper_source"
-else:
-    raise KeyError
-
-with open(f"/home/geyuan/local_soft/TCL/{dataset_dir}/statistics.json", 'r') as json_file:
-    statistics = json.load(json_file)
-    data_min = torch.from_numpy(np.array(statistics['min']))
-    data_max = torch.from_numpy(np.array(statistics['max']))
-
-
-class StepRequestWithObservation(pydantic.BaseModel):
-    primary_rgb: List[str]
-    gripper_rgb: List[str]
-    instruction: str
-    joint_state: List[List[float]]
+max_cache_action = 12
 
 
 @lru_cache()
@@ -63,6 +35,8 @@ def get_agent(device: str):
     ## Op2. Replay model, load action data and sleep
     # model = ReplayModel(sleep_duration=25,
     #                     replay_root="/home/geyuan/datasets/TCL/collected_data")
+
+    return None, None, None
 
     import hydra
     from omegaconf import OmegaConf
@@ -101,17 +75,26 @@ def read_root():
     return {"message": "Hello, World!"}
 
 
+@gpu_app.get("/init")
+def model_init():
+    return {"message": "Initialized.", "max_cache_action": max_cache_action}
+
+
 @gpu_app.get("/reset")
 def model_reset():
     agent, image_shape, _ = get_agent("cuda")
-    agent.reset()
+    # agent.reset()
     return {"max_cache_action": max_cache_action}
 
 
 @gpu_app.post("/step")
-def model_step(step_request: StepRequestWithObservation):
+def model_step(step_request: StepRequestFromEvaluator) -> Dict:
     agent, hydra_config, weight_path = get_agent("cuda")  # shape:[C,H,W]
     print("[gpu_service] Using cached ckpt from: None. Model type:", type(agent), weight_path)
+
+    out_action = [[[256.]*2] * max_cache_action] * 25  # [B,T,2]
+    request_to_evaluator = StepRequestFromPolicy(action=out_action)
+    return request_to_evaluator.model_dump(mode="json")
 
     # 1. Decode observation from received request
     image_shape = hydra_config.image_shape

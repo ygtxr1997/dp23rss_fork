@@ -11,11 +11,15 @@ import pygame
 @click.option('-rs', '--render_size', default=96, type=int)
 @click.option('-hz', '--control_hz', default=10, type=int)
 @click.option('-c', '--cnt', default=5, type=int)
-def main(output, render_size, control_hz, cnt):
+@click.option('-s', '--domain_shift', default='none', type=str)
+def main(output, render_size, control_hz, cnt, domain_shift='none'):
     """
     Collect demonstration for the Push-T task.
 
-    Usage: python demo_pusht.py -o data/pusht_demo.zarr
+    Usage: python auto_pusht.py -o data/tmp_auto.zarr  \
+        -rs 96  \
+        -hz 10  \
+        -s light
 
     This script is compatible with both Linux and MacOS.
     Hover mouse close to the blue circle to start.
@@ -33,7 +37,7 @@ def main(output, render_size, control_hz, cnt):
     kp_kwargs = PushTKeypointsEnv.genenerate_keypoint_manager_params()
     # print(kp_kwargs)
     # exit()
-    env = PushTKeypointsEnv(render_size=render_size, domain_shift="size", **kp_kwargs)
+    env = PushTKeypointsEnv(render_size=render_size, domain_shift=domain_shift, **kp_kwargs)
     # agent = env.teleop_agent()
     agent = env.random_agent()
     clock = pygame.time.Clock()

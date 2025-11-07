@@ -29,6 +29,19 @@ import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 
 
+# Copied from: video2world_force_dit.py
+class ActionEncoder(nn.Module):
+    def __init__(self, in_features: int, output_dim: int):
+        super().__init__()
+        self.layer = nn.Linear(in_features, output_dim)
+    def forward(self, x):
+        return self.layer(x)
+    def init_weights(self) -> None:
+        std = 1.0 / math.sqrt(self.layer.in_features)
+        torch.nn.init.trunc_normal_(self.layer.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.zeros_(self.layer.bias)
+
+
 class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
     def __init__(self, 
             shape_meta: dict,
@@ -55,6 +68,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             pred_action_steps_only=False,
             # da
             use_da=False,
+            # force
+            use_force: bool = False,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -108,6 +123,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         # init global state
         ObsUtils.initialize_obs_utils_with_config(config)
+        print("[DEBUG] ObsUtils initialized with:", config.observation.modalities.obs)
 
         # load model
         policy: PolicyAlgo = algo_factory(
@@ -151,6 +167,14 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         output_dim = input_dim
         cond_dim = obs_feature_dim if obs_as_cond else 0
 
+        # NOTE: obs_encoder will automatically handle the obs in shape_meta, no need to create by ourselves
+        self.force_embedder = None
+        self.use_force = use_force
+        '''
+        obs_feature_dim:134, cond_dim:134, input_dim:7, output_dim:7  
+        '''
+        print(f"[DEBUG] obs_feature_dim:{obs_feature_dim}, cond_dim:{cond_dim}, input_dim:{input_dim}, output_dim:{output_dim} ")
+
         model = TransformerForDiffusion(
             input_dim=input_dim,
             output_dim=output_dim,
@@ -189,13 +213,77 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.pred_action_steps_only = pred_action_steps_only
         self.kwargs = kwargs
 
+        self.pretrained_ckpt = None
+
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
 
         # For real-world inference
         self.infer_frame_idx = 0
-        self.cached_action = None
+        self.cache_action = None
+
+    def load_weight_from_ckpt(self, pretrained_ckpt, use_ema: bool = True):
+        self.pretrained_ckpt = pretrained_ckpt
+        path = pathlib.Path(pretrained_ckpt)
+        payload = torch.load(path.open('rb'), pickle_module=dill)
+
+        def load_state_dict_partial(model, state_dict, skip_keys=[]):
+            """
+            加载状态字典时跳过某些键
+            Args:
+                model (nn.Module): 模型
+                state_dict (dict): 要加载的状态字典
+                skip_keys (list): 需要跳过的键列表
+            """
+            # 过滤掉需要跳过的键
+            filtered_state_dict = {}
+            for k, v in state_dict.items():
+                if k not in skip_keys:
+                    need_skip = False
+                    for skip_key in skip_keys:  # skip_keys may contain short keywords
+                        if skip_key in k:
+                            need_skip = True
+                    if not need_skip:
+                        filtered_state_dict[k] = v
+
+            # 加载过滤后的状态字典
+            # 获取模型的 state_dict 键和 filtered_state_dict 键
+            model_keys = set(model.state_dict().keys())
+            state_dict_keys = set(filtered_state_dict.keys())
+
+            # 找到 missing_keys 和 unexpected_keys
+            missing_keys = list(model_keys - state_dict_keys)
+            unexpected_keys = list(state_dict_keys - model_keys)
+
+            for k in missing_keys:
+                filtered_state_dict[k] = model.state_dict()[k]
+
+            model.load_state_dict(filtered_state_dict, strict=True)
+
+            # Load normalizer
+            norm_keys = set({k: None for k in state_dict.keys() if 'normalizer.' in k}.keys())
+            norm_state_dict = {k[len("normalizer."):]: v for k, v in state_dict.items() if 'normalizer.' in k}
+            model.normalizer.load_state_dict(norm_state_dict)
+
+            # 打印结果
+            print("Skip keys:", skip_keys)
+            print("Normalizer keys:", norm_keys)
+            print("Missing keys:", missing_keys)
+            print("Unexpected keys:", list(set(unexpected_keys) - norm_keys))
+
+        # print(payload['state_dicts']['model'].keys())
+        # print(self.normalizer.state_dict().keys())
+        # exit()
+        skip_keys = [
+            '.ia3_',  # IA3 Adapter
+        ]
+        if use_ema:
+            load_state_dict_partial(self, payload['state_dicts']['ema_model'], skip_keys)
+        else:
+            load_state_dict_partial(self, payload['state_dicts']['model'], skip_keys)
+        print(f"[DiffusionTransformerHybridImagePolicy] Loaded pretrained_ckpt (use_ema={use_ema}) "
+              f"from: {self.pretrained_ckpt}")
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -265,7 +353,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             # reshape back to B, To, Do
             cond = nobs_features.reshape(B, To, -1)
             shape = (B, T, Da)
-            if self.pred_action_steps_only:
+            if self.pred_action_steps_only:  # default:False
                 shape = (B, self.n_action_steps, Da)
             cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
@@ -294,6 +382,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        # print('action_pred:', action_pred.shape, )
 
         # get action
         if self.pred_action_steps_only:
@@ -302,6 +391,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             start = To - 1
             end = start + self.n_action_steps
             action = action_pred[:,start:end]
+
+        self.cache_action = action_pred
         
         result = {
             'action': action,
@@ -311,7 +402,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
     def reset(self):
         self.infer_frame_idx = 0
-        self.cached_action = None
+        self.cache_action = None
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
@@ -347,7 +438,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         # handle different ways of passing observation
         cond = None
         trajectory = nactions
-        if self.obs_as_cond:
+        if self.obs_as_cond:  # default: go here
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
                 lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
@@ -652,6 +743,8 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             start = To - 1
             end = start + self.n_action_steps
             action = action_pred[:, start:end]
+
+        self.cache_action = action_pred
 
         result = {
             'action': action,

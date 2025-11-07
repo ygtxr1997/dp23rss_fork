@@ -38,6 +38,7 @@ class PushTImageEnv(PushTEnv):
                 dtype=np.float32
             )
         })
+        self.render_size = render_size
         self.render_cache = None
     
     def _get_obs(self):
@@ -54,7 +55,7 @@ class PushTImageEnv(PushTEnv):
         # draw action
         if self.latest_action is not None:
             action = np.array(self.latest_action)
-            coord = (action / 512 * 96).astype(np.int32)
+            coord = (action / 512 * self.render_size).astype(np.int32)
             marker_size = int(8/96*self.render_size)
             thickness = int(1/96*self.render_size)
             cv2.drawMarker(img, coord,

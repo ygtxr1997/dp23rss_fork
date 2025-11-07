@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import click
 from diffusion_policy.common.replay_buffer import ReplayBuffer
@@ -14,6 +16,7 @@ def main(output, render_size, control_hz):
     Collect demonstration for the Push-T task.
     
     Usage: python demo_pusht.py -o data/pusht_demo.zarr
+    python demo_pusht.py -o data/pusht_256_val.zarr -rs 256
     
     This script is compatible with both Linux and MacOS.
     Hover mouse close to the blue circle to start.
@@ -43,7 +46,8 @@ def main(output, render_size, control_hz):
         print(f'starting seed {seed}')
 
         # set seed for env
-        env.seed(seed)
+        # env.seed(seed)
+        env.seed(seed + int(time.time()))
         
         # reset env and get observations (including info and render for recording)
         obs = env.reset()

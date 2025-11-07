@@ -49,10 +49,15 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 
         # configure model
         self.model: DiffusionTransformerHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
+        self.pretrained_ckpt = cfg.pretrained_ckpt if hasattr(cfg, 'pretrained_ckpt') else None
+        if self.pretrained_ckpt and os.path.exists(self.pretrained_ckpt):
+            self.model.load_weight_from_ckpt(self.pretrained_ckpt, use_ema=False)
 
         self.ema_model: DiffusionTransformerHybridImagePolicy = None
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
+        else:
+            print(f"[TrainDiffusionTransformerHybridWorkspace] training from scratch")
 
         # configure training state
         self.optimizer = self.model.get_optimizer(**cfg.optimizer)

@@ -96,6 +96,13 @@ class PushTEnv(gym.Env):
         # ])
         self.reset_to_state = specific_state
         self.domain_shift = domain_shift
+        # These will be initialized in _setup for reproducibility
+        self.light_x = None
+        self.light_y = None
+        self.light_dx = None
+        self.light_dy = None
+        self.light_direction_timer = 0
+        self.light_direction_interval = 10
 
     def reset(self):
         seed = self._seed
@@ -141,6 +148,9 @@ class PushTEnv(gym.Env):
                 self.space.step(dt)
                 self.history_positions.append(self.agent.position)
 
+        # Update simulation time
+        self.sim_time += n_steps * dt
+
         # compute reward
         goal_body = self._get_goal_pose_body(self.goal_pose)
         goal_geom = pymunk_to_shapely(goal_body, self.block.shapes)
@@ -175,8 +185,8 @@ class PushTEnv(gym.Env):
         RandomAgent = collections.namedtuple('TeleopAgent', ['act'])
         def act(obs):
             old_x, old_y = self.start_x, self.start_y
-            dx = random.randint(10 - self.window_size, self.window_size - 10) * 0.3
-            dy = random.randint(10 - self.window_size, self.window_size - 10) * 0.3
+            dx = self.np_random.integers(10 - self.window_size, self.window_size - 10) * 0.3
+            dy = self.np_random.integers(10 - self.window_size, self.window_size - 10) * 0.3
             if self.start_x + dx >= self.window_size - 10 or self.start_x + dx <= 10:
                 self.start_x -= dx
             if self.start_y + dy >= self.window_size - 10 or self.start_y + dy <= 10:
@@ -244,6 +254,18 @@ class PushTEnv(gym.Env):
             for x in range(0, canvas.get_width(), image.get_width()):
                 for y in range(0, canvas.get_height(), image.get_height()):
                     canvas.blit(image, (x, y))
+        elif self.domain_shift == "rainbow":
+            # 使用时间创建彩虹色渐变效果
+            import colorsys
+
+            # 使用 self.sim_time 替代 time.time()
+            hue = (self.sim_time * 0.3) % 1.0  # ori:0.35控制变色速度，可调整
+
+            # 将HSV转换为RGB
+            rgb = colorsys.hsv_to_rgb(hue, 0.4, 0.95)  # ori:饱和度0.4，明度0.95
+            rainbow_color = tuple(int(c * 255) for c in rgb)
+            canvas.fill(rainbow_color)
+
         self.screen = canvas
 
         draw_options = DrawOptions(canvas)
@@ -424,8 +446,19 @@ class PushTEnv(gym.Env):
         self.space.damping = 0
         self.teleop = False
         self.render_buffer = list()
-        self.start_x, self.start_y = random.randint(10, self.window_size - 10), random.randint(10, self.window_size - 10)
-        
+
+        # All random initializations are now here, using the re-seeded generator
+        self.start_x = self.np_random.integers(10, self.window_size - 10)
+        self.start_y = self.np_random.integers(10, self.window_size - 10)
+
+        self.light_x = self.np_random.integers(100, self.window_size - 100)
+        self.light_y = self.np_random.integers(100, self.window_size - 100)
+        self.light_dx = self.np_random.choice([-3, -2, -1, 1, 2, 3])
+        self.light_dy = self.np_random.choice([-3, -2, -1, 1, 2, 3])
+        self.light_direction_timer = 0
+
+        self.sim_time = 0.  # used for rainbow domain shift
+
         # Add walls.
         walls = [
             self._add_segment((5, 506), (5, 5), 2),
@@ -578,30 +611,44 @@ class PushTEnv(gym.Env):
     def _apply_random_lighting(self, canvas):
         """在场景中添加随机点光源效果"""
         # 光源参数
-        light_radius = 250  # 光源半径
-        light_intensity = 200  # 光源强度
+        light_radius = 180  # 光源半径, ori:180
+        light_intensity = 160  # 光源强度, ori:160
         light_color = (255, 255, 200)  # 光源颜色
         num_lights = 1  # 随机光源数量
+        move_speed = 20  # ori:20
+        black_intensity = 140  # ori:140
+
+        # 定时切换方向
+        self.light_direction_timer += 1
+        if self.light_direction_timer >= self.light_direction_interval:
+            self.light_dx = self.np_random.choice([-3, -2, -1, 1, 2, 3])
+            self.light_dy = self.np_random.choice([-3, -2, -1, 1, 2, 3])
+            self.light_direction_timer = 0
+
+        # 移动光源
+        self.light_x += self.light_dx * move_speed
+        self.light_y += self.light_dy * move_speed
+
+        # 碰壁反弹
+        if self.light_x <= light_radius // 2 or self.light_x >= self.window_size - light_radius // 2:
+            self.light_dx = -self.light_dx
+        if self.light_y <= light_radius // 2 or self.light_y >= self.window_size - light_radius // 2:
+            self.light_dy = -self.light_dy
+
+        # 确保光源在边界内
+        self.light_x = max(light_radius // 2, min(self.window_size - light_radius // 2, self.light_x))
+        self.light_y = max(light_radius // 2, min(self.window_size - light_radius // 2, self.light_y))
 
         # 创建遮罩层
         darkness = pygame.Surface(canvas.get_size(), pygame.SRCALPHA)
-        darkness.fill((0, 0, 0, 200))  # 黑色半透明遮罩
+        darkness.fill((0, 0, 0, black_intensity))  # 黑色半透明遮罩, ori:200
 
-        # 生成随机光源
-        light_x = random.randint(0, self.window_size)
-        light_y = random.randint(0, self.window_size)
-        for _ in range(num_lights):
-            # 随机生成光源位置
-            max_delta = int(self.window_size * 0.02)
-            light_x += random.randint(-max_delta, max_delta)
-            light_y += random.randint(-max_delta, max_delta)
+        # 创建光源
+        light_surface = self._create_light_surface(light_radius, light_color, light_intensity)
 
-            # 创建光源
-            light_surface = self._create_light_surface(light_radius, light_color, light_intensity)
-
-            # 在遮罩层上叠加光源
-            darkness.blit(light_surface, (light_x - light_radius, light_y - light_radius),
-                          special_flags=pygame.BLEND_RGBA_SUB)
+        # 在遮罩层上叠加光源
+        darkness.blit(light_surface, (self.light_x - light_radius, self.light_y - light_radius),
+                      special_flags=pygame.BLEND_RGBA_SUB)
 
         # 将遮罩层叠加到场景
         canvas.blit(darkness, (0, 0))

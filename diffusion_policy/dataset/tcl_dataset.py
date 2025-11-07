@@ -4,7 +4,8 @@ import numpy as np
 import torch
 from torchvision.transforms import transforms
 
-from robokit.data.tcl_datasets import TCLDataset, TCLDatasetHDF5
+from robokit.datasets.tcl_datasets import TCLDataset, TCLDatasetHDF5
+from robokit.debug_utils.printer import print_batch
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
@@ -20,6 +21,7 @@ class TCLImageDataset(BaseImageDataset):
                  pad_after: int,
                  # Data format
                  shape_meta: dict,
+                 norm_force_type: str = "quantile",
                  # Others
                  seed: int = 42,
                  val_ratio: float = 0.02,
@@ -33,7 +35,8 @@ class TCLImageDataset(BaseImageDataset):
         # RoboKit Dataset
         self.data_root = data_root
         self.shape_meta = shape_meta
-        self.load_keys = ["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text"]
+        self.norm_force_type = norm_force_type
+        self.load_keys = ["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text", "force_torque"]
         self.h5_path = h5_path
         self.use_h5 = use_h5
         if not use_h5:
@@ -42,10 +45,24 @@ class TCLImageDataset(BaseImageDataset):
             self.tcl_dataset = TCLDatasetHDF5(
                 data_root, h5_path,
                 use_extracted=True, load_keys=self.load_keys)
-        self.data_meta = self.tcl_dataset.load_statistics_from_json(os.path.join(data_root, "statistics.json"))
+        print("[DEBUG] type of tcl_dataset:", type(self.tcl_dataset))
+        self.data_meta = self.tcl_dataset.load_meta_from_json(os.path.join(data_root, "statistics.json"))
         self.all_rel_actions = self.tcl_dataset.extracted_data["rel_actions"]
-        self.dataset_min = np.array(self.data_meta["min"])
-        self.dataset_max = np.array(self.data_meta["max"])
+        self.all_force_torques = self.tcl_dataset.dsets["force_torque"]
+        self.dataset_stats = self.data_meta["stats"]  # key: `rel_actions`, `robot_obs`, `force_torque`
+        self.dataset_total_len = self.data_meta["total_len"]
+        self.dataset_action_min = np.array(self.dataset_stats["rel_actions"]["min"])
+        self.dataset_action_max = np.array(self.dataset_stats["rel_actions"]["max"])
+
+        # Calculate p01 and p99 for force_torque if available
+        if 'force_torque' in self.dataset_stats:
+            # Calculate p01 (1%) and p99 (99%) quantiles along the sample dimension (axis=0)
+            p01 = np.quantile(self.all_force_torques, q=0.01, axis=0)
+            p99 = np.quantile(self.all_force_torques, q=0.99, axis=0)
+
+            # Add the calculated quantiles to the merged statistics dictionary
+            self.dataset_stats['force_torque']['p01'] = p01
+            self.dataset_stats['force_torque']['p99'] = p99
 
         self.tasks = self.tcl_dataset.tasks
         self.task_lengths = self.tcl_dataset.task_lengths
@@ -69,6 +86,7 @@ class TCLImageDataset(BaseImageDataset):
         self.obs_image_shape = shape_meta["obs"]["image"]["shape"]  # [3, H, W]
         self.obs_gripper_shape = shape_meta["obs"]["gripper"]["shape"] if "gripper" in shape_meta["obs"] else None
         self.joint_state_shape = shape_meta["obs"]["joint_state"]["shape"]
+        self.force_torque_shape = shape_meta["obs"]["force_torque"]["shape"] if "force_torque" in shape_meta["obs"] else None
         self.action_shape = shape_meta["action"]["shape"]   # [7,]
         obs_image_wh_ratio = float(self.obs_image_shape[2]) / float(self.obs_image_shape[1])  # wh 4:3=16:12=12:9
         transform_list = [
@@ -85,8 +103,8 @@ class TCLImageDataset(BaseImageDataset):
         transform_list.append(transforms.ToTensor())
         self.obs_image_transform = transforms.Compose(transform_list)  # Similar augmentation params with OCTO
 
-        print(f"[TCLImageDataset] dataset loaded, "
-              f"action_min={self.dataset_min}, action_max={self.dataset_max}")
+        print(f"[diffusion_policy.dataset.TCLImageDataset] dataset loaded, "
+              f"action_min={self.dataset_action_min}, action_max={self.dataset_action_max}")
 
     def get_validation_dataset(self):
         return self.create_val_dataset(self)
@@ -102,7 +120,8 @@ class TCLImageDataset(BaseImageDataset):
             seed=instance.seed,
             val_ratio=instance.val_ratio,
             max_train_episodes=instance.max_train_episodes,
-            use_h5=False,  # no need to use h5
+            use_h5=instance.use_h5,  # ori:no need to use h5
+            h5_path=instance.h5_path,
         )
         val_set.tcl_dataset.total_length = 64
         return val_set
@@ -185,6 +204,7 @@ class TCLImageDataset(BaseImageDataset):
                 primary_rgb = zero_rgb
                 gripper_rgb = zero_rgb
                 tcp_pose = torch.zeros((6,)).to(torch.float32)
+                force_torque = torch.zeros((6,)).to(torch.float32)
             else:
                 sample_dict = self.tcl_dataset.__getitem__(idx)
                 primary_rgb = sample_dict['primary_rgb']  # (H,W,C)
@@ -197,10 +217,17 @@ class TCLImageDataset(BaseImageDataset):
                 if "gripper" in obs_keys:
                     gripper_rgb = self.obs_image_transform(gripper_rgb)
                     gripper_rgb = gripper_rgb * 2. - 1.
+                if "force" in obs_keys:
+                    force_torque = sample_dict['force_torque']  # (6,)
+                    force_torque = self.norm_state_or_force(
+                        force_torque, self.norm_force_type, self.dataset_stats["force_torque"])
+                    force_torque = torch.from_numpy(force_torque).to(torch.float32)
             obs_data["image"].append(primary_rgb)
             obs_data["joint_state"].append(tcp_pose)
             if "gripper" in obs_keys:
                 obs_data["gripper"].append(gripper_rgb)
+            if "force" in obs_keys:
+                obs_data["force"].append(force_torque)
         obs_data = {k: torch.stack(v) for k, v in obs_data.items()}
         # obs_data["image"] = torch.stack(obs_data["image"])  # should be (T,C,H,W)
         # obs_data["joint_state"] = torch.stack(obs_data["joint_state"])  # (T,6)
@@ -223,8 +250,36 @@ class TCLImageDataset(BaseImageDataset):
                 rel_action = self.all_rel_actions[idx]  # (7,)
                 act_data.append(rel_action)
         act_data = np.stack(act_data)  # (T,7), in [act_min, act_max]
-        act_data = (act_data - self.dataset_min) / (self.dataset_max - self.dataset_min)  # norm here, in [0,1]
+        act_data = (act_data - self.dataset_action_min) / (self.dataset_action_max - self.dataset_action_min)  # norm here, in [0,1]
         return act_data * 2. - 1.  # in [-1,1]
+
+    @staticmethod
+    def norm_state_or_force(in_data: np.ndarray, norm_type: str, meta_data: dict):
+        """
+        `robot_obs`: (...,14)
+            tcp pos (3), tcp ori (3), gripper width (1), joint_states (6) in rad, gripper_action (1)
+        `force_torque`: (...,6)
+        """
+        D = in_data.shape[-1]
+        if norm_type == "minmax":
+            dataset_min = np.array(meta_data['min'])[:D]
+            dataset_max = np.array(meta_data['max'])[:D]
+            out_data = (in_data - dataset_min) / (dataset_max - dataset_min)  # norm here, in [0,1]
+            out_data = out_data * 2. - 1.  # in [-1,1]
+        elif norm_type == "mean":
+            dataset_mean = np.array(meta_data['mean'])[:D]
+            dataset_std = np.array(meta_data['std'])[:D]
+            out_data = (in_data - dataset_mean) / dataset_std
+        elif norm_type == "quantile":
+            dataset_p01 = np.array(meta_data['p01'])[:D]
+            dataset_p99 = np.array(meta_data['p99'])[:D]
+            in_data = np.clip(in_data, dataset_p01, dataset_p99)  # different from minmax
+            out_data = (in_data - dataset_p01) / (dataset_p99 - dataset_p01)  # norm here, in [0,1]
+            out_data = out_data * 2. - 1.  # in [-1,1]
+        else:
+            assert norm_type == "identity"
+            out_data = in_data
+        return out_data
 
 
 if __name__ == "__main__":
