@@ -18,11 +18,11 @@
 
 
 ## Usage
-'
+tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=6 bash sh_train.sh
-'
+CUDA_VISIBLE_DEVICES=4 bash sh_train.sh
+"
 
 #CONFIG_NAME="tcl_dp_transformer.yaml"
 #CONFIG_NAME="tcl_hdfree_shovel.yaml"

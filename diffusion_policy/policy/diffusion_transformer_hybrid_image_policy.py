@@ -171,7 +171,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.force_embedder = None
         self.use_force = use_force
         '''
-        obs_feature_dim:134, cond_dim:134, input_dim:7, output_dim:7  
+        Without Force:
+        obs_feature_dim:134, cond_dim:134, input_dim:7, output_dim:7
+        With Force:
+        obs_feature_dim:140, cond_dim:140, input_dim:7, output_dim:7
         '''
         print(f"[DEBUG] obs_feature_dim:{obs_feature_dim}, cond_dim:{cond_dim}, input_dim:{input_dim}, output_dim:{output_dim} ")
 
