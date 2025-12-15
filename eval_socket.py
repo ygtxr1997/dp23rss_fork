@@ -27,14 +27,17 @@ Example usage:
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-yes | CUDA_VISIBLE_DEVICES=7 python eval_socket.py  \
+yes | CUDA_VISIBLE_DEVICES=4 python eval_socket.py  \
     -c "None"  \
     -o data/pusht_eval_output  \
-    -p 6067  \
+    -p 6064  \
     -s rainbow  \
-    -n 1
+    -a 0.5  \
+    -r 2  \
+    --max_repeats 100  \
+    --close_online
 '''
-h5_suffix = 'vis5'  # just set for debug. `3e-5`, `layer28`, `ex_lora`, `ex_kv`
+h5_suffix = '_seed100*2_2copy'  # just set for debug. `3e-5`, `layer28`, `ex_lora`, `ex_kv`
 
 @click.command()
 @click.option('-c', '--checkpoint', required=True)
@@ -73,7 +76,7 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
         "n_train": 0,  # ori: 6
         "n_train_vis": 0,  # ori: 2
         "past_action": False,
-        "test_start_seed": 4300050, # now:4300050, ori:4300000, NOTE: start from +50?
+        "test_start_seed": 4300000, # now:4300050, ori:4300000, NOTE: start from +50?
         "train_start_seed": 0,
         "domain_shift": domain_shift,  # `none`, `orange`, `texture`, `light`, `size`
         "render_size": 256,  # ori:96
@@ -86,20 +89,9 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
     if 0.0 < acc_seed < 1.0:
         repeat_times = int(repeat_times * (1.0 / acc_seed))
 
+    stage_flag = 0  # cold-start at the very beginning
     seed_accumulate: float = 0.0
     for idx in range(repeat_times):
-        if acc_seed >= 1.0 or acc_seed == 0.0:
-            env_runner_config.test_start_seed += env_runner_config.n_envs ** int(acc_seed)
-            # NOTE: make sure each eval uses different seeds, acc_seed=0 the added seed is n_envs^0=1
-        elif 0.0 < acc_seed < 1.0:
-            seed_accumulate += acc_seed
-            if seed_accumulate >= 1.0:
-                add_seed = int(seed_accumulate)
-                env_runner_config.test_start_seed += add_seed
-                seed_accumulate = 0.0  # reset
-        else:
-            pass  # do not change seed
-
         # cfg.task.env_runner.n_train = 0
         # cfg.task.env_runner.n_test = 10
         # cfg.task.env_runner.max_steps = 110  # for quick debug
@@ -131,10 +123,14 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
         env_runner.init_socket("push the T-block into the green area.")
         if reset_each > 0 and idx % reset_each == 0:
             env_runner.send_reset()  # NOTE: send reset before each evaluator?
+            stage_flag = 0  # reset to cold-start when seed changes
         runner_log = env_runner.run(
             device=device,
             close_online=close_online,
+            stage_flag=stage_flag,
         )
+        if not close_online:
+            stage_flag = 2  # after first eval, set to 2-copy weights next time
 
         # dump log to json
         json_log = dict()
@@ -164,6 +160,19 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
             value=eval_results[-1],
         )
         print(f"[DEBUG] h5_data[{h5_save_key}]:", len(h5_data_helper.get(key=h5_save_key)))
+
+        # Check if need to update seed at the end of an eval
+        if acc_seed >= 1.0 or acc_seed == 0.0:
+            env_runner_config.test_start_seed += env_runner_config.n_envs ** int(acc_seed)
+            # NOTE: make sure each eval uses different seeds, acc_seed=0 the added seed is n_envs^0=1
+        elif 0.0 < acc_seed < 1.0:
+            seed_accumulate += acc_seed
+            if seed_accumulate >= 1.0:
+                add_seed = int(seed_accumulate)
+                env_runner_config.test_start_seed += add_seed
+                seed_accumulate = 0.0  # reset
+        else:
+            pass  # do not change seed
 
     eval_results = np.array(eval_results)
     eval_mean = np.mean(eval_results)

@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Tuple, Dict
 import copy
+import shutil
 
 import numpy as np
 import pydantic
@@ -29,15 +30,22 @@ CUDA_VISIBLE_DEVICES=6 uvicorn gpu_service:gpu_app --port 6070
 gpu_app = FastAPI()
 max_cache_action = 16
 
-log_time = "2025.11.08-10.25.33"
-w_idx = -1
+log_time = "2025.12.14-20.22.43"
+w_idx = -2
 
 map_time_to_dataset = {
     "2025.11.08-10.27.18": "1021_sweep_bean",
     "2025.11.08-01.55.12": "1024_eggs_pick_place",
     "2025.11.08-10.28.20": "1024_pour_water",
     "2025.11.08-10.25.33": "1024_wipe_white_board",
+    "2025.12.01-22.51.04": "1201_wipe_blackboard",
+    "2025.12.03-23.52.04": "1201_pour_water",
+    "2025.12.11-22.31.16": "1201_banana",
+    "2025.12.11-23.08.31": "1201_pepper",
+    "2025.12.14-20.22.43": "1201_pot",
 }
+train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
+train_project_dir = train_project_dir.replace('-', '/')
 dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
 dataset_name = map_time_to_dataset.get(log_time, dataset_name)
 
@@ -57,7 +65,12 @@ else:
     dataset_dir = dataset_name
     print(f"[Warning] Using {dataset_name} for log_time={log_time}.")
 
-with open(f"/home/geyuan/datasets/TCL/{dataset_dir}/statistics.json", 'r') as json_file:
+dataset_statistics_file = f"/home/geyuan/datasets/TCL/{dataset_dir}/statistics.json"
+train_project_statistics_file = os.path.join(train_project_dir, "statistics.json")
+if not os.path.exists(train_project_statistics_file):
+    shutil.copy(dataset_statistics_file, train_project_statistics_file)
+    print("[Info] Copied statistics.json from dataset dir to train project dir.")
+with open(train_project_statistics_file, 'r') as json_file:
     # statistics = json.load(json_file)
     # data_min = torch.from_numpy(np.array(statistics['min']))
     # data_max = torch.from_numpy(np.array(statistics['max']))
@@ -106,8 +119,7 @@ def get_agent(device: str):
     from omegaconf import OmegaConf
 
     # 1. Load hydra config
-    train_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
-    train_dir = train_dir.replace('-', '/')
+    train_dir = train_project_dir
     hydra_config_path = os.path.join(train_dir, ".hydra/config.yaml")
     hydra_config = OmegaConf.load(hydra_config_path)
     model = hydra.utils.instantiate(hydra_config.policy)

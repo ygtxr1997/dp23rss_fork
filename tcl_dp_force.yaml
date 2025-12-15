@@ -164,11 +164,23 @@ task:
 #    data_root: "/home/geyuan/local_soft/TCL/1024_eggs_pick_place/"
 #    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_eggs_pick_place_240p.h5"
     # Task [3]
-    data_root: "/home/geyuan/local_soft/TCL/1024_pour_water/"
-    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_pour_water_240p.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/1024_pour_water/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_pour_water_240p.h5"
     # Task [4]
 #    data_root: "/home/geyuan/local_soft/TCL/1024_wipe_white_board/"
 #    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_wipe_white_board_240p.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/1201_wipe_blackboard/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_wipe_blackboard_240p.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/1201_pour_water/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_pour_water_240p.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/1201_banana/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_banana_240p.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/1201_pepper/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_pepper_240p.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/1201_pot/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_pot_240p.h5"
+    data_root: "/home/geyuan/local_soft/TCL/1201_coffee/"
+    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_coffee_240p.h5"
     use_h5: true
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
@@ -213,7 +225,7 @@ training:
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 3000  # ori:3050
+  num_epochs: 1500  # ori:3050
   resume: true
   rollout_every: 10000  # ori:50
   sample_every: 5

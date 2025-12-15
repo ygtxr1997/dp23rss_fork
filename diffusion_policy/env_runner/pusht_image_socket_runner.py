@@ -351,7 +351,7 @@ class PushTImageSocketRunner(BaseImageRunner):
         self.send_cnt += 1
         return ret_actions_B_1_D
 
-    def run(self, device: Union[torch.device, str] = "cuda", close_online: bool = True):
+    def run(self, device: Union[torch.device, str] = "cuda", close_online: bool = True, stage_flag: int = 0):
         env = self.env
 
         # plan for rollout
@@ -387,7 +387,6 @@ class PushTImageSocketRunner(BaseImageRunner):
             obs = env.reset()
             past_action = None
             # policy.reset()
-            stage_flag = 0  # 0:cold start, 1:hot start
 
             pbar = tqdm.tqdm(total=self.max_steps,
                              desc=f"Eval PushtImageRunner shift={self.domain_shift} {chunk_idx + 1}/{n_chunks}",
@@ -438,8 +437,12 @@ class PushTImageSocketRunner(BaseImageRunner):
 
                     if close_online:
                         pass
+                    elif stage_flag == 0:
+                        stage_flag = 1  # after 0-cold start, set to 1-hot start
+                    elif stage_flag == 1:
+                        pass
                     else:
-                        stage_flag = 1  # NOTE: after first step, all are hot start
+                        assert stage_flag == 2, f"Expected stage_flag to be 2 after first eval, got {stage_flag}"
 
                 # print("[DEBUG] action:", action_dict["action"].min(), action_dict["action"].max(), action_dict["action"].shape,
                 #       "agent_pos:", obs_dict["agent_pos"].min(), obs_dict["agent_pos"].max(), obs_dict["agent_pos"].shape,

@@ -159,8 +159,10 @@ task:
 #    h5_path: "/home/geyuan/local_soft/TCL/hdf5/0627_pot_source_240p.h5"
 #    data_root: "/home/geyuan/local_soft/TCL/0704_pepper_source/"
 #    h5_path: "/home/geyuan/local_soft/TCL/hdf5/0704_pepper_source_240p.h5"
-    data_root: "/home/geyuan/local_soft/TCL/1024_sweep_bean/"
-    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_sweep_bean_240p.h5"
+#    data_root: "/home/geyuan/local_soft/TCL/1024_sweep_bean/"
+#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_sweep_bean_240p.h5"
+    data_root: "/home/geyuan/local_soft/TCL/1201_wipe_blackboard/"
+    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_wipe_blackboard_240p.h5"
     use_h5: true
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
