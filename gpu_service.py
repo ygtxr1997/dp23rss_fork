@@ -65,46 +65,52 @@ else:
     dataset_dir = dataset_name
     print(f"[Warning] Using {dataset_name} for log_time={log_time}.")
 
+# Load dataset statistics
 dataset_statistics_file = f"/home/geyuan/datasets/TCL/{dataset_dir}/statistics.json"
 train_project_statistics_file = os.path.join(train_project_dir, "statistics.json")
-if not os.path.exists(train_project_statistics_file):
-    shutil.copy(dataset_statistics_file, train_project_statistics_file)
-    print("[Info] Copied statistics.json from dataset dir to train project dir.")
+if os.path.exists(dataset_statistics_file):
+    with open(dataset_statistics_file, 'r') as json_file:
+        statistics = json.load(json_file)
+        dataset_stats = statistics["stats"]
+        datasets_total_len = statistics["total_len"]
+        dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
+        dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
+
+        data_root = f"/home/geyuan/datasets/TCL/{dataset_dir}"
+        h5_path = f"/home/geyuan/datasets/TCL/hdf5/{dataset_dir}_240p.h5"
+        tcl_hdf5_dataset = TCLDatasetHDF5(
+            data_root, h5_path,
+            use_extracted=True,
+            load_keys=["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text", "force_torque"]
+        )
+        all_force_torques = tcl_hdf5_dataset.dsets["force_torque"]
+
+        # Calculate p01 and p99 for force_torque if available
+        if 'force_torque' in dataset_stats:
+            # Calculate p01 (1%) and p99 (99%) quantiles along the sample dimension (axis=0)
+            p01 = np.quantile(all_force_torques, q=0.01, axis=0)
+            p99 = np.quantile(all_force_torques, q=0.99, axis=0)
+
+            # Add the calculated quantiles to the merged statistics dictionary
+            dataset_stats['force_torque']['p01'] = p01.tolist()
+            dataset_stats['force_torque']['p99'] = p99.tolist()
+
+    # Dump updated statistics back to the JSON file
+    if not os.path.exists(train_project_statistics_file):
+        with open(train_project_statistics_file, 'w') as json_file:
+            json.dump(statistics, json_file, indent=4)
+        print("[Info] Dumped updated statistics.json to train_project_dir.")
+
+# Load statistics from train project dir (to be compatible with ITX deployment)
+assert os.path.exists(train_project_statistics_file), "[gpu_service] statistics.json not found in train_project_dir."
 with open(train_project_statistics_file, 'r') as json_file:
-    # statistics = json.load(json_file)
-    # data_min = torch.from_numpy(np.array(statistics['min']))
-    # data_max = torch.from_numpy(np.array(statistics['max']))
     statistics = json.load(json_file)
     dataset_stats = statistics["stats"]
     datasets_total_len = statistics["total_len"]
     dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
     dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
-
-    data_root = f"/home/geyuan/datasets/TCL/{dataset_dir}"
-    h5_path = f"/home/geyuan/datasets/TCL/hdf5/{dataset_dir}_240p.h5"
-    tcl_hdf5_dataset = TCLDatasetHDF5(
-        data_root, h5_path,
-        use_extracted=True,
-        load_keys=["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text", "force_torque"]
-    )
-    all_force_torques = tcl_hdf5_dataset.dsets["force_torque"]
-
-    # Calculate p01 and p99 for force_torque if available
-    if 'force_torque' in dataset_stats:
-        # Calculate p01 (1%) and p99 (99%) quantiles along the sample dimension (axis=0)
-        p01 = np.quantile(all_force_torques, q=0.01, axis=0)
-        p99 = np.quantile(all_force_torques, q=0.99, axis=0)
-
-        # Add the calculated quantiles to the merged statistics dictionary
-        dataset_stats['force_torque']['p01'] = p01
-        dataset_stats['force_torque']['p99'] = p99
-
-
-# class StepRequestWithObservation(pydantic.BaseModel):
-#     primary_rgb: List[str]
-#     gripper_rgb: List[str]
-#     instruction: str
-#     joint_state: List[List[float]]
+    dataset_stats['force_torque']['p01'] = np.array(dataset_stats["force_torque"]['p01'])
+    dataset_stats['force_torque']['p99'] = np.array(dataset_stats["force_torque"]['p99'])
 
 
 @lru_cache()
