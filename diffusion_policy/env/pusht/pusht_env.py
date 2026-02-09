@@ -248,13 +248,13 @@ class PushTEnv(gym.Env):
             ''' to orange '''
             # canvas.fill((180, 180, 180))  # to gray, 0.25
             canvas.fill((255, 125, 80))  # to orange, 0.23
-        elif self.domain_shift == "texture":
+        elif "texture" in self.domain_shift:
             ''' with texture '''
             image = pygame.image.load("media/blotchy_0015.jpg")  # to texture, 0.17
             for x in range(0, canvas.get_width(), image.get_width()):
                 for y in range(0, canvas.get_height(), image.get_height()):
                     canvas.blit(image, (x, y))
-        elif self.domain_shift == "rainbow":
+        elif "rainbow" in self.domain_shift:
             # 使用时间创建彩虹色渐变效果
             import colorsys
 
@@ -342,7 +342,7 @@ class PushTEnv(gym.Env):
         # self.space.debug_draw(draw_options)
 
         ## 添加光照效果, 0.15
-        if self.domain_shift == "light":
+        if "light" in self.domain_shift:  # NOTE: can be compatiable with other shifts
             self._apply_random_lighting(canvas)
 
         if mode == "human":

@@ -6,7 +6,10 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 import copy
 import shutil
+import yaml
 
+import hydra
+from omegaconf import OmegaConf
 import numpy as np
 import pydantic
 from PIL import Image
@@ -16,117 +19,103 @@ import json
 import torch
 from torchvision.transforms import transforms
 
-from diffusion_policy.dataset.tcl_dataset import TCLImageDataset, TCLDatasetHDF5
+from diffusion_policy.dataset.libero_dataset import LiberoFTDataset
 # from robokit.service.service_connector import ServiceConnector
 from robokit.connects.protocols import StepRequestFromEvaluator, StepRequestFromPolicy
+from robokit.debug_utils.printer import print_batch
 
 
 """ How to use me?
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service:gpu_app --port 6070
+CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service_libero:gpu_app --port 6070
 """
 gpu_app = FastAPI()
-max_cache_action = 16
+max_cache_action = 32
 
-log_time = "2026.01.17-00.06.29"
-w_idx = -1
+# log_time = "2026.01.26-16.44.01"
+# log_time = "2026.01.26-20.59.54"
+# log_time = "2026.01.28-10.43.39"  # KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5
+# log_time = "2026.01.28-17.01.07"  # KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo_wrench
+log_time = "2026.01.28-10.44.52"  # KITCHEN_SCENE6_close_the_microwave_demo_wrench.hdf5
+# log_time = "2026.01.28-10.34.35"  # STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_left_compartment_of_the_caddy_demo_wrench.hdf5
+w_idx = -2
 
-map_time_to_dataset = {
-    "2025.11.08-10.27.18": "1021_sweep_bean",
-    "2025.11.08-01.55.12": "1024_eggs_pick_place",
-    "2025.11.08-10.28.20": "1024_pour_water",
-    "2025.11.08-10.25.33": "1024_wipe_white_board",
-    "2025.12.01-22.51.04": "1201_wipe_blackboard",
-    "2025.12.03-23.52.04": "1201_pour_water",
-    "2025.12.11-22.31.16": "1201_banana",
-    "2025.12.11-23.08.31": "1201_pepper",
-    "2025.12.14-20.22.43": "1201_pot",
-    "2025.12.15-17.58.23": "1201_coffee",
-    "2026.01.15-21.40.54": "1201_screw_bulb",
-    "2026.01.17-00.06.29": "1201_screw_bulb_turn_off",
-}
+
+def load_dataset_fields(yaml_path: str):
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    shape_meta = cfg.get("shape_meta", None)
+    ds = cfg["task"]["dataset"]
+    hdf5_fns = ds.get("hdf5_fns", [])
+    dataset_root = ds.get("dataset_root", None)
+    dataset_subname = ds.get("dataset_subname", None)
+    return hdf5_fns, dataset_root, dataset_subname, shape_meta
+
+
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = train_project_dir.replace('-', '/')
-dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
-dataset_name = map_time_to_dataset.get(log_time, dataset_name)
+train_yaml_path = os.path.join(train_project_dir, ".hydra/config.yaml")
+assert os.path.exists(train_yaml_path), f"[gpu_service_libero] train_yaml_path not found: {train_yaml_path}"
 
-if "2025.05.11" in log_time or "2025.05.13" in log_time:
-    dataset_dir = "collected_data_0507"
-elif dataset_name == "shovel":
-    dataset_dir = "collected_data_0514_shovel_source"
-elif dataset_name == "pot":
-    dataset_dir = "0627_pot_source"
-elif dataset_name == "pot_light":
-    dataset_dir = "0627_pot_light"
-elif dataset_name == "pot_object":
-    dataset_dir = "0627_pot_object"
-elif dataset_name == "pepper":
-    dataset_dir = "0704_pepper_source"
-else:
-    dataset_dir = dataset_name
-    print(f"[Warning] Using {dataset_name} for log_time={log_time}.")
+hdf5_fns, dataset_root, dataset_subname, shape_meta = load_dataset_fields(train_yaml_path)
+print(f"[INFO] Loaded dataset fields from {train_yaml_path}:")
+print("  hdf5_fns:", hdf5_fns)
+print("  dataset_root:", dataset_root)
+print("  dataset_subname:", dataset_subname)
+print("  shape_meta:", shape_meta)
 
-# Load dataset statistics
-dataset_statistics_file = f"/home/geyuan/datasets/TCL/{dataset_dir}/statistics.json"
+# Load dataset statistics and save to train_project_dir if not exists
 train_project_statistics_file = os.path.join(train_project_dir, "statistics.json")
-if os.path.exists(dataset_statistics_file):
-    with open(dataset_statistics_file, 'r') as json_file:
-        statistics = json.load(json_file)
-        dataset_stats = statistics["stats"]
-        datasets_total_len = statistics["total_len"]
-        dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
-        dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
-
-        data_root = f"/home/geyuan/datasets/TCL/{dataset_dir}"
-        h5_path = f"/home/geyuan/datasets/TCL/hdf5/{dataset_dir}_240p.h5"
-        tcl_hdf5_dataset = TCLDatasetHDF5(
-            data_root, h5_path,
-            use_extracted=True,
-            load_keys=["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text", "force_torque"]
-        )
-        all_force_torques = tcl_hdf5_dataset.dsets["force_torque"]
-
-        # Calculate p01 and p99 for force_torque if available
-        if 'force_torque' in dataset_stats:
-            # Calculate p01 (1%) and p99 (99%) quantiles along the sample dimension (axis=0)
-            p01 = np.quantile(all_force_torques, q=0.01, axis=0)
-            p99 = np.quantile(all_force_torques, q=0.99, axis=0)
-
-            # Add the calculated quantiles to the merged statistics dictionary
-            dataset_stats['force_torque']['p01'] = p01.tolist()
-            dataset_stats['force_torque']['p99'] = p99.tolist()
+if os.path.exists(dataset_root):
+    train_dataset = LiberoFTDataset(
+        hdf5_fns=hdf5_fns,
+        dataset_root=dataset_root,
+        dataset_subname=dataset_subname,
+        horizon=1,  # just for loading statistics
+        pad_before=0,
+        pad_after=0,
+        shape_meta=shape_meta,
+        norm_force_type="quantile",
+        transform_color_jitter=False,
+    )
+    statistics = train_dataset.dataset_stats
+    for k, stat_dict in statistics.items():
+        statistics[k] = {sub_k: sub_v.tolist() for sub_k, sub_v in stat_dict.items()}
 
     # Dump updated statistics back to the JSON file
     if not os.path.exists(train_project_statistics_file):
         with open(train_project_statistics_file, 'w') as json_file:
             json.dump(statistics, json_file, indent=4)
-        print("[Info] Dumped updated statistics.json to train_project_dir.")
+        print("[INFO] Dumped updated statistics.json to train_project_dir.")
 
 # Load statistics from train project dir (to be compatible with ITX deployment)
-assert os.path.exists(train_project_statistics_file), "[gpu_service] statistics.json not found in train_project_dir."
+assert os.path.exists(train_project_statistics_file), "[gpu_service_libero] statistics.json not found in train_project_dir."
 with open(train_project_statistics_file, 'r') as json_file:
     statistics = json.load(json_file)
-    dataset_stats = statistics["stats"]
-    datasets_total_len = statistics["total_len"]
-    dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
-    dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
-    dataset_stats['force_torque']['p01'] = np.array(dataset_stats["force_torque"]['p01'])
-    dataset_stats['force_torque']['p99'] = np.array(dataset_stats["force_torque"]['p99'])
+    for k, stat_dict in statistics.items():
+        statistics[k] = {sub_k: np.array(sub_v) for sub_k, sub_v in stat_dict.items()}
+    dataset_stats = statistics
+    '''
+    dataset_stats: Dict, keys=['obs.wrenches', 'obs.ee_states', 'action.actions']
+    --obs.wrenches: Dict, keys=['count', 'mean', 'std', 'min', 'max', 'p01', 'p99']
+    ----count, <class 'numpy.ndarray'>, shape=(), value=11723
+    ----mean, <class 'numpy.ndarray'>, shape=(6,), min=-0.2352, max=4.8427, dtype=float64
+    ----std, <class 'numpy.ndarray'>, shape=(6,), min=1.5180, max=23.3075, dtype=float64
+    ----min, <class 'numpy.ndarray'>, shape=(6,), min=-408.8553, max=-18.2925, dtype=float64
+    ----max, <class 'numpy.ndarray'>, shape=(6,), min=27.7514, max=444.5059, dtype=float64
+    ----p01, <class 'numpy.ndarray'>, shape=(6,), min=-32.5228, max=-5.5354, dtype=float64
+    ----p99, <class 'numpy.ndarray'>, shape=(6,), min=3.2230, max=91.8009, dtype=float64
+    '''
+    dataset_action_max = dataset_stats['action.actions']['max']
+    dataset_action_min = dataset_stats['action.actions']['min']
+    dataset_states_max = dataset_stats['obs.ee_states']['max']
+    dataset_states_min = dataset_stats['obs.ee_states']['min']
 
 
 @lru_cache()
-def get_agent(device: str):
-    ## Op1. Debug model, sleep only
-    # model = DebugModel(sleep_duration=100)
-    ## Op2. Replay model, load action data and sleep
-    # model = ReplayModel(sleep_duration=25,
-    #                     replay_root="/home/geyuan/datasets/TCL/collected_data")
-
-    import hydra
-    from omegaconf import OmegaConf
-
+def get_agent(device: str, use_ema: bool = True):
     # 1. Load hydra config
     train_dir = train_project_dir
     hydra_config_path = os.path.join(train_dir, ".hydra/config.yaml")
@@ -141,13 +130,16 @@ def get_agent(device: str):
     print(weight_paths)
     weight_path = os.path.join(train_dir, "checkpoints", weight_paths[w_idx])
     weight = torch.load(weight_path, map_location="cpu", weights_only=False)['state_dicts']
-    weight = weight['model']
+    if not use_ema:
+        weight = weight['model']
+    else:
+        weight = weight['ema_model']
     # for k, v in weight.items():
     #     print(k, v.shape)
 
     model.load_state_dict(weight)
     model = model.to(device).eval()
-    print(f"[get_agent] model loaded from: {weight_path}")
+    print(f"[get_agent] model loaded from: {weight_path}, use_ema={use_ema}")
 
     # 3. Other settings
     model.infer_frame_idx = 0
@@ -198,8 +190,11 @@ def model_step(step_request: StepRequestFromEvaluator):
     tcp_pose_B_T_D = tcp_state[:, :, :6].astype(np.float32)  # (B,T,6)
 
     # Norm input states
-    force_B_T_D = TCLImageDataset.norm_state_or_force(
-        force_B_T_D, norm_type="quantile", meta_data=dataset_stats['force_torque']
+    force_B_T_D = LiberoFTDataset.norm_state_or_force(
+        force_B_T_D, norm_type="quantile", meta_data=dataset_stats['obs.wrenches']
+    )
+    tcp_pose_B_T_D = LiberoFTDataset.norm_state_or_force(
+        tcp_pose_B_T_D, norm_type="mean", meta_data=dataset_stats['obs.ee_states']
     )
 
     # joint_state = torch.from_numpy(np.array(joint_state)).to("cuda").unsqueeze(0)  # (B,T,6)
@@ -288,11 +283,11 @@ def model_step(step_request: StepRequestFromEvaluator):
     # cache_action = (cache_action * 0.5 + 0.5).cpu()  # in [0,1]
     # cache_action = cache_action * (data_max - data_min) + data_min
     cache_action = action
-    for act_idx in range(cache_action.shape[0]):
-        if cache_action[act_idx, 6:] >= 0.5:
-            cache_action[act_idx, 6:] = 1
-        else:
-            cache_action[act_idx, 6:] = 0
+    # for act_idx in range(cache_action.shape[0]):  # NOTE: different gripper control
+    #     if cache_action[act_idx, 6:] >= 0.5:
+    #         cache_action[act_idx, 6:] = 1
+    #     else:
+    #         cache_action[act_idx, 6:] = 0
 
     agent.infer_frame_idx += 1
     # return {"action": cache_action.detach().numpy().tolist()}

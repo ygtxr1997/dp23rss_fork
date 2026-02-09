@@ -27,17 +27,17 @@ Example usage:
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-yes | CUDA_VISIBLE_DEVICES=4 python eval_socket.py  \
+yes | CUDA_VISIBLE_DEVICES=2 python eval_socket.py  \
     -c "None"  \
     -o data/pusht_eval_output  \
-    -p 6064  \
+    -p 6062  \
     -s rainbow  \
-    -a 0.5  \
-    -r 2  \
-    --max_repeats 100  \
+    -a 1  \
+    -r -1  \
+    --max_repeats 30  \
     --close_online
 '''
-h5_suffix = '_seed100*2_2copy'  # just set for debug. `3e-5`, `layer28`, `ex_lora`, `ex_kv`
+h5_suffix = '_tmp'  # just set for debug. `3e-5`, `layer28`, `ex_lora`, `ex_kv`
 
 @click.command()
 @click.option('-c', '--checkpoint', required=True)
@@ -51,7 +51,7 @@ h5_suffix = '_seed100*2_2copy'  # just set for debug. `3e-5`, `layer28`, `ex_lor
 @click.option('--close_online', is_flag=True, default=False, help='whether to eval the baseline')
 @click.option('-r', '--reset_each', default=-1, help='reset model after each n eval')
 @click.option('-n', '--num_envs', default=1, help='num of parallel envs')
-@click.option('-m', '--max_repeats', default=200, help='num of repat time, can be x1.5 for acc_seed=0.66')
+@click.option('-m', '--max_repeats', default=200, help='num of repat time, will be x1.5 if acc_seed=0.66')
 def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift='none',
          acc_seed: float = 1.0, close_online=False, reset_each=-1, num_envs: int = 1,
          max_repeats: int = 200,
@@ -130,6 +130,7 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
             stage_flag=stage_flag,
         )
         if not close_online:
+            # stage_flag = 1  # NOTE: after first eval, set to 1-online next time
             stage_flag = 2  # after first eval, set to 2-copy weights next time
 
         # dump log to json

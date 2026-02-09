@@ -21,6 +21,7 @@
 tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
+export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
 CUDA_VISIBLE_DEVICES=4 bash sh_train.sh
 "
 
@@ -28,6 +29,7 @@ CUDA_VISIBLE_DEVICES=4 bash sh_train.sh
 #CONFIG_NAME="tcl_hdfree_shovel.yaml"
 #CONFIG_NAME="tcl_hdfree_dp.yaml"
 CONFIG_NAME="tcl_dp_force.yaml"
+#CONFIG_NAME="libero_force_dp.yaml"
 DEVICE="cuda"
 
 export HYDRA_FULL_ERROR=1

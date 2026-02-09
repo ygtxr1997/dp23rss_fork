@@ -9,7 +9,7 @@ checkpoint:
     monitor_key: val_loss  # ori: test_mean_score
 dataloader:
   batch_size: 64  # ori:64
-  num_workers: 32
+  num_workers: 48  # ori:32
   persistent_workers: false
   pin_memory: true
   shuffle: true
@@ -98,9 +98,9 @@ policy:
       act_lr: 5e-7  # ori:5e-7
 
   causal_attn: true
-  crop_shape: # h,w
-  - 216  # ori:84
-  - 288
+  crop_shape: # h,w, NOTE: needs to be set according to image_shape
+  - 112  # ori:84
+  - 112
   eval_fixed_crop: true
   horizon: ${horizon}
   n_action_steps: 8
@@ -128,7 +128,7 @@ policy:
   p_drop_emb: 0.0
   shape_meta: ${shape_meta}
   time_as_cond: true
-image_shape: &image_shape [3, 240, 320]
+image_shape: &image_shape [3, 128, 128]  # ori:[3, 240, 320]
 shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
   # acceptable types: rgb, low_dim
   obs:
@@ -149,7 +149,7 @@ shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!
     shape: [7]
 task:
   dataset:  # Source domain
-    _target_: diffusion_policy.dataset.tcl_dataset.TCLImageDataset
+    _target_: diffusion_policy.dataset.libero_dataset.LiberoFTDataset
     shape_meta: ${shape_meta}
     horizon: ${horizon}
     max_train_episodes: 90
@@ -157,37 +157,24 @@ task:
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
-    # Task [1]
-#    data_root: "/home/geyuan/local_soft/TCL/1024_sweep_bean/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_sweep_bean_240p.h5"
-    # Task [2]
-#    data_root: "/home/geyuan/local_soft/TCL/1024_eggs_pick_place/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_eggs_pick_place_240p.h5"
-    # Task [3]
-#    data_root: "/home/geyuan/local_soft/TCL/1024_pour_water/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_pour_water_240p.h5"
-    # Task [4]
-#    data_root: "/home/geyuan/local_soft/TCL/1024_wipe_white_board/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1024_wipe_white_board_240p.h5"
-#    data_root: "/home/geyuan/local_soft/TCL/1201_wipe_blackboard/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_wipe_blackboard_240p.h5"
-#    data_root: "/home/geyuan/local_soft/TCL/1201_pour_water/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_pour_water_240p.h5"
-#    data_root: "/home/geyuan/local_soft/TCL/1201_banana/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_banana_240p.h5"
-#    data_root: "/home/geyuan/local_soft/TCL/1201_pepper/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_pepper_240p.h5"
-#    data_root: "/home/geyuan/local_soft/TCL/1201_pot/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_pot_240p.h5"
-#    data_root: "/home/geyuan/local_soft/TCL/1201_coffee/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_coffee_240p.h5"
-#    data_root: "/home/geyuan/local_soft/TCL/1201_screw_bulb/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_screw_bulb_240p.h5"
 #    data_root: "/home/geyuan/local_soft/TCL/1201_screw_bulb_turn_off/"
 #    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_screw_bulb_turn_off_240p.h5"
-    data_root: "/home/geyuan/local_soft/TCL/0209_tower_boby/"
-    h5_path: "/home/geyuan/local_soft/TCL/hdf5/0209_tower_boby_240p.h5"
-    use_h5: true
+    dataset_root: "/home/geyuan/code/LIBERO-FT/libero/datasets/"
+    dataset_subname: "libero_force"
+    hdf5_fns:
+#      - "tmp_replayed_wrench.hdf5"
+      - "KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE5_close_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE2_open_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE6_close_the_microwave_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_and_open_the_top_drawer_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE7_open_the_microwave_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_left_compartment_of_the_caddy_demo_wrench.hdf5"
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: *shape_meta
@@ -221,7 +208,7 @@ task:
   name: pusht_image
   shape_meta: ${shape_meta}
 task_name: pusht_image
-#pretrained_ckpt: "data/outputs/2025.06.30/00.35.04_train_diffusion_transformer_hybrid_pusht_images/checkpoints/epoch=2800-val_loss=0.012.ckpt"
+pretrained_ckpt: "data/outputs/2026.01.28/17.01.07_train_diffusion_transformer_hybrid_pusht_images/checkpoints/latest.ckpt"
 training:
   checkpoint_every: 50  # ori:50
   debug: false
@@ -241,7 +228,7 @@ training:
   val_every: 50
 val_dataloader:
   batch_size: 64
-  num_workers: 24  # ori:48
+  num_workers: 12  # ori:48
   persistent_workers: false
   pin_memory: true
   shuffle: false
