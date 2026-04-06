@@ -133,6 +133,7 @@ class LiberoFTDataset(BaseImageDataset):
             max_len: Optional[int] = None,
             transform_color_jitter: bool = True,
             load_future_obs: bool = False,
+            zero_force: bool = False,
     ):
         super().__init__()
         # RoboKit Dataset
@@ -144,6 +145,10 @@ class LiberoFTDataset(BaseImageDataset):
         self.libero_h5_datasets = []
         for fn in hdf5_fns:
             hdf5_path = os.path.join(dataset_root, dataset_subname, fn)
+            if not os.path.exists(hdf5_path):
+                self.dataset_root = dataset_root = os.path.join(dataset_root, dataset_subname)
+                self.dataset_subname = dataset_subname = "libero_90"
+                hdf5_path = os.path.join(dataset_root, dataset_subname, fn)
             assert os.path.exists(hdf5_path), f"HDF5 file not found: {hdf5_path}"
             self.hdf5_paths.append(hdf5_path)
             self.libero_h5_datasets.append(
@@ -191,6 +196,7 @@ class LiberoFTDataset(BaseImageDataset):
         self.val_ratio = val_ratio
         self.max_train_episodes = max_train_episodes
         self.max_len = max_len
+        self.zero_force = zero_force
 
         # Sampling a data sequence
         self.horizon = horizon
@@ -337,6 +343,9 @@ class LiberoFTDataset(BaseImageDataset):
         obs_data["force"] = force_torque  # (T,D)
         for k in obs_data.keys():
             assert obs_data[k] != [], f"obs_data[{k}] is empty!"
+
+        if self.zero_force:
+            obs_data["force"] *= 0.0
 
         # act_data = (actions - self.dataset_stats["action.actions"]["min"]) / (
         #         self.dataset_stats["action.actions"]["max"] - self.dataset_stats["action.actions"]["min"] + 1e-8

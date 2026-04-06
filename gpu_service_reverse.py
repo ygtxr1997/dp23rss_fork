@@ -25,30 +25,18 @@ from robokit.connects.protocols import StepRequestFromEvaluator, StepRequestFrom
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service:gpu_app --port 6070
+CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service_reverse:gpu_app --port 6070
 """
 gpu_app = FastAPI()
 max_cache_action = 32
 
-log_time = "2026.03.18-21.22.07"
+log_time = "2026.03.18-22.40.53"
 w_idx = -1
 
 map_time_to_dataset = {
-    "2025.11.08-10.27.18": "1021_sweep_bean",
-    "2025.11.08-01.55.12": "1024_eggs_pick_place",
-    "2025.11.08-10.28.20": "1024_pour_water",
-    "2025.11.08-10.25.33": "1024_wipe_white_board",
-    "2025.12.01-22.51.04": "1201_wipe_blackboard",
-    "2025.12.03-23.52.04": "1201_pour_water",
-    "2025.12.11-22.31.16": "1201_banana",
-    "2025.12.11-23.08.31": "1201_pepper",
-    "2025.12.14-20.22.43": "1201_pot",
-    "2025.12.15-17.58.23": "1201_coffee",
-    "2026.01.15-21.40.54": "1201_screw_bulb",
-    "2026.01.17-00.06.29": "1201_screw_bulb_turn_off",
-    "2026.02.10-00.06.53": "0209_tower_boby",
-    "2026.03.16-21.09.19": "0209_tower_boby_hard",
-    "2026.03.18-21.22.07": "0209_tower_boby_easy",
+    "2026.03.13-22.23.23": "tower_boby_A",
+    "2026.03.17-00.32.10": "0209_tower_boby_hard_reversed",
+    "2026.03.18-22.40.53": "0209_tower_boby_easy_reversed",
 }
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = train_project_dir.replace('-', '/')
@@ -57,22 +45,12 @@ dataset_name = map_time_to_dataset.get(log_time, dataset_name)
 
 if "2025.05.11" in log_time or "2025.05.13" in log_time:
     dataset_dir = "collected_data_0507"
-elif dataset_name == "shovel":
-    dataset_dir = "collected_data_0514_shovel_source"
-elif dataset_name == "pot":
-    dataset_dir = "0627_pot_source"
-elif dataset_name == "pot_light":
-    dataset_dir = "0627_pot_light"
-elif dataset_name == "pot_object":
-    dataset_dir = "0627_pot_object"
-elif dataset_name == "pepper":
-    dataset_dir = "0704_pepper_source"
 else:
     dataset_dir = dataset_name
     print(f"[Warning] Using {dataset_name} for log_time={log_time}.")
 
 # Load dataset statistics
-dataset_statistics_file = f"/home/geyuan/datasets/TCL/{dataset_dir}/statistics.json"
+dataset_statistics_file = f"/home/geyuan/datasets/reverse/{dataset_dir}/statistics.json"
 train_project_statistics_file = os.path.join(train_project_dir, "statistics.json")
 if os.path.exists(dataset_statistics_file):
     with open(dataset_statistics_file, 'r') as json_file:
@@ -82,8 +60,8 @@ if os.path.exists(dataset_statistics_file):
         dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
         dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
 
-        data_root = f"/home/geyuan/datasets/TCL/{dataset_dir}"
-        h5_path = f"/home/geyuan/datasets/TCL/hdf5/{dataset_dir}_240p.h5"
+        data_root = f"/home/geyuan/datasets/reverse/{dataset_dir}"
+        h5_path = f"/home/geyuan/datasets/reverse/hdf5/{dataset_dir}_240p.h5"
         tcl_hdf5_dataset = TCLDatasetHDF5(
             data_root, h5_path,
             use_extracted=True,
@@ -125,7 +103,7 @@ def get_agent(device: str):
     # model = DebugModel(sleep_duration=100)
     ## Op2. Replay model, load action data and sleep
     # model = ReplayModel(sleep_duration=25,
-    #                     replay_root="/home/geyuan/datasets/TCL/collected_data")
+    #                     replay_root="/home/geyuan/datasets/reverse/collected_data")
 
     import hydra
     from omegaconf import OmegaConf
@@ -154,6 +132,14 @@ def get_agent(device: str):
 
     # 3. Other settings
     model.infer_frame_idx = 0
+
+    # (Optional) 4. Use replay model for debugging
+    # from robokit.debug_utils.debug_classes import ReplayModel
+    # model = ReplayModel(sleep_duration=0,
+    #                     replay_root="/home/geyuan/datasets/reverse/tower_boby_A",
+    #                     replay_idx=10,
+    #                     cache_actions_cnt=16,
+    #                     )
 
     return model, hydra_config, weight_path
 
@@ -271,25 +257,11 @@ def model_step(step_request: StepRequestFromEvaluator):
 
     # 3.b Postprocess
     # print(action.shape, action.min(dim=0)[0], action.max(dim=0)[0])
+    # TODO: not for ReplayModel
     action = (action * 0.5 + 0.5).cpu()  # in [0,1]
     action = action.clamp(0., 1.)
     action = action * (dataset_action_max - dataset_action_min) + dataset_action_min
-    # # print(action.shape, action.min(dim=0), action.max(dim=0))
-    # agent.cache_action = action
-    # else:
-    #     action = agent.cache_action
 
-    # 4. Return results
-    # frame_action = action[action_idx].numpy().tolist()
-    # if frame_action[6] > 0.5:
-    #     frame_action[6] = 1.
-    # else:
-    #     frame_action[6] = 0.
-    # print("[gpu_service] Action:", len(frame_action), frame_action, obs_dict.keys())
-
-    # cache_action = copy.deepcopy(agent.cache_action[0])  # remove batch dim
-    # cache_action = (cache_action * 0.5 + 0.5).cpu()  # in [0,1]
-    # cache_action = cache_action * (data_max - data_min) + data_min
     cache_action = action
     for act_idx in range(cache_action.shape[0]):
         if cache_action[act_idx, 6:] >= 0.5:

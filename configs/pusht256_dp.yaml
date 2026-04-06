@@ -3,13 +3,13 @@ checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
   topk:
-    format_str: epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt
+    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
     k: 5
-    mode: min
-    monitor_key: val_loss  # ori: test_mean_score
+    mode: max
+    monitor_key: test_mean_score
 dataloader:
   batch_size: 64  # ori:64
-  num_workers: 48  # ori:32
+  num_workers: 12
   persistent_workers: false
   pin_memory: true
   shuffle: true
@@ -21,16 +21,9 @@ ema:
   min_value: 0.0
   power: 0.75
   update_after_step: 0
-
 exp_name: default
-horizon: 32
+horizon: 10
 keypoint_visible_rate: 1.0
-n_action_steps: 8
-n_latency_steps: 0
-n_obs_steps: 1  # ori:2
-name: train_diffusion_transformer_hybrid
-obs_as_cond: true
-
 logging:
   group: null
   id: null
@@ -42,20 +35,24 @@ logging:
 multi_run:
   run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
-
+n_action_steps: 8
+n_latency_steps: 0
+n_obs_steps: 2
+name: train_diffusion_transformer_hybrid
+obs_as_cond: true
 optimizer:
   betas:
   - 0.9
   - 0.95
   learning_rate: 0.0001
   obs_encoder_weight_decay: 0.01  # ori:1.0e-06
-  transformer_weight_decay: 0.001  # ori:0.001
+  transformer_weight_decay: 0.01  # ori:0.001
 past_action_visible: false
 policy:
   # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
   # hdfree: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  use_da: false
+  use_da: false  # ori: true
   domain_adapt:
     src_ckpt: "data/experiments/image/pusht/diffusion_policy_transformer/train_0/epoch=0100-test_mean_score=0.748.ckpt"
 
@@ -98,94 +95,68 @@ policy:
       act_lr: 5e-7  # ori:5e-7
 
   causal_attn: true
-  crop_shape: # h,w, NOTE: needs to be set according to image_shape
-  - 112  # ori:84
-  - 112
+  crop_shape:
+  - 240  # ori:84
+  - 240  # ori:84
   eval_fixed_crop: true
-  horizon: ${horizon}
+  horizon: 10
   n_action_steps: 8
   n_cond_layers: 0
   n_emb: 256
   n_head: 4
   n_layer: 8
-  n_obs_steps: ${n_obs_steps}
+  n_obs_steps: 2
   noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
     beta_end: 0.02
     beta_schedule: squaredcos_cap_v2
     beta_start: 0.0001
     clip_sample: true
-    set_alpha_to_one: True
     num_train_timesteps: 100
-    steps_offset: 0
-    # prediction_type: epsilon
-    # variance_type: fixed_small
-
-  num_inference_steps: 8
-  obs_as_cond: true  # ori: true
+    prediction_type: epsilon
+    variance_type: fixed_small
+  num_inference_steps: 100
+  obs_as_cond: true
   obs_encoder_group_norm: true
   p_drop_attn: 0.3
   p_drop_emb: 0.0
   shape_meta: ${shape_meta}
   time_as_cond: true
-image_shape: &image_shape [3, 128, 128]  # ori:[3, 240, 320]
+image_shape: &image_shape [3, 256, 256]  # ori:[3, 96, 96]
 shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
   # acceptable types: rgb, low_dim
   obs:
-    image:  # static
+    image:
       shape: *image_shape
       type: rgb
-    gripper:  # gripper
-      shape: *image_shape
-      type: rgb
-    joint_state:
-      shape: [6]
+    agent_pos:
+      shape: [2]
       type: low_dim
-    force:  # will load `force_torque` from dataset
-      shape: [6]
-      type: low_dim
-
   action:
-    shape: [7]
+    shape: [2]
 task:
   dataset:  # Source domain
-    _target_: diffusion_policy.dataset.libero_dataset.LiberoFTDataset
+    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: ${shape_meta}
-    horizon: ${horizon}
+    horizon: 10
     max_train_episodes: 90
-    pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
-    pad_after: ${eval:'${n_action_steps}-1'}
+    pad_after: 7
+    pad_before: 1
     seed: 42
-    val_ratio: 0.02
-#    data_root: "/home/geyuan/local_soft/TCL/1201_screw_bulb_turn_off/"
-#    h5_path: "/home/geyuan/local_soft/TCL/hdf5/1201_screw_bulb_turn_off_240p.h5"
-    dataset_root: "/home/geyuan/code/LIBERO-FT//datasets/"
-    dataset_subname: "libero_force"
-    hdf5_fns:
-#      - "tmp_replayed_wrench.hdf5"
-#      - "KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE5_close_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE2_open_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE6_close_the_microwave_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_and_open_the_top_drawer_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE7_open_the_microwave_demo_wrench.hdf5"
-      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5"
-#      - "KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_demo_wrench.hdf5"
-#      - "STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_left_compartment_of_the_caddy_demo_wrench.hdf5"
-    zero_force: true  # ori:false
+    val_ratio: 0.01
+    transform_color_jitter: true  # ori:false
+#    zarr_path: data/pusht/pusht_256.zarr  # source domain
+    zarr_path: data/pusht/pusht_256_light.zarr  # shift: light
+#    zarr_path: data/pusht/pusht_256_goal.zarr  # shift: goal
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
-    shape_meta: *shape_meta
-    horizon: ${horizon}
+    horizon: 10
     max_train_episodes: 200  # ori:90
-    pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
-    pad_after: ${eval:'${n_action_steps}-1'}
+    pad_after: 7
+    pad_before: 1
     seed: 42
     val_ratio: 0.02
-    zarr_path: data/pusht/pusht_size_random.zarr
+    zarr_path: data/pusht/pusht_size.zarr
   env_runner:
     _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
     fps: 10
@@ -193,25 +164,24 @@ task:
     max_steps: 300
     n_action_steps: 8
     n_envs: null
-    n_obs_steps: ${n_obs_steps}
+    n_obs_steps: 2
     n_test: 25  # ori:50
     n_test_vis: 4
-    n_train: 6
-    n_train_vis: 2
+    n_train: 0  # ori: 4
+    n_train_vis: 0  # ori: 2
     past_action: false
     test_start_seed: 4300000  # ori:100000, download:4300000, [Note]: Should be totally same with the loading ckpt!!!
     train_start_seed: 0
-    domain_shift: size
-  image_shape:
-  - 3
-  - 96
-  - 96
+    domain_shift: light  # ori:size,goal,none,light
+    render_size: 256  # ori:96
+  image_shape: *image_shape
   name: pusht_image
   shape_meta: ${shape_meta}
-task_name: pusht_image
-pretrained_ckpt: "data/outputs/2026.01.28/10.43.39_train_diffusion_transformer_hybrid_pusht_images/checkpoints/latest.ckpt"
+task_name: pusht256
+#pretrained_ckpt: "data/outputs/2026.04.02/18.33.44_train_diffusion_transformer_hybrid_pusht256s/checkpoints/latest.ckpt"
+pretrained_ckpt: "data/outputs/2026.04.03/20.51.46_train_diffusion_transformer_hybrid_pusht256s/checkpoints/latest.ckpt"
 training:
-  checkpoint_every: 50  # ori:50
+  checkpoint_every: ${training.rollout_every}  # ori:50
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
@@ -219,17 +189,17 @@ training:
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 1500  # ori:3050
+  num_epochs: 1000  # ori:3050
   resume: true
-  rollout_every: 10000  # ori:50
+  rollout_every: 50  # ori:50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
   use_ema: true
-  val_every: 50
+  val_every: 25  # ori: 10
 val_dataloader:
   batch_size: 64
-  num_workers: 12  # ori:48
+  num_workers: 8
   persistent_workers: false
   pin_memory: true
   shuffle: false

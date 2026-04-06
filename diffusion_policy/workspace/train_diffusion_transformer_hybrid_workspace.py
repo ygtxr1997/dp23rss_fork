@@ -201,7 +201,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        with JsonLogger(log_path) as json_logger:
+        with (JsonLogger(log_path) as json_logger):
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
                 # ========= train for this epoch ==========
@@ -296,7 +296,8 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run rollout
-                if (self.epoch % cfg.training.rollout_every) == -1:  # TODO: banned
+                if cfg.training.rollout_every != -1 and  \
+                    ((self.epoch) % cfg.training.rollout_every) == 0:  # TODO: banned when cfg.training.rollout_every == -1
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)

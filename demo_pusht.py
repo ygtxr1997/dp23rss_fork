@@ -11,12 +11,15 @@ import pygame
 @click.option('-o', '--output', required=True)
 @click.option('-rs', '--render_size', default=96, type=int)
 @click.option('-hz', '--control_hz', default=10, type=int)
-def main(output, render_size, control_hz):
+@click.option('-s', '--domain_shift', default='none', type=str)
+def main(output, render_size, control_hz, domain_shift="none"):
     """
     Collect demonstration for the Push-T task.
     
     Usage: python demo_pusht.py -o data/pusht_demo.zarr
-    python demo_pusht.py -o data/pusht_256_val.zarr -rs 256
+    python demo_pusht.py -o data/pusht_256.zarr  \
+        -rs 256  \
+        -s light_texture_goal
     
     This script is compatible with both Linux and MacOS.
     Hover mouse close to the blue circle to start.
@@ -26,6 +29,7 @@ def main(output, render_size, control_hz):
     Press "R" to retry.
     Hold "Space" to pause.
     """
+    # assert domain_shift in ['none', 'texture', 'rainbow', 'light', 'size'], f"invalid domain shift {domain_shift}"
     
     # create replay buffer in read-write mode
     replay_buffer = ReplayBuffer.create_from_path(output, mode='a')
@@ -34,7 +38,11 @@ def main(output, render_size, control_hz):
     kp_kwargs = PushTKeypointsEnv.genenerate_keypoint_manager_params()
     print(kp_kwargs)
     # exit()
-    env = PushTKeypointsEnv(render_size=render_size, render_action=False, **kp_kwargs)
+    env = PushTKeypointsEnv(
+        render_size=render_size, render_action=False,
+        domain_shift=domain_shift,
+        **kp_kwargs
+    )
     agent = env.teleop_agent()
     clock = pygame.time.Clock()
     

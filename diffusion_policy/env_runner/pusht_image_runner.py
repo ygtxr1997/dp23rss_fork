@@ -210,6 +210,18 @@ class PushTImageRunner(BaseImageRunner):
                 obs_dict = dict_apply(np_obs_dict, 
                     lambda x: torch.from_numpy(x).to(
                         device=device))
+                # from robokit.debug_utils.printer import print_batch
+                # print_batch("[DEBUG] PushTImageRunner obs_dict:", obs_dict)
+                '''
+                [DEBUG] PushTImageRunner obs_dict:: Dict, keys=['agent_pos', 'image']
+                --agent_pos, <class 'torch.Tensor'>, shape=torch.Size([31, 2, 2]), min=55.0000, max=441.0000, dtype=torch.float32
+                --image, <class 'torch.Tensor'>, shape=torch.Size([31, 2, 3, 256, 256]), min=0.2549, max=1.0000, dtype=torch.float32
+                '''
+
+                # NOTE: a better design is to wrap the policy with an API class to handle norm/denorm
+                # TODO: norm here
+                obs_dict["image"] = obs_dict["image"] * 2. - 1.  # from [0,1] to [-1,1]
+                obs_dict["agent_pos"] = obs_dict["agent_pos"] / 512 * 2 - 1  # from [0,512] to [-1,1]
 
                 # run policy
                 with torch.no_grad():
@@ -219,7 +231,8 @@ class PushTImageRunner(BaseImageRunner):
                 np_action_dict = dict_apply(action_dict,
                     lambda x: x.detach().to('cpu').numpy())
 
-                action = np_action_dict['action']
+                action = np_action_dict['action']  # (31, 8, 2) -0.9899171 1.000014
+                action = (action + 1.) * 256.  # from [-1,1] to [0,512], TODO: check this
 
                 # step env
                 obs, reward, done, info = env.step(action)

@@ -30,11 +30,12 @@ export PYTHONPATH=~/code/dp23rss_fork
 yes | CUDA_VISIBLE_DEVICES=2 python eval_socket.py  \
     -c "None"  \
     -o data/pusht_eval_output  \
-    -p 6062  \
-    -s rainbow  \
+    -p 7072  \
+    -s goal  \
     -a 1  \
     -r -1  \
-    --max_repeats 30  \
+    -n 10  \
+    --max_repeats 5  \
     --close_online
 '''
 h5_suffix = '_tmp'  # just set for debug. `3e-5`, `layer28`, `ex_lora`, `ex_kv`

@@ -22,14 +22,23 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=4 bash sh_train.sh
+CUDA_VISIBLE_DEVICES=5 bash sh_train.sh
 "
 
+CONFIG_DIR="./"
 #CONFIG_NAME="tcl_dp_transformer.yaml"
 #CONFIG_NAME="tcl_hdfree_shovel.yaml"
 #CONFIG_NAME="tcl_hdfree_dp.yaml"
-CONFIG_NAME="tcl_dp_force.yaml"
+#CONFIG_NAME="tcl_dp_force.yaml"
 #CONFIG_NAME="libero_force_dp.yaml"
+
+### Reverse Collect ###
+#CONFIG_NAME="reverse_dp_force.yaml"
+
+### Merge MoE ###
+CONFIG_DIR="configs/"
+CONFIG_NAME="pusht256_dp.yaml"
+
 DEVICE="cuda"
 
 export HYDRA_FULL_ERROR=1
@@ -39,6 +48,6 @@ set -x
 
 wandb online
 
-python train.py --config-dir=. --config-name=${CONFIG_NAME} training.seed=42  \
+python train.py --config-dir=${CONFIG_DIR} --config-name=${CONFIG_NAME} training.seed=42  \
   training.device=${DEVICE}  \
   hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'s

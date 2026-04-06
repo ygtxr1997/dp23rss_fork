@@ -29,17 +29,27 @@ from robokit.debug_utils.printer import print_batch
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service_libero:gpu_app --port 6070
+CUDA_VISIBLE_DEVICES=6 uvicorn gpu_service_libero:gpu_app --port 7076
 """
 gpu_app = FastAPI()
-max_cache_action = 32
+max_cache_action = 4  # ori:32
 
 # log_time = "2026.01.26-16.44.01"
 # log_time = "2026.01.26-20.59.54"
-# log_time = "2026.01.28-10.43.39"  # KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5
-# log_time = "2026.01.28-17.01.07"  # KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo_wrench
-log_time = "2026.01.28-10.44.52"  # KITCHEN_SCENE6_close_the_microwave_demo_wrench.hdf5
-# log_time = "2026.01.28-10.34.35"  # STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_left_compartment_of_the_caddy_demo_wrench.hdf5
+# log_time = "2026.02.26-14.58.47"  # KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo_wrench
+# log_time = "2026.02.26-15.22.57"  # KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5
+# log_time = "2026.02.26-13.41.21"  # KITCHEN_SCENE5_close_the_top_drawer_of_the_cabinet_demo_wrench.hdf5
+# log_time = "2026.02.26-14.58.47"  # KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo_wrench
+# log_time = "2026.02.26-00.44.21"  # KITCHEN_SCENE2_open_the_top_drawer_of_the_cabinet_demo_wrench.hdf5
+# log_time = "2026.02.26-15.09.30"  # KITCHEN_SCENE6_close_the_microwave_demo_wrench.hdf5
+# log_time = "2026.02.26-00.50.21"  # KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo_wrench.hdf5
+log_time = "2026.02.26-09.21.31"  # KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_and_open_the_top_drawer_demo_wrench.hdf5
+# log_time = "2026.02.26-12.09.38"  # KITCHEN_SCENE7_open_the_microwave_demo_wrench.hdf5
+# log_time = "2026.02.26-15.22.57"  # KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5
+# log_time = "2026.02.26-09.21.31"  # KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_and_open_the_top_drawer_demo_wrench.hdf5
+# log_time = "2026.02.26-14.38.50"  # STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_left_compartment_of_the_caddy_demo_wrench.hdf5
+
+# log_time = "2026.02.28-02.01.18"  # KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench
 w_idx = -2
 
 
@@ -197,10 +207,12 @@ def model_step(step_request: StepRequestFromEvaluator):
         tcp_pose_B_T_D, norm_type="mean", meta_data=dataset_stats['obs.ee_states']
     )
 
+    zero_force = hasattr(hydra_config.task.dataset, "zero_force") and hydra_config.task.dataset.zero_force
+    force_scale = 0. if zero_force else 1.  # just for ablation
     # joint_state = torch.from_numpy(np.array(joint_state)).to("cuda").unsqueeze(0)  # (B,T,6)
     obs_dict = {
         "joint_state": torch.from_numpy(tcp_pose_B_T_D).to("cuda"),  # should be (B,T,6)
-        "force": torch.from_numpy(force_B_T_D).to("cuda"),  # should be (B,T,6)
+        "force": torch.from_numpy(force_B_T_D).to("cuda") * force_scale,  # should be (B,T,6)
     }
 
     if True or agent.infer_frame_idx % max_cache_action == 0:  # always enter

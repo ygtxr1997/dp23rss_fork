@@ -24,7 +24,13 @@ def pymunk_to_shapely(body, shapes):
             geoms.append(sg.Polygon(verts))
         else:
             raise RuntimeError(f'Unsupported shape type {type(shape)}')
-    geom = sg.MultiPolygon(geoms)
+    ## Ori: dp official implementation
+    # geom = sg.MultiPolygon(geoms)
+    ## Our implementation: union of all geoms, which is more accurate for non-convex shapes like X or T
+    geom = geoms[0]
+    for g in geoms[1:]:
+        geom = geom.union(g)
+
     return geom
 
 class PushTEnv(gym.Env):
@@ -474,14 +480,19 @@ class PushTEnv(gym.Env):
         ''' agent is a poly '''
         # self.agent = self.add_box_agent((256, 400), 50)
 
-        if self.domain_shift == "size":
-            self.block = self.add_tee((256, 300), 0, scale=40)  # baseline: 30
+        block_shift = "block" in self.domain_shift
+        if "size" in self.domain_shift:
+            self.block = self.add_tee((256, 300), 0, scale=40, block_shift=block_shift)  # baseline: 30
         else:
-            self.block = self.add_tee((256, 300), 0, scale=30)  # baseline: 30
-        # self.block = self.add_tee((256, 300), 0, scale=30,
-        #                           image_path='media/blotchy_0015.jpg')  # image_path='media/blotchy_0015.jpg'
-        self.goal_color = pygame.Color('LightGreen')
-        self.goal_pose = np.array([256,256,np.pi/4])  # x, y, theta (in radians)
+            self.block = self.add_tee((256, 300), 0, scale=30, block_shift=block_shift)  # baseline: 30
+
+        if "goal" in self.domain_shift:
+            self.goal_color = pygame.Color('Orchid')
+            self.goal_pose = np.array([300, 200, -np.pi])  # shifted: x, y, theta (in radians)
+        else:
+            self.goal_color = pygame.Color('LightGreen')
+            self.goal_pose = np.array([256, 256, np.pi/4])  # default: x, y, theta (in radians)
+
 
         # Add collision handling
         self.collision_handeler = self.space.add_collision_handler(0, 0)
@@ -526,19 +537,33 @@ class PushTEnv(gym.Env):
         self.space.add(body, shape)
         return body
 
-    def add_tee(self, position, angle, scale=30, color='LightSlateGray', mask=pymunk.ShapeFilter.ALL_MASKS(), image_path=None):
+    def add_tee(self, position, angle, scale=30, color='LightSlateGray',
+                mask=pymunk.ShapeFilter.ALL_MASKS(), image_path=None,
+                block_shift: bool = False):
         mass = 1
         length = 4
+        # 👇 这是水平横梁的顶点 👉 需要保持不变
         vertices1 = [(-length*scale/2, scale),
-                                 ( length*scale/2, scale),
-                                 ( length*scale/2, 0),
-                                 (-length*scale/2, 0)]
+                     ( length*scale/2, scale),
+                     ( length*scale/2, 0),
+                     (-length*scale/2, 0)]
         inertia1 = pymunk.moment_for_poly(mass, vertices=vertices1)
-        vertices2 = [(-scale/2, scale),
-                                 (-scale/2, length*scale),
-                                 ( scale/2, length*scale),
-                                 ( scale/2, scale)]
-        inertia2 = pymunk.moment_for_poly(mass, vertices=vertices1)
+        # 👇 这是垂直竖杆的顶点 👉 需要修改以垂直居中
+        if not block_shift:
+            vertices2 = [(-scale/2, scale),
+                         (-scale/2, length*scale),
+                         ( scale/2, length*scale),
+                         ( scale/2, scale)]
+        else:
+            vertices2 = [
+                (-scale / 2, scale / 2 - length * scale / 2),
+                (-scale / 2, scale / 2 + length * scale / 2),
+                (scale / 2, scale / 2 + length * scale / 2),
+                (scale / 2, scale / 2 - length * scale / 2)
+            ]
+            color = "IndianRed"
+        inertia2 = pymunk.moment_for_poly(mass, vertices=vertices2)
+        # print(f"vertices1: {vertices1}, vertices2: {vertices2}")
         body = pymunk.Body(mass, inertia1 + inertia2)
         shape1 = pymunk.Poly(body, vertices1)
         shape2 = pymunk.Poly(body, vertices2)
