@@ -29,16 +29,31 @@ from robokit.debug_utils.printer import print_batch
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=2 uvicorn gpu_service_pusht:gpu_app --port 7072
+CUDA_VISIBLE_DEVICES=6 uvicorn gpu_service_pusht:gpu_app --port 7076
 """
 gpu_app = FastAPI()
 max_cache_action = 8  # ori:32
 
-# log_time = "2026.04.05-02.55.11"  # `None`
-log_time = "2026.04.05-12.03.07"  # `goal`
-# log_time = "2026.04.05-12.05.01"  # `light`
+# log_time = "2026.04.09-21.03.16"  # `None`
+# log_time = "2026.04.09-21.05.34"  # `light`
+# log_time = "2026.04.09-21.04.18"  # `goal`
+# log_time = "2026.04.07-19.27.27"  # `None+goal+light+texture+block`
 
-w_idx = -3
+# log_time = "2026.04.15-16.41.59"  # `none`, vis_encoder from `none`
+# log_time = "2026.04.15-16.44.03"  # `light`, vis_encoder from `none`
+log_time = "2026.04.15-16.59.43"  # `goal`, vis_encoder from `none`
+# log_time = "2026.04.15-17.39.01"  # `block`, vis_encoder from `none`
+
+# log_time = "2026.04.14-02.22.18"  # `none`, vis_encoder from `predict_all`
+# log_time = "2026.04.14-11.19.46"  # `goal`, vis_encoder from `predict_all`
+# log_time = "2026.04.15-01.26.00"  # `light`, vis_encoder from `predict_all`
+# log_time = "2026.04.15-01.24.54"  # `block`, vis_encoder from `predict_all`
+
+# log_time = "2026.04.10-20.41.29"  # `none+goal+light`, moe from scratch
+# log_time = "2026.04.11-00.08.53"  # `none+goal+light`, moe from teacher + freeze FFN
+# log_time = "2026.04.11-12.13.35"  # `none+goal+light`, moe from teacher + finetune
+
+w_idx = -2
 
 
 
@@ -53,7 +68,7 @@ def load_dataset_fields(yaml_path: str):
     return hdf5_fns, dataset_root, dataset_subname, shape_meta
 
 
-train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht256s"
+train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht256"
 train_project_dir = train_project_dir.replace('-', '/')
 train_yaml_path = os.path.join(train_project_dir, ".hydra/config.yaml")
 assert os.path.exists(train_yaml_path), f"[gpu_service_pusht] train_yaml_path not found: {train_yaml_path}"

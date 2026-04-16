@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, List, Union
+from typing import Dict, Tuple, List, Union, Optional
 import math
 import numpy as np
 import torch
@@ -12,10 +12,12 @@ import pathlib
 import dill
 import copy
 import hydra
+from accelerate import Accelerator, PartialState
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.diffusion.transformer_for_diffusion import TransformerForDiffusion
+from diffusion_policy.model.diffusion.moe_for_diffusion import MoEForDiffusion
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy.common.robomimic_config_util import get_robomimic_config
 from robomimic.algo import algo_factory
@@ -70,6 +72,15 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             use_da=False,
             # force
             use_force: bool = False,
+            # moe
+            en_freeze_obs_encoder: bool = False,
+            load_parts_from_ckpt: str = None,
+            ffn_expand_factor: Union[float, List[float]] = 4.,
+            backbone_type: str = "transformer",  # transformer | moe
+            teacher_ckpts: List[str] = None,  # for moe from multiple teachers
+            moe_topk: int = 2,
+            router_noisy_std: float = 0.0,
+            moe_aux_loss_weight: float = 0.0,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -178,7 +189,13 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         '''
         print(f"[DEBUG] obs_feature_dim:{obs_feature_dim}, cond_dim:{cond_dim}, input_dim:{input_dim}, output_dim:{output_dim} ")
 
-        model = TransformerForDiffusion(
+        self.backbone_type = backbone_type
+        self.obs_encoder = obs_encoder  # will be set weight in _bulild_backbone()
+        model = self._build_backbone(
+            # Shared params
+            ffn_expand_factor=ffn_expand_factor,
+            backbone_type=backbone_type,
+            # Original `TransformerForDiffusion` params
             input_dim=input_dim,
             output_dim=output_dim,
             horizon=horizon,
@@ -194,9 +211,12 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             obs_as_cond=obs_as_cond,
             n_cond_layers=n_cond_layers,
             is_da=use_da,
+            # MoE specific params
+            teacher_ckpts=teacher_ckpts,
+            moe_topk=moe_topk,
+            router_noisy_std=router_noisy_std,
         )
 
-        self.obs_encoder = obs_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
         self.mask_generator = LowdimMaskGenerator(
@@ -222,35 +242,160 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
 
+        # MoE related
+        self.en_freeze_obs_encoder = en_freeze_obs_encoder
+        self.load_parts_from_ckpt = load_parts_from_ckpt or "all"  # default: `all`
+        self.teacher_ckpts = teacher_ckpts
+        self.moe_topk = moe_topk
+        self.router_noisy_std = router_noisy_std
+        self.moe_aux_loss_weight = moe_aux_loss_weight
+
         # For real-world inference
         self.infer_frame_idx = 0
         self.cache_action = None
+
+    def _build_backbone(self, backbone_type: str,
+                        ffn_expand_factor: Union[float, List[float]],
+                        teacher_ckpts: List[str],
+                        use_ema: bool = True,
+                        **model_kwargs
+                        ):
+        if backbone_type == "transformer":
+            assert isinstance(ffn_expand_factor, (int, float)), "`ffn_expand_factor` should be float for transformer backbone"
+            backbone_kwargs = dict(model_kwargs)
+            backbone_kwargs["is_da"] = backbone_kwargs.get("is_da", False)
+            return TransformerForDiffusion(
+                ffn_expand_factor=ffn_expand_factor,
+                **backbone_kwargs
+            )
+
+        if backbone_type == "moe":
+            # Check `num_experts`
+            teacher_ckpts = [] or teacher_ckpts  # avoid None
+
+            if ffn_expand_factor is None and len(teacher_ckpts) == 0:
+                raise ValueError("For MoE backbone, either `ffn_expand_factor` or `teacher_ckpts` must be provided.")
+            if ffn_expand_factor is None and len(teacher_ckpts) > 0:
+                raise ValueError("For MoE backbone, `ffn_expand_factor` must be provided when `teacher_ckpts` is given to determine the number of experts.")
+            if ffn_expand_factor is not None and len(teacher_ckpts) > 0:
+                ffn_expand_factor = [ffn_expand_factor] if isinstance(ffn_expand_factor, (int, float)) else ffn_expand_factor
+                assert len(ffn_expand_factor) == len(teacher_ckpts), \
+                    (f"The length of `ffn_expand_factor` should match `teacher_ckpts`. "
+                     f"Got {len(ffn_expand_factor)} vs {len(teacher_ckpts)}.")
+                # We use a strict rule to avoid complicated checking logic
+
+            if len(teacher_ckpts) > 0:
+                # A) 从多 teacher ckpt 合并
+                teachers = []
+                teacher_obs_encoders = []
+
+                def _extract_component_state_dict(payload: dict, use_ema_flag: bool, component_name: str):
+                    branch = "ema_model" if use_ema_flag else "model"
+                    root = payload["state_dicts"][branch]
+                    if not isinstance(root, dict):
+                        raise ValueError(
+                            f"Unexpected checkpoint structure at state_dicts['{branch}']: {type(root)}")
+
+                    # case 1) nested dict under component key
+                    if component_name in root and isinstance(root[component_name], dict):
+                        nested = root[component_name]
+                        prefix = f"{component_name}."
+                        prefixed_nested = {k[len(prefix):]: v for k, v in nested.items() if k.startswith(prefix)}
+                        return prefixed_nested if len(prefixed_nested) > 0 else nested
+
+                    # case 2) policy-flat keys with component prefix
+                    prefix = f"{component_name}."
+                    prefixed = {k[len(prefix):]: v for k, v in root.items() if k.startswith(prefix)}
+                    if len(prefixed) > 0:
+                        return prefixed
+
+                    # case 3) already component-only state dict (for `model`)
+                    if component_name == "model":
+                        return root
+                    return None
+
+                for t_idx, (ckpt, ffn_factor) in enumerate(zip(teacher_ckpts, ffn_expand_factor)):
+                    # Merge action transformers
+                    teacher_kwargs = dict(model_kwargs)
+                    teacher_kwargs["is_da"] = False
+                    teacher = TransformerForDiffusion(
+                        ffn_expand_factor=ffn_factor,
+                        **teacher_kwargs
+                    )
+                    payload = torch.load(pathlib.Path(ckpt).open("rb"), map_location="cpu", pickle_module=dill)
+                    teacher_sd = _extract_component_state_dict(payload, use_ema_flag=use_ema, component_name="model")
+                    teacher.load_state_dict(teacher_sd, strict=True)
+                    teachers.append(teacher)
+
+                    # Merge obs_encoders
+                    assert self.obs_encoder is not None, "obs_encoder should be initialized before building MoE backbone, since we need to load teacher obs_encoder weights from ckpt"
+                    obs_sd = _extract_component_state_dict(
+                        payload, use_ema_flag=use_ema, component_name="obs_encoder")
+                    if obs_sd is None:
+                        raise ValueError(
+                            f"Cannot find `obs_encoder` state dict in teacher checkpoint: {ckpt}")
+                    teacher_obs_encoder = copy.deepcopy(self.obs_encoder)
+                    teacher_obs_encoder.load_state_dict(obs_sd, strict=True)
+                    teacher_obs_encoders.append(teacher_obs_encoder)
+
+                return MoEForDiffusion.from_teacher_models(
+                    teachers=teachers,
+                    moe_topk=model_kwargs["moe_topk"],
+                    router_noisy_std=model_kwargs["router_noisy_std"],
+                    freeze_experts=False,  # NOTE: how to set this?
+                    target_obs_encoder=self.obs_encoder,
+                    teacher_obs_encoders=teacher_obs_encoders,
+                    is_main_process=PartialState().is_main_process,
+                )
+            else:
+                # B) 无 teacher 直接初始化 MoE
+                return MoEForDiffusion(
+                    num_experts=len(ffn_expand_factor),
+                    **model_kwargs
+                )
+        raise ValueError(f"[DiffusionTransformerHybridImagePolicy] Unsupported backbone_type = {backbone_type}")
+
+    def freeze_obs_encoder(self):
+        for param in self.obs_encoder.parameters():
+            param.requires_grad = False
+        self.obs_encoder.eval()
+
+    def print_training_status(self):
+        if PartialState().is_main_process:
+            self.count_moe_param_groups(self)
 
     def load_weight_from_ckpt(self, pretrained_ckpt, use_ema: bool = True):
         self.pretrained_ckpt = pretrained_ckpt
         path = pathlib.Path(pretrained_ckpt)
         payload = torch.load(path.open('rb'), pickle_module=dill)
 
-        def load_state_dict_partial(model, state_dict, skip_keys=[]):
+        def load_state_dict_partial(model, state_dict, load_keys=None, skip_keys=None):
             """
-            加载状态字典时跳过某些键
+            对 ckpt 的 keys，先按 load_keys 选择，再按 skip_keys 排除
             Args:
                 model (nn.Module): 模型
                 state_dict (dict): 要加载的状态字典
+                load_keys (list): 只加载包含任一子串的键；None/[] 表示全量候选
                 skip_keys (list): 需要跳过的键列表
             """
             # 过滤掉需要跳过的键
-            filtered_state_dict = {}
-            for k, v in state_dict.items():
-                if k not in skip_keys:
-                    need_skip = False
-                    for skip_key in skip_keys:  # skip_keys may contain short keywords
-                        if skip_key in k:
-                            need_skip = True
-                    if not need_skip:
-                        filtered_state_dict[k] = v
+            load_keys = [] if load_keys is None else [str(x) for x in load_keys if str(x) != ""]
+            skip_keys = [] if skip_keys is None else [str(x) for x in skip_keys if str(x) != ""]
 
-            # 加载过滤后的状态字典
+            def _match_any(name: str, patterns: List[str]) -> bool:
+                return any(p in name for p in patterns)
+
+            # 1) include by load_keys
+            selected_state_dict = {}
+            for k, v in state_dict.items():
+                if len(load_keys) == 0 or _match_any(k, load_keys):  # load_keys 为空表示全量候选
+                    selected_state_dict[k] = v
+            # 2) exclude by skip_keys
+            filtered_state_dict = {}
+            for k, v in selected_state_dict.items():
+                if not _match_any(k, skip_keys):
+                    filtered_state_dict[k] = v
+
             # 获取模型的 state_dict 键和 filtered_state_dict 键
             model_keys = set(model.state_dict().keys())
             state_dict_keys = set(filtered_state_dict.keys())
@@ -258,36 +403,181 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             # 找到 missing_keys 和 unexpected_keys
             missing_keys = list(model_keys - state_dict_keys)
             unexpected_keys = list(state_dict_keys - model_keys)
+            loaded_keys = list(state_dict_keys & model_keys)
 
             for k in missing_keys:
                 filtered_state_dict[k] = model.state_dict()[k]
 
             model.load_state_dict(filtered_state_dict, strict=True)
 
-            # Load normalizer
+            # Load normalizer (do not consider `load_keys` and `skip_keys` for normalizer)
             norm_keys = set({k: None for k in state_dict.keys() if 'normalizer.' in k}.keys())
             norm_state_dict = {k[len("normalizer."):]: v for k, v in state_dict.items() if 'normalizer.' in k}
             model.normalizer.load_state_dict(norm_state_dict)
 
-            # 打印结果
-            print("Skip keys:", skip_keys)
-            print("Normalizer keys:", norm_keys)
-            print("Missing keys:", missing_keys)
-            print("Unexpected keys:", list(set(unexpected_keys) - norm_keys))
+            if PartialState().is_main_process:
+                print(f"Load keys (len={len(load_keys)}):", load_keys[:10], "..." if len(load_keys) > 10 else "")
+                print(f"Skip keys (len={len(skip_keys)}):", skip_keys[:10], "..." if len(skip_keys) > 10 else "")
+                print(f"Normalizer keys (len={len(list(norm_keys))}):", list(norm_keys)[:10], "..." if len(list(norm_keys)) > 10 else "")
+                print(f"Missing keys (len={len(missing_keys)}):", missing_keys[:10], "..." if len(missing_keys) > 10 else "")
+                print(f"Unexpected keys (len={len(list(set(unexpected_keys) - norm_keys))}):", list(set(unexpected_keys) - norm_keys))
+                print(f"Loaded keys (len={len(loaded_keys)}):")
 
         # print(payload['state_dicts']['model'].keys())
         # print(self.normalizer.state_dict().keys())
-        # exit()
+        # print("[DEBUG] Keys in checkpoint model state_dict:", payload['state_dicts']['model'].keys())
+        # self.count_moe_param_groups(self)
+        # self.count_moe_param_groups(payload['state_dicts']['model'])
+
+        load_keys: List[str] = []  # `None` or `[]` means all keys will be loaded (except those in `skip_keys`)
         skip_keys = [
             '.ia3_',  # IA3 Adapter
         ]
+
+        # Skip some layers for MoE fine-tuning, see `policy.load_parts_from_ckpt` in config yaml
+        if self.load_parts_from_ckpt != "all":
+            load_keys = [str(part) for part in self.load_parts_from_ckpt.split(",")]
+
         if use_ema:
-            load_state_dict_partial(self, payload['state_dicts']['ema_model'], skip_keys)
+            load_state_dict_partial(self, payload['state_dicts']['ema_model'], load_keys, skip_keys)
         else:
-            load_state_dict_partial(self, payload['state_dicts']['model'], skip_keys)
+            load_state_dict_partial(self, payload['state_dicts']['model'], load_keys, skip_keys)
         print(f"[DiffusionTransformerHybridImagePolicy] Loaded pretrained_ckpt (use_ema={use_ema}) "
-              f"from: {self.pretrained_ckpt}")
-    
+              f"from: {self.pretrained_ckpt}, load_keys={load_keys}(empty means `all`), skip_keys={skip_keys}")
+
+    @staticmethod
+    def count_moe_param_groups(policy):
+        """
+        统计 DiffusionTransformerHybridImagePolicy 各模块参数量。
+        """
+        import re
+
+        # 定义正则表达式规则与组名的映射
+        rules = {
+            r'^obs_encoder\..*': 'obs_encoder.*',
+            r'^model\.cond_obs_emb\..*': 'model.cond_obs_emb.*',
+            r'^model\.input_emb\..*': 'model.input_emb.*',
+            r'^model\.(cond_)?pos_emb$': 'model.pos_emb / cond_pos_emb',
+            r'^model\.encoder\..*': 'model.encoder.* (cond MLP)',
+            r'^model\..*\.self_attn\..*': 'model.*.self_attn.*',
+            r'^model\..*\.multihead_attn\..*': 'model.*.multihead_attn.*',
+            r'^model\..*\.linear[12]\..*': 'model.*.linear1/2 (FFN)',
+            r'^model\..*\.norm[123]\..*': 'model.*.norm1/2/3.*',
+            r'^model\.ln_f\..*': 'model.ln_f.*',
+            r'^model\.head\..*': 'model.head.*',
+            r'^normalizer\..*': 'normalizer.*',
+        }
+
+        # 1. 改变初始化：包含 total 和 trainable
+        groups = {name: {'total': 0, 'trainable': 0} for name in rules.values()}
+        groups['buffers/dummy'] = {'total': 0, 'trainable': 0}
+        groups['OTHER'] = {'total': 0, 'trainable': 0}
+
+        other_keys = []
+
+        # 2. 修改遍历逻辑：获取 requires_grad
+        is_module = isinstance(policy, nn.Module)
+        if is_module:
+            named_params = list(policy.named_parameters()) + list(policy.named_buffers())
+        else:
+            named_params = policy.items()
+
+        for name, param in named_params:
+            n = param.numel()
+            is_trainable = param.requires_grad if hasattr(param, 'requires_grad') and is_module else False
+
+            matched = False
+            for pattern, group_name in rules.items():
+                if re.match(pattern, name):
+                    groups[group_name]['total'] += n
+                    groups[group_name]['trainable'] += (n if is_trainable else 0)
+                    matched = True
+                    break
+
+            if not matched:
+                groups['OTHER']['total'] += n
+                groups['OTHER']['trainable'] += (n if is_trainable else 0)
+                other_keys.append(name)
+
+        # buffers（非 parameter，需单独遍历）
+        if isinstance(policy, nn.Module):
+            for name, buf in policy.named_buffers():
+                n = buf.numel()
+                is_trainable = buf.requires_grad if hasattr(buf, 'requires_grad') and is_module else False
+
+                if '_dummy' in name or 'mask' in name:
+                    groups['buffers/dummy']['total'] += n
+                    groups['buffers/dummy']['trainable'] += (n if is_trainable else 0)
+                # buffers 不计入 total params
+
+        # 3. 计算总计（这里以 total 为例）
+        total = sum(
+            v['total'] for k, v in groups.items() if k not in ('buffers/dummy', 'OTHER')) + groups['OTHER']['total']
+        total_trainable = sum(
+            v['trainable'] for k, v in groups.items() if k not in ('buffers/dummy', 'OTHER')) + groups['OTHER'][
+                              'trainable']
+
+        # 计算 MoE 冻结和微调参数量
+        moe_frozen = groups['obs_encoder.*']['total'] + groups['model.*.linear1/2 (FFN)']['total']
+        moe_finetune = sum(groups[k]['total'] for k in [
+            'model.*.self_attn.*', 'model.*.multihead_attn.*', 'model.*.norm1/2/3.*',
+            'model.ln_f.*', 'model.encoder.* (cond MLP)', 'model.cond_obs_emb.*',
+            'model.input_emb.*', 'model.pos_emb / cond_pos_emb', 'model.head.*'
+        ])
+
+        def fmt(n):
+            if n >= 1e6:  return f"{n / 1e6:.3f} M"
+            if n >= 1e3:  return f"{n / 1e3:.1f} K"
+            return str(n)
+
+        W = 46
+        print(f"\n{'=' * (W + 22)}")
+        print(f"  MoE 参数分组统计")
+        print(f"{'=' * (W + 22)}")
+        print(f"  {'组别':<{W}} {'参数量':>10}  {'占比':>6}")
+        print(f"  {'-' * W}  {'-' * 10}  {'-' * 6}")
+
+        categories = [
+            ('── 视觉编码器（Frozen）', None),
+            ('obs_encoder.*', '🔒 frozen'),
+            ('── Transformer 条件侧', None),
+            ('model.cond_obs_emb.*', '✏️  finetune'),
+            ('model.encoder.* (cond MLP)', '✏️  finetune'),
+            ('model.pos_emb / cond_pos_emb', '✏️  finetune'),
+            ('model.input_emb.*', '✏️  finetune'),
+            ('── Transformer Decoder', None),
+            ('model.*.self_attn.*', '✏️  finetune'),
+            ('model.*.multihead_attn.*', '✏️  finetune'),
+            ('model.*.linear1/2 (FFN)', '🔒 frozen (MoE experts)'),
+            ('model.*.norm1/2/3.*', '✏️  finetune'),
+            ('model.ln_f.*', '✏️  finetune'),
+            ('model.head.*', '✏️  finetune'),
+            ('── 其他', None),
+            ('normalizer.*', '—  not trained'),
+            ('OTHER', '❓ check'),
+        ]
+
+        for item in categories:
+            if item[1] is None:
+                print(f"  {item[0]}")
+                continue
+            k, tag = item
+            v_tot = groups[k]['total']
+            v_train = groups[k]['trainable']
+            pct = v_tot / total * 100 if total > 0 else 0
+            train_pct = (v_train / v_tot * 100) if v_tot > 0 else 0
+            print(f"    {k:<{W - 2}} {fmt(v_tot):>10}  {pct:>5.1f}% | Train: {fmt(v_train):>10} ({train_pct:>5.1f}%)   {tag}")
+
+        print(f"  {'─' * W}  {'─' * 10}  {'─' * 6}")
+        print(f"  {'TOTAL (parameters)':<{W}} {fmt(total):>10}  100.0%")
+        print(f"  {'  ├─ MoE Frozen (obs_encoder + FFN experts)':<{W}} {fmt(moe_frozen):>10}  {moe_frozen / total * 100:>5.1f}%")
+        print(f"  {'  └─ MoE Finetune':<{W}} {fmt(moe_finetune):>10}  {moe_finetune / total * 100:>5.1f}%")
+        print(f"  {'└─ Trainable':<{W}} {fmt(total_trainable):>10}  {total_trainable / total * 100:>5.1f}%")
+        if other_keys:
+            print("OTHER keys:", other_keys)
+
+        return groups
+
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, condition_mask,
@@ -325,7 +615,6 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         trajectory[condition_mask] = condition_data[condition_mask]        
 
         return trajectory
-
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -429,7 +718,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         )
         return optimizer
 
-    def compute_loss(self, batch):
+    def compute_loss(self, batch) -> Dict[str, torch.Tensor]:
         # normalize input
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
@@ -496,10 +785,25 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
+        losses = {}
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
+
+        # optional MoE auxiliary loss
+        if self.backbone_type == "moe" and self.moe_aux_loss_weight > 0:
+            aux = getattr(self.model, "last_moe_aux_loss", None)
+            if aux is not None:
+                loss = loss + self.moe_aux_loss_weight * aux
+                losses["moe_aux_loss"] = aux.detach().cpu().item()
+
+        losses["total_loss"] = loss
+
+        return losses
+
+    def forward(self, batch):
+        loss = self.compute_loss(batch)
         return loss
 
 
@@ -953,7 +1257,8 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         # )
         # return optimizer
 
-    def compute_loss(self, batch: dict, optimizers = None, lr_schedulers = None, batch_idx: int = None):
+    def compute_loss(self, batch: dict, optimizers = None, lr_schedulers = None, batch_idx: int = None,
+                     accelerator: Accelerator = None):
         """ Called by BaseWorkspace.run() """
         ''' (1) Vanilla batch'''
         if batch.get("src") is None:
@@ -1147,7 +1452,11 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
 
             d_vis1_opt.zero_grad()
             # self.manual_backward(losses['da_d1_loss'], retain_graph=False)  # no need to retrain graph
-            losses['da_d1_loss'].backward(retain_graph=False)
+            # losses['da_d1_loss'].backward(retain_graph=False)
+            if accelerator is not None:
+                accelerator.backward(losses['da_d1_loss'], retain_graph=False)
+            else:
+                losses['da_d1_loss'].backward(retain_graph=False)
             d_vis1_opt.step()
             d_vis1_sch.step()
 
@@ -1166,7 +1475,11 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
 
             d_vis2_opt.zero_grad()
             # self.manual_backward(losses['da_d2_loss'], retain_graph=False)  # no need to retrain graph
-            losses['da_d2_loss'].backward(retain_graph=False)
+            # losses['da_d2_loss'].backward(retain_graph=False)
+            if accelerator is not None:
+                accelerator.backward(losses['da_d2_loss'], retain_graph=False)
+            else:
+                losses['da_d2_loss'].backward(retain_graph=False)
             d_vis2_opt.step()
             d_vis2_sch.step()
 
@@ -1186,7 +1499,11 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
 
             d_act_opt.zero_grad()
             # self.manual_backward(losses['da_d_act_loss'], retain_graph=False)  # no need to retrain graph
-            losses['da_d_act_loss'].backward(retain_graph=True)
+            # losses['da_d_act_loss'].backward(retain_graph=True)
+            if accelerator is not None:
+                accelerator.backward(losses['da_d_act_loss'], retain_graph=True)
+            else:
+                losses['da_d_act_loss'].backward(retain_graph=True)
             d_act_opt.step()
             d_act_sch.step()
 
@@ -1207,11 +1524,17 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
             retain_graph = self.use_da_vis1 or self.use_da_vis2  # Keep backward graph for later modules
             if not self.debug_diff_loss:
                 act_back_loss = losses['da_g_act_loss'] + losses['action_loss']
-                # self.manual_backward(act_back_loss, retain_graph=retain_graph)
-                act_back_loss.backward(retain_graph=retain_graph)
+                # act_back_loss.backward(retain_graph=retain_graph)
+                if accelerator is not None:
+                    accelerator.backward(act_back_loss, retain_graph=retain_graph)
+                else:
+                    act_back_loss.backward(retain_graph=retain_graph)
             elif self.current_epoch >= 1 or batch_idx > 10:  # Only for debug
-                # self.manual_backward(backward_loss)
-                backward_loss.backward()
+                # backward_loss.backward()
+                if accelerator is not None:
+                    accelerator.backward(backward_loss)
+                else:
+                    backward_loss.backward()
             g_act_opt.step()
             g_act_sch.step()
 
@@ -1244,7 +1567,11 @@ class DiffusionTransformerHybridImagePolicyHDFree(DiffusionTransformerHybridImag
         losses['total_loss'] += backward_loss + losses['da_g_act_loss']
         if self.use_da_vis1 or self.use_da_vis2:
             # self.manual_backward(backward_loss)  # backward vis1 and vis2 together
-            backward_loss.backward()
+            # backward_loss.backward()
+            if accelerator is not None:
+                accelerator.backward(backward_loss)
+            else:
+                backward_loss.backward()
 
         if self.use_da_vis1:
             g_vis1_opt.step()

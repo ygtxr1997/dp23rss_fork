@@ -28,6 +28,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             n_cond_layers: int = 0,
             # DA params
             is_da: bool = False,
+            # MoE compatible params
+            ffn_expand_factor: float = 4.0,
+            # Not used params
+            **kwargs
         ) -> None:
         super().__init__()
 
@@ -87,7 +91,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             decoder_layer = nn.TransformerDecoderLayer(
                 d_model=n_emb,
                 nhead=n_head,
-                dim_feedforward=4*n_emb,
+                dim_feedforward=int(ffn_expand_factor * n_emb),
                 dropout=p_drop_attn,
                 activation='gelu',
                 batch_first=True,
@@ -168,10 +172,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # constants
         self.T = T
         self.T_cond = T_cond
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.horizon = horizon
+        self.n_obs_steps = n_obs_steps
+        self.cond_dim = cond_dim
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_emb = n_emb
+        self.p_drop_emb = p_drop_emb
+        self.p_drop_attn = p_drop_attn
+        self.causal_attn = causal_attn
         self.time_as_cond = time_as_cond
         self.obs_as_cond = obs_as_cond
+        self.n_cond_layers = n_cond_layers
         self.encoder_only = encoder_only
+
+        self.ffn_expand_factor = ffn_expand_factor
 
         # init
         self.apply(self._init_weights)

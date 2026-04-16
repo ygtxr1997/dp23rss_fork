@@ -49,13 +49,21 @@ optimizer:
   transformer_weight_decay: 0.01  # ori:0.001
 past_action_visible: false
 policy:
-  # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  # hdfree: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
   ### MoE related configs
-  en_freeze_obs_encoder: false  # ori: false
+  en_freeze_obs_encoder: true  # ori: false
   load_parts_from_ckpt: "obs_encoder"  # ori: all
-  ffn_expand_factor: 4  # ori:4
+  ffn_expand_factor: [2, 4, 6]  # ori:4
+
+  backbone_type: moe  # ori: transformer, choices: transformer, moe
+  teacher_ckpts:  # order-sensitive, should be in the same order as ffn_expand_factor
+    - "data/outputs/2026.04.09/21.03.16_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
+    - "data/outputs/2026.04.09/21.05.34_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
+    - "data/outputs/2026.04.09/21.04.18_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
+  moe_topk: 2
+  router_noisy_std: 0.1
+  moe_aux_loss_weight: 0.01
+  ########
 
   use_da: false  # ori: true
   domain_adapt:
@@ -190,10 +198,8 @@ task:
   name: pusht_image
   shape_meta: ${shape_meta}
 task_name: pusht256
-pretrained_ckpt: "data/outputs/2026.04.05/02.55.11_train_diffusion_transformer_hybrid_pusht256s/checkpoints/latest.ckpt"  # pusht only
-#pretrained_ckpt: "data/outputs/2026.04.07/19.27.27_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
-#pretrained_ckpt: "data/outputs/2026.04.13/21.31.26_train_visual_encoder_pretrain_pusht256/checkpoints/latest.ckpt"
-#pretrained_ckpt: "data/outputs/2026.04.15/12.10.48_train_visual_encoder_pretrain_pusht256/checkpoints/latest.ckpt"  # predict_all
+#pretrained_ckpt: "data/outputs/2026.04.02/18.33.44_train_diffusion_transformer_hybrid_pusht256s/checkpoints/latest.ckpt"
+pretrained_ckpt: "data/outputs/2026.04.07/19.27.27_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
 training:
   checkpoint_every: ${training.rollout_every}  # ori:50
   debug: false
@@ -203,7 +209,7 @@ training:
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 2000  # ori:3050
+  num_epochs: 1000  # ori:3050
   resume: true
   rollout_every: 50  # ori:50
   sample_every: 5

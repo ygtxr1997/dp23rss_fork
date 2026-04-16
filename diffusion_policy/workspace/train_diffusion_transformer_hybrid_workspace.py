@@ -21,6 +21,12 @@ import wandb
 import tqdm
 import numpy as np
 import shutil
+
+from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
+from datetime import timedelta
+from contextlib import nullcontext
+
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.diffusion_transformer_hybrid_image_policy import DiffusionTransformerHybridImagePolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
@@ -41,6 +47,13 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
 
+        # =========================================================
+        # 提前锁定多卡通信环境，防止稍后 load_weight 污染 CUDA 上下文
+        kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        self.accelerator = Accelerator(kwargs_handlers=[kwargs, ddp_kwargs])
+        # =========================================================
+
         # set seed
         seed = cfg.training.seed
         torch.manual_seed(seed)
@@ -51,13 +64,20 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         self.model: DiffusionTransformerHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
         self.pretrained_ckpt = cfg.pretrained_ckpt if hasattr(cfg, 'pretrained_ckpt') else None
         if self.pretrained_ckpt and os.path.exists(self.pretrained_ckpt):
-            self.model.load_weight_from_ckpt(self.pretrained_ckpt, use_ema=False)
+            self.model.load_weight_from_ckpt(self.pretrained_ckpt, use_ema=True)  # NOTE: ori:False
 
         self.ema_model: DiffusionTransformerHybridImagePolicy = None
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
         else:
             print(f"[TrainDiffusionTransformerHybridWorkspace] training from scratch")
+
+        # freeze some parameters if needed
+        if getattr(cfg.policy, 'en_freeze_obs_encoder', False):
+            print("[TrainDiffusionTransformerHybridWorkspace] Freezing obs_encoder...")
+            if hasattr(self.model, 'freeze_obs_encoder'):
+                self.model.freeze_obs_encoder()
+        self.model.print_training_status()
 
         # configure training state
         self.optimizer = self.model.get_optimizer(**cfg.optimizer)
@@ -73,11 +93,20 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
     def run(self):  # Main Entry
         cfg = copy.deepcopy(self.cfg)
 
+        # =========================================================
+        # 直接获取在 __init__ 中安全初始化好的 accelerator
+        accelerator = self.accelerator
+        device = accelerator.device
+        # =========================================================
+
         # resume training
         if cfg.training.resume:
+            # 注意：多卡模式下，只需主进程打印
             lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file():
+            if lastest_ckpt_path.is_file() and accelerator.is_main_process:
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
+            # 模型加载需在所有进程同步执行
+            if lastest_ckpt_path.is_file():
                 self.load_checkpoint(path=lastest_ckpt_path)
 
         # configure dataset
@@ -132,60 +161,67 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                              g_vis2_sch, d_vis2_sch,
                              g_act_sch, d_act_sch)
         else:
-            lr_scheduler = get_scheduler(
+            self.lr_scheduler = get_scheduler(
                 cfg.training.lr_scheduler,
                 optimizer=self.optimizer,
                 num_warmup_steps=cfg.training.lr_warmup_steps,
-                num_training_steps=(
-                    len(train_dataloader) * cfg.training.num_epochs) \
-                        // cfg.training.gradient_accumulate_every,
-                # pytorch assumes stepping LRScheduler every epoch
-                # however huggingface diffusers steps it every batch
-                last_epoch=self.global_step-1
+                num_training_steps=(len(train_dataloader) * cfg.training.num_epochs)
+                                   // cfg.training.gradient_accumulate_every,
+                last_epoch=self.global_step - 1
             )
 
-        # configure ema
+        # ### [修改点 3] 让 Accelerator 接管模型、优化器和 DataLoader ###
+        # 被接管后，accelerator 会自动处理 .to(device) 和 DDP 的包装
+        if self.is_da:
+            prepared = accelerator.prepare(
+                self.model, train_dataloader, val_dataloader,
+                *self.optimizer, *lr_schedulers
+            )
+            self.model = prepared[0]
+            train_dataloader = prepared[1]
+            val_dataloader = prepared[2]
+            self.optimizer = tuple(prepared[3:9])
+            lr_schedulers = tuple(prepared[9:])
+        else:
+            self.model, self.optimizer, train_dataloader, val_dataloader, self.lr_scheduler = accelerator.prepare(
+                self.model, self.optimizer, train_dataloader, val_dataloader, self.lr_scheduler
+            )
+
+        # configure ema (EMA 模型通常不需要放入 DDP 包装中，手动放到 device 即可)
         ema: EMAModel = None
         if cfg.training.use_ema:
-            ema = hydra.utils.instantiate(
-                cfg.ema,
-                model=self.ema_model)
-
-        # configure env
-        env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, BaseImageRunner)
-
-        # configure logging
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging
-        )
-        wandb.config.update(
-            {
-                "output_dir": self.output_dir,
-            }
-        )
-
-        # configure checkpoint
-        topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
-        )
-
-        # device transfer
-        device = torch.device(cfg.training.device)
-        self.model.to(device)
-        if self.ema_model is not None:
             self.ema_model.to(device)
-        if self.is_da:
-            for opt in self.optimizer:
-                optimizer_to(opt, device)
+            ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
+
+        # configure env (只有主进程需要跑仿真 Rollout)
+        env_runner = None
+        wandb_run = None
+        topk_manager = None
+
+        if accelerator.is_main_process:
+            env_runner = hydra.utils.instantiate(cfg.task.env_runner, output_dir=self.output_dir)
+
+            # To avoid time inconsistency between ckpt dir and wandb run name
+            run_dir = pathlib.Path(self.output_dir)  # data/outputs/YYYY.MM.DD/HH.MM.SS_xxx
+            logging_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
+            logging_cfg["name"] = f"{run_dir.parent.name}-{run_dir.name}"  #YYYY.MM.DD - HH.MM.SS_xxx
+
+            wandb_run = wandb.init(
+                dir=str(self.output_dir),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **logging_cfg
+            )
+            wandb.config.update({"output_dir": self.output_dir})
+
+            topk_manager = TopKCheckpointManager(
+                save_dir=os.path.join(self.output_dir, 'checkpoints'),
+                **cfg.checkpoint.topk
+            )
+
+            log_path = os.path.join(self.output_dir, 'logs.json.txt')
+            log_ctx = JsonLogger(log_path)
         else:
-            optimizer_to(self.optimizer, device)
+            log_ctx = nullcontext(None)
         
         # save batch for sampling
         train_sampling_batch = None
@@ -200,175 +236,168 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
             cfg.training.sample_every = 1
 
         # training loop
-        log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        with (JsonLogger(log_path) as json_logger):
+        # ### [修改点 4] 仅主进程开启 tqdm ###
+        disable_tqdm = not accelerator.is_main_process
+        with log_ctx as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
-                # ========= train for this epoch ==========
                 train_losses = list()
-                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
-                        leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
+
+                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}",
+                               leave=False, mininterval=cfg.training.tqdm_interval_sec, disable=disable_tqdm) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
                         losses_log = {}
+
                         if not self.is_da:
-                            ''' (1) Vanilla training '''
-                            # device transfer
-                            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                            # Vanilla training
                             if train_sampling_batch is None:
                                 train_sampling_batch = batch
 
-                            # compute loss
-                            raw_loss = self.model.compute_loss(batch)
-                            loss = raw_loss / cfg.training.gradient_accumulate_every
-                            loss.backward()
+                            with accelerator.accumulate(self.model):
+                                losses: dict = self.model(batch)
+                                raw_loss = losses['total_loss']
+                                loss = raw_loss
+                                accelerator.backward(loss)
 
-                            # step optimizer
-                            if self.global_step % cfg.training.gradient_accumulate_every == 0:
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-                                lr_scheduler.step()
+                                if accelerator.sync_gradients:
+                                    self.optimizer.step()
+                                    self.lr_scheduler.step()
+                                    self.optimizer.zero_grad()
+
+                                for k, v in losses.items():
+                                    if k == 'total_loss': continue
+                                    losses_log[k] = v.item() if isinstance(v, torch.Tensor) else v
                         else:
-                            ''' (2) Domain adaptation '''
-                            # device transfer
+                            # Domain adaptation
                             batch_src = batch['src']
-                            batch_tgt = batch['tgt']
-                            batch_src = dict_apply(batch_src, lambda x: x.to(device, non_blocking=True))
-                            batch_tgt = dict_apply(batch_tgt, lambda x: x.to(device, non_blocking=True))
                             if train_sampling_batch is None:
                                 train_sampling_batch = batch_src
 
-                            # compute loss
-                            losses: dict = self.model.compute_loss(batch, self.optimizer, lr_schedulers,
-                                                               batch_idx=batch_idx)
+                            # ### [致命隐患修正注意] ###
+                            # 你的 self.model 是被 accelerator 包装过的。
+                            # 如果 compute_loss 内部有 .backward()，你必须把 accelerator 作为参数传进去，
+                            # 并在 compute_loss 内部用 accelerator.backward(loss) 替换原有的 loss.backward()，否则多卡必卡死！
+                            # losses: dict = self.model.compute_loss(
+                            #     batch, self.optimizer, lr_schedulers, batch_idx=batch_idx,
+                            #     accelerator=accelerator  # <- 强烈建议传入 accelerator 以便在内部调用
+                            # )
+                            losses: dict = self.model(
+                                batch, optimizers=self.optimizer, lr_schedulers=lr_schedulers,
+                                batch_idx=batch_idx, accelerator=accelerator
+                            )
                             raw_loss = losses['da_d1_loss']
                             for k, v in losses.items():
-                                if isinstance(v, torch.Tensor):
-                                    losses_log[k] = v.item()
-                                else:
-                                    losses_log[k] = v
+                                losses_log[k] = v.item() if isinstance(v, torch.Tensor) else v
                             lr_scheduler = lr_schedulers[0]
-                            #### Optimizers are updated in self.model.comupute_loss()
-                            # loss = raw_loss / cfg.training.gradient_accumulate_every
-                            # loss.backward()
 
-                            # # step optimizer
-                            # if self.global_step % cfg.training.gradient_accumulate_every == 0:
-                            #     self.optimizer.step()
-                            #     self.optimizer.zero_grad()
-                            #     lr_scheduler.step()
-                        
-                        # update ema
+                        # ### [修改点 6] 获取真实的 model 进行 EMA 更新 ###
                         if cfg.training.use_ema:
-                            ema.step(self.model)
+                            ema.step(accelerator.unwrap_model(self.model))
 
-                        # logging
+                        # ### [修改点 7] 仅主进程进行 Logging ###
                         raw_loss_cpu = raw_loss.item()
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
-                        step_log = {
-                            'train_loss': raw_loss_cpu,
-                            'global_step': self.global_step,
-                            'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0],
-                            **losses_log
-                        }
 
-                        is_last_batch = (batch_idx == (len(train_dataloader)-1))
-                        if not is_last_batch:
-                            # log of last step is combined with validation and rollout
-                            wandb_run.log(step_log, step=self.global_step)
-                            json_logger.log(step_log)
-                            self.global_step += 1
+                        if accelerator.is_main_process:
+                            step_log = {
+                                'train_loss': raw_loss_cpu,
+                                'global_step': self.global_step,
+                                'epoch': self.epoch,
+                                'lr': self.lr_scheduler.get_last_lr()[0],
+                                **losses_log
+                            }
 
-                        if (cfg.training.max_train_steps is not None) \
-                            and batch_idx >= (cfg.training.max_train_steps-1):
-                            break
+                            is_last_batch = (batch_idx == (len(train_dataloader) - 1))
+                            if not is_last_batch:
+                                wandb_run.log(step_log, step=self.global_step)
+                                json_logger.log(step_log)
 
-                # at the end of each epoch
-                # replace train_loss with epoch average
-                train_loss = np.mean(train_losses)
-                step_log['train_loss'] = train_loss
+                        self.global_step += 1
 
-                # ========= eval for this epoch ==========
-                policy = self.model
-                if cfg.training.use_ema:
-                    policy = self.ema_model
-                policy.eval()
+                # ========= 评测阶段 (仅让主进程执行 Rollout 和保存，避免冲突) =========
+                # 同步所有 GPU，确保大家都跑完了这个 Epoch
+                accelerator.wait_for_everyone()
 
-                # run rollout
-                if cfg.training.rollout_every != -1 and  \
-                    ((self.epoch) % cfg.training.rollout_every) == 0:  # TODO: banned when cfg.training.rollout_every == -1
-                    runner_log = env_runner.run(policy)
-                    # log all
-                    step_log.update(runner_log)
+                if accelerator.is_main_process:
+                    step_log['train_loss'] = np.mean(train_losses)
 
-                # run validation
+                    # Unwrap model to pass to runner
+                    unwrapped_policy = accelerator.unwrap_model(self.model)
+                    policy = unwrapped_policy
+                    if cfg.training.use_ema:
+                        policy = self.ema_model
+                    policy.eval()
+
+                    # run rollout
+                    if cfg.training.rollout_every != -1 and ((self.epoch) % cfg.training.rollout_every) == 0:
+                        runner_log = env_runner.run(policy)
+                        step_log.update(runner_log)
+
+                # run validation (所有卡都可以参与计算验证集，但最简单的做法是只让主卡算，或者算完 gather。此处保持原逻辑但在主卡上收集)
                 if (self.epoch % cfg.training.val_every) == 0:
-                    with torch.no_grad():
-                        val_losses = list()
-                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
-                                leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                            for batch_idx, batch in enumerate(tepoch):
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
-                                val_losses.append(loss)
-                                if (cfg.training.max_val_steps is not None) \
-                                    and batch_idx >= (cfg.training.max_val_steps-1):
-                                    break
-                        if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
-                            # log epoch average validation loss
-                            step_log['val_loss'] = val_loss
+                    policy_val = self.ema_model if cfg.training.use_ema else accelerator.unwrap_model(self.model)
+                    policy_val.eval()
 
-                # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
+                    val_loss_sum = torch.tensor(0.0, device=device)
+                    val_batches = torch.tensor(0, device=device)
+
                     with torch.no_grad():
-                        # sample trajectory from training set, and evaluate difference
-                        batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
-                        obs_dict = batch['obs']
-                        gt_action = batch['action']
-                        
+                        with tqdm.tqdm(
+                                val_dataloader,
+                                desc=f"Validation epoch {self.epoch}",
+                                leave=False,
+                                mininterval=cfg.training.tqdm_interval_sec,
+                                disable=disable_tqdm,
+                        ) as tepoch:
+                            for batch in tepoch:
+                                loss = policy_val.compute_loss(batch)
+                                loss = loss.detach() if isinstance(loss, torch.Tensor) else loss["total_loss"].detach()
+                                val_loss_sum += loss
+                                val_batches += 1
+
+                    stats = torch.stack([val_loss_sum, val_batches.float()])
+                    stats = accelerator.reduce(stats, reduction="sum")
+
+                    if accelerator.is_main_process and stats[1] > 0:
+                        step_log["val_loss"] = (stats[0] / stats[1]).item()
+
+                # run diffusion sampling
+                if (self.epoch % cfg.training.sample_every) == 0 and accelerator.is_main_process:
+                    with torch.no_grad():
+                        obs_dict = train_sampling_batch['obs']
+                        gt_action = train_sampling_batch['action']
                         result = policy.predict_action(obs_dict)
-                        pred_action = result['action_pred']
-                        mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+                        mse = torch.nn.functional.mse_loss(result['action_pred'], gt_action)
                         step_log['train_action_mse_error'] = mse.item()
-                        del batch
-                        del obs_dict
-                        del gt_action
-                        del result
-                        del pred_action
-                        del mse
-                
+
                 # checkpoint
                 if (self.epoch % cfg.training.checkpoint_every) == 0:
-                    # checkpointing
-                    if cfg.checkpoint.save_last_ckpt:
-                        self.save_checkpoint()
-                    if cfg.checkpoint.save_last_snapshot:
-                        self.save_snapshot()
+                    accelerator.wait_for_everyone()
 
-                    # sanitize metric names
-                    metric_dict = dict()
-                    for key, value in step_log.items():
-                        new_key = key.replace('/', '_')
-                        metric_dict[new_key] = value
-                    
-                    # We can't copy the last checkpoint here
-                    # since save_checkpoint uses threads.
-                    # therefore at this point the file might have been empty!
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    if accelerator.is_main_process:
+                        if cfg.checkpoint.save_last_ckpt:
+                            self.save_checkpoint()
 
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
-                # ========= eval end for this epoch ==========
-                policy.train()
+                        # DDP 下不建议保存 snapshot；只在单进程时保留
+                        if cfg.checkpoint.save_last_snapshot and accelerator.num_processes == 1:
+                            self.save_snapshot()
 
-                # end of epoch
-                # log of last step is combined with validation and rollout
-                wandb_run.log(step_log, step=self.global_step)
-                json_logger.log(step_log)
-                self.global_step += 1
+                        metric_dict = {k.replace('/', '_'): v for k, v in step_log.items()}
+                        monitor_key = cfg.checkpoint.topk.monitor_key
+                        assert monitor_key in metric_dict, f"skip topk ckpt: monitor_key `{monitor_key}` not in step_log."
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(path=topk_ckpt_path)
+
+                if accelerator.is_main_process:
+                    policy.train()
+                    wandb_run.log(step_log, step=self.global_step)
+                    json_logger.log(step_log)
+
                 self.epoch += 1
+                accelerator.wait_for_everyone()  # 确保下一轮开始前所有进程同步
+
 
 @hydra.main(
     version_base=None,
@@ -377,6 +406,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 def main(cfg):
     workspace = TrainDiffusionTransformerHybridWorkspace(cfg)
     workspace.run()
+
 
 if __name__ == "__main__":
     main()
