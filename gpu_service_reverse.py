@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES=5 uvicorn gpu_service_reverse:gpu_app --port 6071
 gpu_app = FastAPI()
 max_cache_action = 32
 
-log_time = "2026.04.22-01.43.49"
+log_time = "2026.04.24-17.27.49"
 w_idx = -1
 
 map_time_to_dataset = {
@@ -45,6 +45,12 @@ map_time_to_dataset = {
     "2026.04.22-02.35.32": "0209_tower_boby_easy_reversed",
     "2026.04.22-01.34.29": "0417_test_tube_reversed",
     "2026.04.22-01.43.49": "0417_french_press_reversed",
+    "2026.04.22-18.17.12": "0417_test_tube_reversed",
+    "2026.04.22-18.13.59": "0417_french_press_reversed",
+    "2026.04.23-14.46.54": "0209_tower_boby_easy_reversed",
+    "2026.04.24-16.36.26": "0209_tower_boby_easy_reversed",
+    "2026.04.24-16.46.18": "0417_put_mouse_reversed",
+    "2026.04.24-17.27.49": "0417_french_press_reversed",
 }
 # train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
@@ -102,6 +108,7 @@ with open(train_project_statistics_file, 'r') as json_file:
     datasets_total_len = statistics["total_len"]
     dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
     dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
+    dataset_action_mean = np.array(dataset_stats["rel_actions"]["mean"])
     dataset_stats['force_torque']['p01'] = np.array(dataset_stats["force_torque"]['p01'])
     dataset_stats['force_torque']['p99'] = np.array(dataset_stats["force_torque"]['p99'])
 
@@ -321,6 +328,8 @@ def model_step(step_request: StepRequestFromEvaluator):
     action = action * (dataset_action_max - dataset_action_min) + dataset_action_min
 
     cache_action = action
+    threshold = dataset_action_mean[-1]
+    print("[DEBUG] threshold=", threshold)
     for act_idx in range(cache_action.shape[0]):
         if cache_action[act_idx, 6:] >= 0.5:
             cache_action[act_idx, 6:] = 1
