@@ -1,6 +1,7 @@
 import os
 import copy
 from typing import List, Tuple, Optional, Dict, Any, Union, Callable
+from collections.abc import Sequence
 import numpy as np
 import torch
 from torchvision.transforms import transforms
@@ -117,7 +118,7 @@ class LiberoFTDataset(BaseImageDataset):
             self,
             # RoboKit Dataset
             dataset_root: str,
-            dataset_subname: str,
+            dataset_subname: Union[List[str], str],
             hdf5_fns: List[str],
             # Data sequence
             horizon: int,
@@ -141,15 +142,30 @@ class LiberoFTDataset(BaseImageDataset):
         self.dataset_subname = dataset_subname
         self.norm_force_type = norm_force_type
         self.hdf5_fns = hdf5_fns
+        if isinstance(dataset_subname, str):
+            dataset_subnames = [dataset_subname] * len(hdf5_fns)
+        else:
+            assert isinstance(dataset_subname, Sequence) and not isinstance(dataset_subname, (str, bytes)), \
+                f"dataset_subname should be str or sequence of str, but got {type(dataset_subname)}"
+            assert len(dataset_subname) == len(hdf5_fns), \
+                f"len(dataset_subname)={len(dataset_subname)} must equal len(hdf5_fns)={len(hdf5_fns)}"
+            dataset_subnames = list(dataset_subname)
+        self.dataset_subnames = dataset_subnames
+        self.resolved_dataset_roots = []
+        self.resolved_dataset_subnames = []
         self.hdf5_paths = []
         self.libero_h5_datasets = []
-        for fn in hdf5_fns:
-            hdf5_path = os.path.join(dataset_root, dataset_subname, fn)
+        for subname, fn in zip(dataset_subnames, hdf5_fns):
+            current_root = dataset_root
+            current_subname = subname
+            hdf5_path = os.path.join(current_root, current_subname, fn)
             if not os.path.exists(hdf5_path):
-                self.dataset_root = dataset_root = os.path.join(dataset_root, dataset_subname)
-                self.dataset_subname = dataset_subname = "libero_90"
-                hdf5_path = os.path.join(dataset_root, dataset_subname, fn)
+                current_root = os.path.join(current_root, current_subname)
+                current_subname = "libero_90"
+                hdf5_path = os.path.join(current_root, current_subname, fn)
             assert os.path.exists(hdf5_path), f"HDF5 file not found: {hdf5_path}"
+            self.resolved_dataset_roots.append(current_root)
+            self.resolved_dataset_subnames.append(current_subname)
             self.hdf5_paths.append(hdf5_path)
             self.libero_h5_datasets.append(
                 LiberoH5FrameDataset(
@@ -233,17 +249,17 @@ class LiberoFTDataset(BaseImageDataset):
         )
 
         print(f"[diffusion_policy.libero_dataset.LiberoFTDataset] dataset loaded, len={len(self.merge_dataset)}, "
-              f"hdf5_fns={self.hdf5_fns}, ")
+              f"hdf5_fns={self.hdf5_fns}, dataset_subnames={self.dataset_subnames}.")
 
     def get_validation_dataset(self):
         return self.create_val_dataset(self)
 
     @classmethod
-    def create_val_dataset(cls, instance: 'TCLImageDataset'):
+    def create_val_dataset(cls, instance: 'LiberoFTDataset'):
         val_set = cls(
             dataset_root=instance.dataset_root,
             dataset_subname=instance.dataset_subname,
-            hdf5_fns=instance.hdf5_fns[:1],  # use only one h5 file for validation
+            hdf5_fns=instance.hdf5_fns,
             horizon=instance.horizon,
             pad_before=instance.pad_before,
             pad_after=instance.pad_after,
@@ -253,7 +269,7 @@ class LiberoFTDataset(BaseImageDataset):
             val_ratio=instance.val_ratio,
             max_train_episodes=instance.max_train_episodes,
             transform_color_jitter=False,  # no color jitter for val
-            max_len=64,  # limit val set size for speed
+            max_len=instance.max_len,
         )
         return val_set
 

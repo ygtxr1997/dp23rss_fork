@@ -31,7 +31,7 @@ CUDA_VISIBLE_DEVICES=4 uvicorn gpu_service:gpu_app --port 6070
 gpu_app = FastAPI()
 max_cache_action = 32
 
-log_time = "2026.03.18-21.22.07"
+log_time = "2026.04.29-22.07.32"
 w_idx = -1
 
 map_time_to_dataset = {
@@ -57,12 +57,18 @@ map_time_to_dataset = {
     "2026.04.21-01.31.36": "0417_put_mouse",
     "2026.04.21-22.57.11": "0417_test_tube",
     "2026.04.21-22.58.02": "0417_french_press",
-    "2026.04.22-18.27.22": "0417_test_tube",
+    "2026.04.24-18.38.41": "0417_test_tube",
     "2026.04.22-18.15.26": "0417_french_press",
+    "2026.04.28-21.28.06": "1201_screw_bulb_turn_off_table",
+    "2026.04.29-22.07.32": "0417_brush",
 }
 # train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
 train_project_dir = train_project_dir.replace('-', '/')
+# fall back
+if not os.path.exists(train_project_dir):
+    train_project_dir = train_project_dir.replace("image", "images")
+    print(f"[Warning] fallback `xxx_image/` to `xxx_images/`")
 dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
 dataset_name = map_time_to_dataset.get(log_time, dataset_name)
 

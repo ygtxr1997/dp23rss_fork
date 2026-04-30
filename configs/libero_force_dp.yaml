@@ -9,7 +9,7 @@ checkpoint:
     monitor_key: train_action_mse_error  # ori: test_mean_score
 dataloader:
   batch_size: 64  # ori:64
-  num_workers: 32
+  num_workers: 16  # ori:32
   persistent_workers: true
   pin_memory: true
   shuffle: true
@@ -52,9 +52,12 @@ optimizer:
   transformer_weight_decay: 0.001  # ori:0.001
 past_action_visible: false
 policy:
-  # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  # hdfree: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
+  ### MoE related configs
+  en_freeze_obs_encoder: false  # ori: false
+  load_parts_from_ckpt: "obs_encoder"  # ori: all
+  ffn_expand_factor: 4  # ori:4
+
   use_da: false
   domain_adapt:
     src_ckpt: "data/experiments/image/pusht/diffusion_policy_transformer/train_0/epoch=0100-test_mean_score=0.748.ckpt"
@@ -98,9 +101,9 @@ policy:
       act_lr: 5e-7  # ori:5e-7
 
   causal_attn: true
-  crop_shape: # h,w
-  - 216  # ori:84
-  - 288
+  crop_shape: # h,w, NOTE: needs to be set according to image_shape
+  - 112  # ori:84
+  - 112
   eval_fixed_crop: true
   horizon: ${horizon}
   n_action_steps: 8
@@ -128,7 +131,7 @@ policy:
   p_drop_emb: 0.0
   shape_meta: ${shape_meta}
   time_as_cond: true
-image_shape: &image_shape [3, 240, 320]
+image_shape: &image_shape [3, 128, 128]  # ori:[3, 240, 320]
 shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
   # acceptable types: rgb, low_dim
   obs:
@@ -149,7 +152,7 @@ shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!
     shape: [7]
 task:
   dataset:  # Source domain
-    _target_: diffusion_policy.dataset.tcl_dataset.TCLImageDataset
+    _target_: diffusion_policy.dataset.libero_dataset.LiberoFTDataset
     shape_meta: ${shape_meta}
     horizon: ${horizon}
     max_train_episodes: 90
@@ -157,25 +160,25 @@ task:
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
-    transform_color_jitter: true  # ori:false
+    transform_color_jitter: true
+
+    dataset_root: "/home/geyuan/code/LIBERO-FT/libero/datasets/"
+    dataset_subname: "libero_force"
+    hdf5_fns:
+#      - "tmp_replayed_wrench.hdf5"
+#      - "KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE5_close_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE2_open_the_top_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE6_close_the_microwave_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_and_open_the_top_drawer_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE7_open_the_microwave_demo_wrench.hdf5"
+      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_demo_wrench.hdf5"
+#      - "STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_left_compartment_of_the_caddy_demo_wrench.hdf5"
     zero_force: false  # ori:false
-    p_camera_drop: 0.0  # ori:0.0
-#    data_root: "/home/geyuan/datasets/reverse/tower_boby_A/"
-#    h5_path: "/home/geyuan/datasets/reverse/hdf5/tower_boby_A_240p.h5"
-
-#    data_root: "/home/geyuan/datasets/TCL/0209_tower_boby_hard/"
-#    h5_path: "/home/geyuan/datasets/TCL/hdf5/0209_tower_boby_hard_240p.h5"
-#    data_root: "/home/geyuan/datasets/reverse/0209_tower_boby_hard_reversed/"
-#    h5_path: "/home/geyuan/datasets/reverse/hdf5/0209_tower_boby_hard_reversed_240p.h5"
-
-#    data_root: "/home/geyuan/datasets/TCL/0209_tower_boby_easy/"
-#    h5_path: "/home/geyuan/datasets/TCL/hdf5/0209_tower_boby_easy_240p.h5"
-    data_root: "/home/geyuan/datasets/reverse/0209_tower_boby_easy_reversed/"
-    h5_path: "/home/geyuan/datasets/reverse/hdf5/0209_tower_boby_easy_reversed_240p.h5"
-    use_h5: true
-    ## Used by `TCLMasterSlaveDataset`
-    slave_data_roots: null
-    slave_h5_paths: null
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: *shape_meta
@@ -209,7 +212,7 @@ task:
   name: pusht_image
   shape_meta: ${shape_meta}
 task_name: pusht_image
-pretrained_ckpt: "data/outputs/22026.04.22/18.17.12_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+pretrained_ckpt: "data/outputs/2026.01.28/10.43.39_train_diffusion_transformer_hybrid_pusht_images/checkpoints/latest.ckpt"
 training:
   checkpoint_every: 50  # ori:50
   debug: false
@@ -221,7 +224,7 @@ training:
   max_val_steps: null
   num_epochs: 1500  # ori:3050
   resume: true
-  rollout_every: -1  # ori:50, -1 means never
+  rollout_every: -1  # ori:50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
@@ -229,7 +232,7 @@ training:
   val_every: 50
 val_dataloader:
   batch_size: 64
-  num_workers: 24  # ori:48
+  num_workers: 12  # ori:48
   persistent_workers: false
   pin_memory: true
   shuffle: false

@@ -29,7 +29,7 @@ from robokit.debug_utils.printer import print_batch
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=6 uvicorn gpu_service_libero:gpu_app --port 7076
+CUDA_VISIBLE_DEVICES=2 CKPT_INDEX=0 uvicorn gpu_service_libero:gpu_app --port 7072
 """
 gpu_app = FastAPI()
 max_cache_action = 4  # ori:32
@@ -43,14 +43,35 @@ max_cache_action = 4  # ori:32
 # log_time = "2026.02.26-00.44.21"  # KITCHEN_SCENE2_open_the_top_drawer_of_the_cabinet_demo_wrench.hdf5
 # log_time = "2026.02.26-15.09.30"  # KITCHEN_SCENE6_close_the_microwave_demo_wrench.hdf5
 # log_time = "2026.02.26-00.50.21"  # KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo_wrench.hdf5
-log_time = "2026.02.26-09.21.31"  # KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_and_open_the_top_drawer_demo_wrench.hdf5
+# log_time = "2026.02.26-09.21.31"  # KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_and_open_the_top_drawer_demo_wrench.hdf5
 # log_time = "2026.02.26-12.09.38"  # KITCHEN_SCENE7_open_the_microwave_demo_wrench.hdf5
 # log_time = "2026.02.26-15.22.57"  # KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5
 # log_time = "2026.02.26-09.21.31"  # KITCHEN_SCENE4_close_the_bottom_drawer_of_the_cabinet_and_open_the_top_drawer_demo_wrench.hdf5
 # log_time = "2026.02.26-14.38.50"  # STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_left_compartment_of_the_caddy_demo_wrench.hdf5
 
+## Without force
 # log_time = "2026.02.28-02.01.18"  # KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench
-w_idx = -2
+
+## MoE
+# log_time = "2026.04.27-01.29.21"  # k1_open_top_put_bowl
+# log_time = "2026.04.28-12.39.18"  # k1_open_top_put_bowl, texture
+# log_time = "2026.04.28-12.39.58"  # k1_open_top_put_bowl, darken
+# log_time = "2026.04.29-22.00.13"  # k1_open_top_put_bowl, view
+# log_time = "2026.04.29-12.42.59"  # k1_open_top_put_bowl, color
+
+# log_time = "2026.04.30-11.31.13"  # k1_open_top_put_bowl, texture_slice
+# log_time = "2026.04.30-10.49.39"  # k1_open_top_put_bowl, view_slice, ffn*4
+# log_time = "2026.04.30-10.49.10"  # k1_open_top_put_bowl, color_slice
+# log_time = "2026.04.30-13.28.53"  # k1_open_top_put_bowl, color_slice, ffn*10
+
+# log_time = "2026.04.30-07.39.51"  # k1_open_top_put_bowl, MoE:texture/view/color
+# log_time = "2026.04.30-09.42.59"  # k1_open_top_put_bowl, MoE:view only
+# log_time = "2026.04.30-10.47.46"  # k1_open_top_put_bowl, MoE:all 3, fix weight decay
+log_time = "2026.04.30-12.33.08"  # k1_open_top_put_bowl, MoE:all 3 slice
+
+# log_time = "2026.04.27-08.52.45"  # s3_pick_book_place_leftcaddy
+# log_time = "2026.04.27-09.00.26"  # k6_close
+w_idx = int(os.environ.get("CKPT_INDEX", -2))
 
 
 def load_dataset_fields(yaml_path: str):
@@ -64,7 +85,8 @@ def load_dataset_fields(yaml_path: str):
     return hdf5_fns, dataset_root, dataset_subname, shape_meta
 
 
-train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
+# train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
+train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
 train_project_dir = train_project_dir.replace('-', '/')
 train_yaml_path = os.path.join(train_project_dir, ".hydra/config.yaml")
 assert os.path.exists(train_yaml_path), f"[gpu_service_libero] train_yaml_path not found: {train_yaml_path}"

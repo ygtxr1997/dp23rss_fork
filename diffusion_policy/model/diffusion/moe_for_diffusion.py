@@ -806,6 +806,9 @@ class MoEForDiffusion(ModuleAttrMixin):
                     for p in expert.parameters():
                         p.requires_grad = False
 
+            if li == 0 and is_main_process:
+                print(f"[Moe Builder] Merged teachers weights into decoder.layers and ffn")
+
         model.last_moe_aux_loss = None
         if target_obs_encoder is not None:
             if len(teacher_obs_encoders) != len(teachers):

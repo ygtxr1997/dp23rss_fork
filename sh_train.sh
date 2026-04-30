@@ -29,15 +29,15 @@ CONFIG_DIR="./"
 #CONFIG_NAME="tcl_dp_transformer.yaml"
 #CONFIG_NAME="tcl_hdfree_shovel.yaml"
 #CONFIG_NAME="tcl_hdfree_dp.yaml"
-#CONFIG_NAME="tcl_dp_force.yaml"
+CONFIG_NAME="tcl_dp_force.yaml"
 #CONFIG_NAME="libero_force_dp.yaml"
 
 ### Reverse Collect ###
 #CONFIG_NAME="reverse_dp_force.yaml"
 
 ### Merge MoE ###
-CONFIG_DIR="configs/"
-CONFIG_NAME="pusht256_dp.yaml"
+#CONFIG_DIR="configs/"
+#CONFIG_NAME="pusht256_dp.yaml"
 
 DEVICE="cuda"
 

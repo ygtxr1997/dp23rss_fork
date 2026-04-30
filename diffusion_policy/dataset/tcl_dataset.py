@@ -191,8 +191,9 @@ class TCLImageDataset(BaseImageDataset):
             max_train_episodes=instance.max_train_episodes,
             use_h5=instance.use_h5,  # ori:no need to use h5
             h5_path=instance.h5_path,
+            transform_color_jitter=False,
         )
-        val_set.tcl_dataset.total_length = 64
+        val_set.tcl_dataset.total_length = 1024
         return val_set
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:

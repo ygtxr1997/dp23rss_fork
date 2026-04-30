@@ -9,7 +9,7 @@ checkpoint:
     monitor_key: train_action_mse_error  # ori: test_mean_score
 dataloader:
   batch_size: 64  # ori:64
-  num_workers: 32
+  num_workers: 16
   persistent_workers: true
   pin_memory: true
   shuffle: true
@@ -52,10 +52,23 @@ optimizer:
   transformer_weight_decay: 0.001  # ori:0.001
 past_action_visible: false
 policy:
-  # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  # hdfree: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  use_da: false
+  ### MoE related configs
+  en_freeze_obs_encoder: false  # ori: false
+  load_parts_from_ckpt: "obs_encoder"  # ori: all
+  ffn_expand_factor: [2, 4, 6]  # ori:4
+
+  backbone_type: moe  # ori: transformer, choices: transformer, moe
+  teacher_ckpts:  # order-sensitive, should be in the same order as ffn_expand_factor
+    - "data/outputs/2026.04.29/12.42.59_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+    - "data/outputs/2026.04.29/22.00.13_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+    - "data/outputs/2026.04.28/12.39.18_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+  moe_topk: 2
+  router_noisy_std: 0.1
+  moe_aux_loss_weight: 0.01
+  ########
+
+  use_da: false  # ori: true
   domain_adapt:
     src_ckpt: "data/experiments/image/pusht/diffusion_policy_transformer/train_0/epoch=0100-test_mean_score=0.748.ckpt"
 
@@ -98,9 +111,9 @@ policy:
       act_lr: 5e-7  # ori:5e-7
 
   causal_attn: true
-  crop_shape: # h,w
-  - 216  # ori:84
-  - 288
+  crop_shape: # h,w, NOTE: needs to be set according to image_shape
+  - 112  # ori:84
+  - 112
   eval_fixed_crop: true
   horizon: ${horizon}
   n_action_steps: 8
@@ -128,7 +141,7 @@ policy:
   p_drop_emb: 0.0
   shape_meta: ${shape_meta}
   time_as_cond: true
-image_shape: &image_shape [3, 240, 320]
+image_shape: &image_shape [3, 128, 128]  # ori:[3, 240, 320]
 shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
   # acceptable types: rgb, low_dim
   obs:
@@ -149,43 +162,38 @@ shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!
     shape: [7]
 task:
   dataset:  # Source domain
-    _target_: diffusion_policy.dataset.tcl_dataset.TCLImageDataset
+    _target_: diffusion_policy.dataset.libero_dataset.LiberoFTDataset
     shape_meta: ${shape_meta}
     horizon: ${horizon}
     max_train_episodes: 90
     pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
-    val_ratio: 0.02
+    val_ratio: 0.01
     transform_color_jitter: true  # ori:false
+
+    dataset_root: "/home/geyuan/code/LIBERO-FT/libero/datasets/"
+    dataset_subname:
+#      - "libero_force"  # source domain
+      - "libero_force_color"  # shift: color
+      - "libero_force_view"  # shift: view
+      - "libero_force_texture"  # shift: texture
+
+    hdf5_fns:
+      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5"
+      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5"
+      - "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5"
+
     zero_force: false  # ori:false
-    p_camera_drop: 0.0  # ori:0.0
-#    data_root: "/home/geyuan/datasets/reverse/tower_boby_A/"
-#    h5_path: "/home/geyuan/datasets/reverse/hdf5/tower_boby_A_240p.h5"
-
-#    data_root: "/home/geyuan/datasets/TCL/0209_tower_boby_hard/"
-#    h5_path: "/home/geyuan/datasets/TCL/hdf5/0209_tower_boby_hard_240p.h5"
-#    data_root: "/home/geyuan/datasets/reverse/0209_tower_boby_hard_reversed/"
-#    h5_path: "/home/geyuan/datasets/reverse/hdf5/0209_tower_boby_hard_reversed_240p.h5"
-
-#    data_root: "/home/geyuan/datasets/TCL/0209_tower_boby_easy/"
-#    h5_path: "/home/geyuan/datasets/TCL/hdf5/0209_tower_boby_easy_240p.h5"
-    data_root: "/home/geyuan/datasets/reverse/0209_tower_boby_easy_reversed/"
-    h5_path: "/home/geyuan/datasets/reverse/hdf5/0209_tower_boby_easy_reversed_240p.h5"
-    use_h5: true
-    ## Used by `TCLMasterSlaveDataset`
-    slave_data_roots: null
-    slave_h5_paths: null
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
-    shape_meta: *shape_meta
-    horizon: ${horizon}
+    horizon: 10
     max_train_episodes: 200  # ori:90
-    pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
-    pad_after: ${eval:'${n_action_steps}-1'}
+    pad_after: 7
+    pad_before: 1
     seed: 42
     val_ratio: 0.02
-    zarr_path: data/pusht/pusht_size_random.zarr
+    zarr_path: data/pusht/pusht_size.zarr
   env_runner:
     _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
     fps: 10
@@ -193,25 +201,23 @@ task:
     max_steps: 300
     n_action_steps: 8
     n_envs: null
-    n_obs_steps: ${n_obs_steps}
+    n_obs_steps: 2
     n_test: 25  # ori:50
     n_test_vis: 4
-    n_train: 6
-    n_train_vis: 2
+    n_train: 0  # ori: 4
+    n_train_vis: 0  # ori: 2
     past_action: false
     test_start_seed: 4300000  # ori:100000, download:4300000, [Note]: Should be totally same with the loading ckpt!!!
     train_start_seed: 0
-    domain_shift: size
-  image_shape:
-  - 3
-  - 96
-  - 96
+    domain_shift: none  # ori:size,goal,none,light
+    render_size: 256  # ori:96
+  image_shape: *image_shape
   name: pusht_image
   shape_meta: ${shape_meta}
 task_name: pusht_image
-pretrained_ckpt: "data/outputs/22026.04.22/18.17.12_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+#pretrained_ckpt: "data/outputs/2026.04.27/01.29.21_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
 training:
-  checkpoint_every: 50  # ori:50
+  checkpoint_every: 200  # ori:50
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
@@ -221,7 +227,7 @@ training:
   max_val_steps: null
   num_epochs: 1500  # ori:3050
   resume: true
-  rollout_every: -1  # ori:50, -1 means never
+  rollout_every: -1  # ori:50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
@@ -229,7 +235,7 @@ training:
   val_every: 50
 val_dataloader:
   batch_size: 64
-  num_workers: 24  # ori:48
+  num_workers: 8
   persistent_workers: false
   pin_memory: true
   shuffle: false

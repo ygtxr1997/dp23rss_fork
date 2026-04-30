@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES=5 uvicorn gpu_service_reverse:gpu_app --port 6071
 gpu_app = FastAPI()
 max_cache_action = 32
 
-log_time = "2026.04.24-17.27.49"
+log_time = "2026.04.29-01.20.15"
 w_idx = -1
 
 map_time_to_dataset = {
@@ -51,6 +51,9 @@ map_time_to_dataset = {
     "2026.04.24-16.36.26": "0209_tower_boby_easy_reversed",
     "2026.04.24-16.46.18": "0417_put_mouse_reversed",
     "2026.04.24-17.27.49": "0417_french_press_reversed",
+    "2026.04.29-01.30.55": "0417_french_press_reversed",
+    "2026.04.29-22.22.19": "0417_brush_reversed",
+    "2026.04.29-01.20.15": "0209_tower_boby_easy_reversed",
 }
 # train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
