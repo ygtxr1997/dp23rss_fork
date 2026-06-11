@@ -35,7 +35,7 @@ def _as_blocks_per_stage(
     else:
         stage_blocks = tuple(int(x) for x in blocks_per_stage)
         if len(stage_blocks) != num_stages:
-            raise ValueError("blocks_per_stage length must match num_blocks.")
+            raise ValueError("blocks_per_stage length must match num_stages.")
     if any(x <= 0 for x in stage_blocks):
         raise ValueError("blocks_per_stage values must be positive.")
     return stage_blocks
@@ -46,7 +46,7 @@ def _make_group_norm(num_channels: int) -> nn.GroupNorm:
     return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
 
 
-class _ResidualConvBlock(nn.Module):
+class _ResidualBlock(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -103,34 +103,33 @@ class RoiNet(nn.Module):
     """
 
     _PRESETS = {
-        # "tiny": {
-        #     "base_channels": 48,
-        #     "num_blocks": 3,
-        #     "blocks_per_stage": 2,
-        #     "locator_input_size": (96, 96),
-        #     "hidden_dim": 256,
-        # },
         "tiny": {
-            "base_channels": 96,
-            "num_blocks": 3,
+            "base_channels": 48,
+            "num_stages": 3,
             "blocks_per_stage": 2,
             "locator_input_size": (96, 96),
-            "hidden_dim": 384,
+            "hidden_dim": 256,
         },
         "small": {
             "base_channels": 96,
-            "num_blocks": 6,
+            "num_stages": 6,
             "blocks_per_stage": 2,
             "locator_input_size": (96, 96),
             "hidden_dim": 384,
         },
         "medium": {
             "base_channels": 128,
-            "num_blocks": 8,
+            "num_stages": 8,
             "blocks_per_stage": 2,
             "locator_input_size": (160, 160),
             "hidden_dim": 512,
         },
+    }
+    _LOCATOR_TYPES = {"residual", "resnet"}
+    _RESNET_BLOCKS_PER_STAGE_BY_PRESET = {
+        "tiny": (1, 1, 1, 1),    # ResNet-10-style: stem + 4 BasicBlock stages.
+        "small": (2, 2, 2, 2),   # ResNet-18-style.
+        "medium": (3, 4, 6, 3),  # ResNet-34-style.
     }
 
     def __init__(
@@ -138,8 +137,9 @@ class RoiNet(nn.Module):
         in_channels: int = 3,
         roi_size: Size2D = (256, 256),
         preset: str = "small",
+        locator_type: str = "residual",
         base_channels: Optional[int] = None,
-        num_blocks: Optional[int] = None,
+        num_stages: Optional[int] = None,
         blocks_per_stage: Optional[BlocksPerStage] = None,
         locator_input_size: Optional[Size2D] = None,
         hidden_dim: Optional[int] = None,
@@ -163,24 +163,40 @@ class RoiNet(nn.Module):
             raise ValueError("Expected 0 < min_scale <= max_scale <= 1.0.")
         if padding_mode not in {"zeros", "border", "reflection"}:
             raise ValueError("padding_mode must be 'zeros', 'border', or 'reflection'.")
+        if locator_type not in self._LOCATOR_TYPES:
+            valid_locator_types = ", ".join(sorted(self._LOCATOR_TYPES))
+            raise ValueError(
+                f"Unknown locator_type '{locator_type}'. "
+                f"Valid locator types: {valid_locator_types}."
+            )
+        if locator_type == "resnet" and num_stages is not None:
+            raise ValueError("num_stages is not supported when locator_type='resnet'.")
+        if locator_type == "resnet" and blocks_per_stage is not None:
+            raise ValueError(
+                "blocks_per_stage is not supported when locator_type='resnet'."
+            )
 
         preset_config = self._PRESETS[preset]
         self.in_channels = int(in_channels)
         self.roi_h, self.roi_w = _as_hw(roi_size, "roi_size")
         self.preset = preset
+        self.locator_type = locator_type
         self.base_channels = int(
             preset_config["base_channels"] if base_channels is None else base_channels
         )
-        self.num_stages = int(
-            preset_config["num_blocks"] if num_blocks is None else num_blocks
-        )
-        self.num_blocks = self.num_stages
-        self.blocks_per_stage = _as_blocks_per_stage(
-            preset_config["blocks_per_stage"]
-            if blocks_per_stage is None
-            else blocks_per_stage,
-            self.num_stages,
-        )
+        if self.locator_type == "residual":
+            self.num_stages = int(
+                preset_config["num_stages"] if num_stages is None else num_stages
+            )
+            self.blocks_per_stage = _as_blocks_per_stage(
+                preset_config["blocks_per_stage"]
+                if blocks_per_stage is None
+                else blocks_per_stage,
+                self.num_stages,
+            )
+        else:
+            self.blocks_per_stage = self._RESNET_BLOCKS_PER_STAGE_BY_PRESET[preset]
+            self.num_stages = len(self.blocks_per_stage)
         locator_size = (
             preset_config["locator_input_size"]
             if locator_input_size is None
@@ -205,30 +221,18 @@ class RoiNet(nn.Module):
         if self.base_channels <= 0:
             raise ValueError("base_channels must be positive.")
         if self.num_stages <= 0:
-            raise ValueError("num_blocks must be positive.")
+            raise ValueError("num_stages must be positive.")
         if self.hidden_dim <= 0:
             raise ValueError("hidden_dim must be positive.")
         if self.init_head_weight_std < 0.0:
             raise ValueError("init_head_weight_std must be non-negative.")
 
-        locator_layers = []
-        block_in_channels = self.in_channels
-        block_out_channels = self.base_channels
-        for stage_idx, num_stage_blocks in enumerate(self.blocks_per_stage):
-            # Each stage starts with one spatial downsample, then repeats
-            # residual blocks at the same H/W like a compact UNet-style encoder.
-            block_out_channels = self.base_channels * min(2 ** stage_idx, 4)
-            for block_idx in range(num_stage_blocks):
-                stride = 4 if block_idx == 0 else 2
-                block = _ResidualConvBlock(
-                    in_channels=block_in_channels,
-                    out_channels=block_out_channels,
-                    stride=stride,
-                )
-                locator_layers.append(block)
-                block_in_channels = block_out_channels
-
-        self.locator_feature_dim = block_in_channels
+        if self.locator_type == "residual":
+            locator_layers, self.locator_feature_dim = (
+                self._make_residual_locator_layers()
+            )
+        else:
+            locator_layers, self.locator_feature_dim = self._make_resnet_locator_layers()
         self.locator_cnn = nn.Sequential(
             *locator_layers,
             nn.AdaptiveAvgPool2d(output_size=1),
@@ -240,6 +244,54 @@ class RoiNet(nn.Module):
             nn.Linear(self.hidden_dim, 3),
         )
         self._init_locator_head()
+
+    def _make_residual_locator_layers(self):
+        locator_layers = []
+        block_in_channels = self.in_channels
+        for stage_idx, num_stage_blocks in enumerate(self.blocks_per_stage):
+            # Each stage starts with one spatial downsample, then repeats
+            # residual blocks at the same H/W like a compact UNet-style encoder.
+            block_out_channels = self.base_channels * min(2 ** stage_idx, 4)
+            for block_idx in range(num_stage_blocks):
+                stride = 4 if block_idx == 0 else 2
+                block = _ResidualBlock(
+                    in_channels=block_in_channels,
+                    out_channels=block_out_channels,
+                    stride=stride,
+                )
+                locator_layers.append(block)
+                block_in_channels = block_out_channels
+
+        return locator_layers, block_in_channels
+
+    def _make_resnet_locator_layers(self):
+        locator_layers = [
+            nn.Conv2d(
+                self.in_channels,
+                self.base_channels,
+                kernel_size=7,
+                stride=2,
+                padding=3,
+                bias=False,
+            ),
+            _make_group_norm(self.base_channels),
+            nn.SiLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        ]
+        block_in_channels = self.base_channels
+        for stage_idx, num_stage_blocks in enumerate(self.blocks_per_stage):
+            block_out_channels = self.base_channels * (2 ** stage_idx)
+            for block_idx in range(num_stage_blocks):
+                stride = 1 if stage_idx == 0 or block_idx > 0 else 2
+                block = _ResidualBlock(
+                    in_channels=block_in_channels,
+                    out_channels=block_out_channels,
+                    stride=stride,
+                )
+                locator_layers.append(block)
+                block_in_channels = block_out_channels
+
+        return locator_layers, block_in_channels
 
     def _resolve_init_scale(self, init_scale: Optional[float]) -> float:
         scale_range = self.max_scale - self.min_scale
@@ -541,6 +593,7 @@ class RoiNet(nn.Module):
             f"in_channels={self.in_channels}, "
             f"roi_size=({self.roi_h}, {self.roi_w}), "
             f"preset='{self.preset}', "
+            f"locator_type='{self.locator_type}', "
             f"locator_input_size=({self.locator_input_h}, {self.locator_input_w}), "
             f"base_channels={self.base_channels}, "
             f"num_stages={self.num_stages}, "
