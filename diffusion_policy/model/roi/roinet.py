@@ -100,6 +100,8 @@ class RoiNet(nn.Module):
     The input tensor convention is fixed to (B, C, T, H, W). The localization
     CNN predicts one normalized center_x, center_y, scale triplet per frame,
     then affine_grid + grid_sample crops the original image to a fixed ROI size.
+    Samples outside the source image are masked out instead of moving the
+    predicted center back inside the image.
     """
 
     _PRESETS = {
@@ -126,6 +128,7 @@ class RoiNet(nn.Module):
         },
     }
     _LOCATOR_TYPES = {"residual", "resnet"}
+    _PREDICT_TYPES = {"xys", "logit_scale"}
     _RESNET_BLOCKS_PER_STAGE_BY_PRESET = {
         "tiny": (1, 1, 1, 1),    # ResNet-10-style: stem + 4 BasicBlock stages.
         "small": (2, 2, 2, 2),   # ResNet-18-style.
@@ -147,11 +150,15 @@ class RoiNet(nn.Module):
         max_scale: float = 1.0,
         init_scale: Optional[float] = None,
         init_head_weight_std: float = 1e-4,
+        init_center_raw_std: Optional[float] = None,
+        init_patch_logit_raw_std: Optional[float] = None,
         detach_input_grad: bool = True,
         padding_mode: str = "border",
         align_corners: bool = False,
         return_grid: bool = False,
         return_features: bool = False,
+        predict_type: str = "xys",
+        patchify_wh: int = 16,
     ) -> None:
         super().__init__()
         if preset not in self._PRESETS:
@@ -168,6 +175,12 @@ class RoiNet(nn.Module):
             raise ValueError(
                 f"Unknown locator_type '{locator_type}'. "
                 f"Valid locator types: {valid_locator_types}."
+            )
+        if predict_type not in self._PREDICT_TYPES:
+            valid_predict_types = ", ".join(sorted(self._PREDICT_TYPES))
+            raise ValueError(
+                f"Unknown predict_type '{predict_type}'. "
+                f"Valid predict types: {valid_predict_types}."
             )
         if locator_type == "resnet" and num_stages is not None:
             raise ValueError("num_stages is not supported when locator_type='resnet'.")
@@ -212,11 +225,21 @@ class RoiNet(nn.Module):
         self.max_scale = float(max_scale)
         self.init_scale = self._resolve_init_scale(init_scale)
         self.init_head_weight_std = float(init_head_weight_std)
+        self.init_center_raw_std = (
+            None if init_center_raw_std is None else float(init_center_raw_std)
+        )
+        self.init_patch_logit_raw_std = (
+            None
+            if init_patch_logit_raw_std is None
+            else float(init_patch_logit_raw_std)
+        )
         self.detach_input_grad = bool(detach_input_grad)
         self.padding_mode = padding_mode
         self.align_corners = bool(align_corners)
         self.return_grid = bool(return_grid)
         self.return_features = bool(return_features)
+        self.predict_type = predict_type
+        self.patchify_wh = int(patchify_wh)
 
         if self.base_channels <= 0:
             raise ValueError("base_channels must be positive.")
@@ -226,6 +249,32 @@ class RoiNet(nn.Module):
             raise ValueError("hidden_dim must be positive.")
         if self.init_head_weight_std < 0.0:
             raise ValueError("init_head_weight_std must be non-negative.")
+        if self.init_center_raw_std is not None and self.init_center_raw_std < 0.0:
+            raise ValueError("init_center_raw_std must be non-negative.")
+        if (
+            self.init_patch_logit_raw_std is not None
+            and self.init_patch_logit_raw_std < 0.0
+        ):
+            raise ValueError("init_patch_logit_raw_std must be non-negative.")
+        if self.patchify_wh <= 0:
+            raise ValueError("patchify_wh must be positive.")
+        self.patch_grid_h = self.locator_input_h // self.patchify_wh
+        self.patch_grid_w = self.locator_input_w // self.patchify_wh
+        if self.predict_type == "logit_scale":
+            if (
+                self.locator_input_h % self.patchify_wh != 0
+                or self.locator_input_w % self.patchify_wh != 0
+            ):
+                raise ValueError(
+                    "locator_input_size must be divisible by patchify_wh "
+                    "when predict_type='logit_scale'."
+                )
+            if self.patch_grid_h <= 0 or self.patch_grid_w <= 0:
+                raise ValueError(
+                    "patchify_wh must not exceed locator_input_size "
+                    "when predict_type='logit_scale'."
+                )
+        self.patch_grid_size = self.patch_grid_h * self.patch_grid_w
 
         if self.locator_type == "residual":
             locator_layers, self.locator_feature_dim = (
@@ -238,10 +287,18 @@ class RoiNet(nn.Module):
             nn.AdaptiveAvgPool2d(output_size=1),
             nn.Flatten(start_dim=1),
         )
+        locator_head_out_dim = (
+            3 if self.predict_type == "xys" else self.patch_grid_size + 1
+        )
         self.locator_head = nn.Sequential(
             nn.Linear(self.locator_feature_dim, self.hidden_dim),
             nn.SiLU(inplace=True),
-            nn.Linear(self.hidden_dim, 3),
+            nn.Linear(self.hidden_dim, locator_head_out_dim),
+        )
+        self.register_buffer(
+            "_patch_centers_G_2",
+            self._make_patch_centers(),
+            persistent=False,
         )
         self._init_locator_head()
 
@@ -313,48 +370,124 @@ class RoiNet(nn.Module):
         init_scale_ratio = min(max(init_scale_ratio, scale_eps), 1.0 - scale_eps)
         return self.min_scale + scale_range * init_scale_ratio
 
+    def _make_patch_centers(self) -> torch.Tensor:
+        if self.patch_grid_h <= 0 or self.patch_grid_w <= 0:
+            return torch.empty(0, 2)
+        y_centers = (
+            (torch.arange(self.patch_grid_h, dtype=torch.float32) + 0.5)
+            / float(self.patch_grid_h)
+            * 2.0
+            - 1.0
+        )
+        x_centers = (
+            (torch.arange(self.patch_grid_w, dtype=torch.float32) + 0.5)
+            / float(self.patch_grid_w)
+            * 2.0
+            - 1.0
+        )
+        grid_y, grid_x = torch.meshgrid(y_centers, x_centers, indexing="ij")
+        return torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2)
+
     def _init_locator_head(self) -> None:
         last_linear = self.locator_head[-1]
-        nn.init.normal_(last_linear.weight, mean=0.0, std=self.init_head_weight_std)
-        nn.init.zeros_(last_linear.bias)
-        if self.max_scale > self.min_scale:
-            init_scale_ratio = (
-                (self.init_scale - self.min_scale)
-                / (self.max_scale - self.min_scale)
-            )
-            with torch.no_grad():
-                last_linear.bias[2] = math.log(
+
+        with torch.no_grad():
+            last_linear.weight.zero_()
+            last_linear.bias.zero_()
+
+            if self.predict_type == "xys":
+                center_weight_std = self._resolve_head_weight_std(
+                    self.init_center_raw_std
+                )
+                if center_weight_std > 0.0:
+                    nn.init.normal_(
+                        last_linear.weight[:2],
+                        mean=0.0,
+                        std=center_weight_std,
+                    )
+            elif self.predict_type == "logit_scale":
+                patch_logit_weight_std = self._resolve_head_weight_std(
+                    self.init_patch_logit_raw_std
+                )
+                if patch_logit_weight_std > 0.0:
+                    nn.init.normal_(
+                        last_linear.weight[: self.patch_grid_size],
+                        mean=0.0,
+                        std=patch_logit_weight_std,
+                    )
+            else:
+                raise RuntimeError(f"Unsupported predict_type {self.predict_type}.")
+
+            if self.max_scale > self.min_scale:
+                init_scale_ratio = (
+                    (self.init_scale - self.min_scale)
+                    / (self.max_scale - self.min_scale)
+                )
+                scale_bias_idx = 2 if self.predict_type == "xys" else -1
+                last_linear.bias[scale_bias_idx] = math.log(
                     init_scale_ratio / (1.0 - init_scale_ratio)
                 )
 
+    def _resolve_head_weight_std(self, raw_std: Optional[float]) -> float:
+        if raw_std is None:
+            return self.init_head_weight_std
+        return raw_std / math.sqrt(float(self.hidden_dim))
+
+    def _constrain_raw_scale(self, raw_scale_BT: torch.Tensor) -> torch.Tensor:
+        # Smoothly map raw scale to [min_scale, max_scale]. The final-layer bias
+        # is initialized so raw output starts near self.init_scale, usually 0.98.
+        if self.max_scale == self.min_scale:
+            return torch.full_like(raw_scale_BT, fill_value=self.min_scale)
+        scale_ratio_BT = torch.sigmoid(raw_scale_BT)
+        return self.min_scale + (self.max_scale - self.min_scale) * scale_ratio_BT
+
     def _constrain_raw_params(self, raw_params_BT_3: torch.Tensor) -> torch.Tensor:
+        if raw_params_BT_3.shape[-1] != 3:
+            raise ValueError("Expected raw xys params with last dimension 3.")
         raw_center_x_BT = raw_params_BT_3[:, 0]
         raw_center_y_BT = raw_params_BT_3[:, 1]
         raw_scale_BT = raw_params_BT_3[:, 2]
 
-        # Smoothly map raw scale to [min_scale, max_scale]. The final-layer bias
-        # is initialized so raw output starts near self.init_scale, usually 0.98,
-        # leaving a small but non-zero center movement range at initialization.
-        if self.max_scale == self.min_scale:
-            scale_BT = torch.full_like(raw_scale_BT, fill_value=self.min_scale)
-        else:
-            scale_ratio_BT = torch.sigmoid(raw_scale_BT)
-            scale_BT = (
-                self.min_scale
-                + (self.max_scale - self.min_scale) * scale_ratio_BT
-            )
-
-        # For a crop with normalized scale s, center must stay inside
-        # [-1 + s, 1 - s] to keep the ROI within the input image.
-        center_limit_BT = torch.clamp(1.0 - scale_BT, min=0.0)
-        center_x_BT = center_limit_BT * torch.tanh(raw_center_x_BT)
-        center_y_BT = center_limit_BT * torch.tanh(raw_center_y_BT)
+        scale_BT = self._constrain_raw_scale(raw_scale_BT)
+        center_x_BT = torch.tanh(raw_center_x_BT)
+        center_y_BT = torch.tanh(raw_center_y_BT)
 
         params_BT_3 = torch.stack(
             (center_x_BT, center_y_BT, scale_BT),
             dim=-1,
         )
         return params_BT_3
+
+    def _constrain_logit_scale_params(
+        self,
+        raw_logit_scale_BT_G1: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_dim = self.patch_grid_size + 1
+        if raw_logit_scale_BT_G1.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Expected raw logit_scale params with last dimension {expected_dim}."
+            )
+
+        logits_BT_G = raw_logit_scale_BT_G1[:, : self.patch_grid_size]
+        raw_scale_BT = raw_logit_scale_BT_G1[:, -1]
+
+        probs_BT_G = torch.softmax(logits_BT_G, dim=-1)
+        centers_BT_2 = probs_BT_G @ self._patch_centers_G_2.to(
+            device=raw_logit_scale_BT_G1.device,
+            dtype=raw_logit_scale_BT_G1.dtype,
+        )
+        scale_BT = self._constrain_raw_scale(raw_scale_BT)
+        return torch.cat((centers_BT_2, scale_BT.unsqueeze(-1)), dim=-1)
+
+    def _constrain_raw_head_output(
+        self,
+        raw_head_output_BT_D: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.predict_type == "xys":
+            return self._constrain_raw_params(raw_head_output_BT_D)
+        if self.predict_type == "logit_scale":
+            return self._constrain_logit_scale_params(raw_head_output_BT_D)
+        raise RuntimeError(f"Unsupported predict_type {self.predict_type}.")
 
     @staticmethod
     def area_loss(
@@ -377,6 +510,48 @@ class RoiNet(nn.Module):
         if reduction == "sum":
             return area_percent.sum()
         raise ValueError("reduction must be 'none', 'mean', or 'sum'.")
+
+    @staticmethod
+    def center_diversity_loss(
+        params_or_output: Union[Dict[str, torch.Tensor], torch.Tensor],
+        margin: float = 0.25,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if isinstance(params_or_output, dict):
+            params_B_T_3 = params_or_output["params_B_T_3"]
+        else:
+            params_B_T_3 = params_or_output
+        if params_B_T_3.shape[-1] != 3:
+            raise ValueError("Expected ROI params with last dimension 3.")
+        if params_B_T_3.ndim != 3:
+            raise ValueError("Expected ROI params with shape (B, T, 3).")
+        if margin < 0.0:
+            raise ValueError("margin must be non-negative.")
+        if eps < 0.0:
+            raise ValueError("eps must be non-negative.")
+
+        centers_B_T_2 = params_B_T_3[..., :2]
+        batch_size = centers_B_T_2.shape[0]
+        if batch_size < 2:
+            return centers_B_T_2.sum() * 0.0
+
+        center_diff_B_B_T_2 = (
+            centers_B_T_2[:, None, :, :] - centers_B_T_2[None, :, :, :]
+        )
+        center_dist_B_B_T = torch.sqrt(
+            center_diff_B_B_T_2.square().sum(dim=-1) + eps
+        )
+        pair_mask_B_B = torch.triu(
+            torch.ones(
+                batch_size,
+                batch_size,
+                device=centers_B_T_2.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+        pair_dist_P_T = center_dist_B_B_T[pair_mask_B_B]
+        return torch.relu(float(margin) - pair_dist_P_T).square().mean()
 
     def _make_theta(self, params_BT_3: torch.Tensor) -> torch.Tensor:
         center_x_BT = params_BT_3[:, 0]
@@ -450,10 +625,10 @@ class RoiNet(nn.Module):
         with gtp(f"{gtp_training}/roi.locator_cnn", group=f"{gtp_training}/roi"):
             locator_features_BT_D = self.locator_cnn(locator_x_BT_C_LH_LW)
         with gtp(f"{gtp_training}/roi.locator_head", group=f"{gtp_training}/roi"):
-            raw_params_BT_3 = self.locator_head(locator_features_BT_D)
+            raw_head_output_BT_D = self.locator_head(locator_features_BT_D)
 
         # Map unconstrained network outputs into normalized ROI parameters.
-        params_BT_3 = self._constrain_raw_params(raw_params_BT_3)
+        params_BT_3 = self._constrain_raw_head_output(raw_head_output_BT_D)
 
         # theta maps output normalized coordinates to input normalized coordinates.
         # With center=(0,0), scale=1 this is an identity full-frame resize.
@@ -466,12 +641,21 @@ class RoiNet(nn.Module):
                 size=(BT, C, self.roi_h, self.roi_w),
                 align_corners=self.align_corners,
             )
+            valid_mask_BT_1_RH_RW = (
+                (grid_BT_RH_RW_2[..., 0] >= -1.0)
+                & (grid_BT_RH_RW_2[..., 0] <= 1.0)
+                & (grid_BT_RH_RW_2[..., 1] >= -1.0)
+                & (grid_BT_RH_RW_2[..., 1] <= 1.0)
+            ).unsqueeze(1)
             roi_BT_C_RH_RW = F.grid_sample(
                 image_for_roi,
                 grid_BT_RH_RW_2,
                 mode="bilinear",
                 padding_mode=self.padding_mode,
                 align_corners=self.align_corners,
+            )
+            roi_BT_C_RH_RW = roi_BT_C_RH_RW * valid_mask_BT_1_RH_RW.to(
+                dtype=roi_BT_C_RH_RW.dtype
             )
 
         with gtp(f"{gtp_training}/roi.postprocess", group=f"{gtp_training}/roi"):
@@ -482,11 +666,19 @@ class RoiNet(nn.Module):
             )
             theta_B_T_2_3 = theta_BT_2_3.view(B, T, 2, 3)
             params_B_T_3 = params_BT_3.view(B, T, 3)
+            valid_mask_B_T_1_RH_RW = valid_mask_BT_1_RH_RW.view(
+                B,
+                T,
+                1,
+                self.roi_h,
+                self.roi_w,
+            )
 
         out = {
             "roi_B_C_T_RH_RW": roi_B_C_T_RH_RW,
             "theta_B_T_2_3": theta_B_T_2_3,
             "params_B_T_3": params_B_T_3,
+            "valid_mask_B_T_1_RH_RW": valid_mask_B_T_1_RH_RW,
         }
         if should_return_grid:
             out["grid_B_T_RH_RW_2"] = grid_BT_RH_RW_2.view(
@@ -602,5 +794,9 @@ class RoiNet(nn.Module):
             f"scale_range=({self.min_scale}, {self.max_scale}), "
             f"init_scale={self.init_scale}, "
             f"init_head_weight_std={self.init_head_weight_std}, "
-            f"detach_input_grad={self.detach_input_grad}"
+            f"init_center_raw_std={self.init_center_raw_std}, "
+            f"init_patch_logit_raw_std={self.init_patch_logit_raw_std}, "
+            f"detach_input_grad={self.detach_input_grad}, "
+            f"predict_type='{self.predict_type}', "
+            f"patchify_wh={self.patchify_wh}"
         )
