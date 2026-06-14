@@ -128,7 +128,7 @@ class RoiNet(nn.Module):
         },
     }
     _LOCATOR_TYPES = {"residual", "resnet"}
-    _PREDICT_TYPES = {"xys", "logit_scale"}
+    _PREDICT_TYPES = {"xys", "logit_scale", "logit_logit"}
     _RESNET_BLOCKS_PER_STAGE_BY_PRESET = {
         "tiny": (1, 1, 1, 1),    # ResNet-10-style: stem + 4 BasicBlock stages.
         "small": (2, 2, 2, 2),   # ResNet-18-style.
@@ -152,6 +152,7 @@ class RoiNet(nn.Module):
         init_head_weight_std: float = 1e-4,
         init_center_raw_std: Optional[float] = None,
         init_patch_logit_raw_std: Optional[float] = None,
+        init_scale_logit_raw_std: Optional[float] = None,
         detach_input_grad: bool = True,
         padding_mode: str = "border",
         align_corners: bool = False,
@@ -159,6 +160,7 @@ class RoiNet(nn.Module):
         return_features: bool = False,
         predict_type: str = "xys",
         patchify_wh: int = 16,
+        scale_num_bins: int = 64,
     ) -> None:
         super().__init__()
         if preset not in self._PRESETS:
@@ -233,6 +235,11 @@ class RoiNet(nn.Module):
             if init_patch_logit_raw_std is None
             else float(init_patch_logit_raw_std)
         )
+        self.init_scale_logit_raw_std = (
+            None
+            if init_scale_logit_raw_std is None
+            else float(init_scale_logit_raw_std)
+        )
         self.detach_input_grad = bool(detach_input_grad)
         self.padding_mode = padding_mode
         self.align_corners = bool(align_corners)
@@ -240,6 +247,7 @@ class RoiNet(nn.Module):
         self.return_features = bool(return_features)
         self.predict_type = predict_type
         self.patchify_wh = int(patchify_wh)
+        self.scale_num_bins = int(scale_num_bins)
 
         if self.base_channels <= 0:
             raise ValueError("base_channels must be positive.")
@@ -256,23 +264,30 @@ class RoiNet(nn.Module):
             and self.init_patch_logit_raw_std < 0.0
         ):
             raise ValueError("init_patch_logit_raw_std must be non-negative.")
+        if (
+            self.init_scale_logit_raw_std is not None
+            and self.init_scale_logit_raw_std < 0.0
+        ):
+            raise ValueError("init_scale_logit_raw_std must be non-negative.")
         if self.patchify_wh <= 0:
             raise ValueError("patchify_wh must be positive.")
+        if self.scale_num_bins < 2:
+            raise ValueError("scale_num_bins must be at least 2.")
         self.patch_grid_h = self.locator_input_h // self.patchify_wh
         self.patch_grid_w = self.locator_input_w // self.patchify_wh
-        if self.predict_type == "logit_scale":
+        if self.predict_type in {"logit_scale", "logit_logit"}:
             if (
                 self.locator_input_h % self.patchify_wh != 0
                 or self.locator_input_w % self.patchify_wh != 0
             ):
                 raise ValueError(
                     "locator_input_size must be divisible by patchify_wh "
-                    "when predict_type='logit_scale'."
+                    "when predict_type uses logits for center prediction."
                 )
             if self.patch_grid_h <= 0 or self.patch_grid_w <= 0:
                 raise ValueError(
                     "patchify_wh must not exceed locator_input_size "
-                    "when predict_type='logit_scale'."
+                    "when predict_type uses logits for center prediction."
                 )
         self.patch_grid_size = self.patch_grid_h * self.patch_grid_w
 
@@ -287,9 +302,14 @@ class RoiNet(nn.Module):
             nn.AdaptiveAvgPool2d(output_size=1),
             nn.Flatten(start_dim=1),
         )
-        locator_head_out_dim = (
-            3 if self.predict_type == "xys" else self.patch_grid_size + 1
-        )
+        if self.predict_type == "xys":
+            locator_head_out_dim = 3
+        elif self.predict_type == "logit_scale":
+            locator_head_out_dim = self.patch_grid_size + 1
+        elif self.predict_type == "logit_logit":
+            locator_head_out_dim = self.patch_grid_size + self.scale_num_bins
+        else:
+            raise RuntimeError(f"Unsupported predict_type {self.predict_type}.")
         self.locator_head = nn.Sequential(
             nn.Linear(self.locator_feature_dim, self.hidden_dim),
             nn.SiLU(inplace=True),
@@ -298,6 +318,11 @@ class RoiNet(nn.Module):
         self.register_buffer(
             "_patch_centers_G_2",
             self._make_patch_centers(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_scale_bins_S",
+            self._make_scale_bins(),
             persistent=False,
         )
         self._init_locator_head()
@@ -388,6 +413,39 @@ class RoiNet(nn.Module):
         grid_y, grid_x = torch.meshgrid(y_centers, x_centers, indexing="ij")
         return torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2)
 
+    def _make_scale_bins(self) -> torch.Tensor:
+        return torch.linspace(
+            self.min_scale,
+            self.max_scale,
+            steps=self.scale_num_bins,
+            dtype=torch.float32,
+        )
+
+    def _make_scale_init_logits(self) -> torch.Tensor:
+        if self.max_scale == self.min_scale:
+            return torch.zeros(self.scale_num_bins, dtype=torch.float32)
+
+        scale_ratio = (self.init_scale - self.min_scale) / (
+            self.max_scale - self.min_scale
+        )
+        positions = torch.linspace(0.0, 1.0, steps=self.scale_num_bins)
+        centered_positions = positions - positions.mean()
+        if abs(scale_ratio - 0.5) < 1e-6:
+            return torch.zeros_like(positions)
+
+        low = -200.0
+        high = 200.0
+        for _ in range(80):
+            mid = (low + high) * 0.5
+            probs = torch.softmax(centered_positions * mid, dim=0)
+            mean = torch.sum(probs * positions).item()
+            if mean < scale_ratio:
+                low = mid
+            else:
+                high = mid
+        slope = (low + high) * 0.5
+        return centered_positions * slope
+
     def _init_locator_head(self) -> None:
         last_linear = self.locator_head[-1]
 
@@ -405,7 +463,7 @@ class RoiNet(nn.Module):
                         mean=0.0,
                         std=center_weight_std,
                     )
-            elif self.predict_type == "logit_scale":
+            elif self.predict_type in {"logit_scale", "logit_logit"}:
                 patch_logit_weight_std = self._resolve_head_weight_std(
                     self.init_patch_logit_raw_std
                 )
@@ -415,18 +473,36 @@ class RoiNet(nn.Module):
                         mean=0.0,
                         std=patch_logit_weight_std,
                     )
+                if self.predict_type == "logit_logit":
+                    scale_logit_weight_std = self._resolve_head_weight_std(
+                        self.init_scale_logit_raw_std
+                    )
+                    if scale_logit_weight_std > 0.0:
+                        nn.init.normal_(
+                            last_linear.weight[self.patch_grid_size :],
+                            mean=0.0,
+                            std=scale_logit_weight_std,
+                        )
             else:
                 raise RuntimeError(f"Unsupported predict_type {self.predict_type}.")
 
             if self.max_scale > self.min_scale:
-                init_scale_ratio = (
-                    (self.init_scale - self.min_scale)
-                    / (self.max_scale - self.min_scale)
-                )
-                scale_bias_idx = 2 if self.predict_type == "xys" else -1
-                last_linear.bias[scale_bias_idx] = math.log(
-                    init_scale_ratio / (1.0 - init_scale_ratio)
-                )
+                if self.predict_type == "logit_logit":
+                    last_linear.bias[self.patch_grid_size :] = (
+                        self._make_scale_init_logits().to(
+                            device=last_linear.bias.device,
+                            dtype=last_linear.bias.dtype,
+                        )
+                    )
+                else:
+                    init_scale_ratio = (
+                        (self.init_scale - self.min_scale)
+                        / (self.max_scale - self.min_scale)
+                    )
+                    scale_bias_idx = 2 if self.predict_type == "xys" else -1
+                    last_linear.bias[scale_bias_idx] = math.log(
+                        init_scale_ratio / (1.0 - init_scale_ratio)
+                    )
 
     def _resolve_head_weight_std(self, raw_std: Optional[float]) -> float:
         if raw_std is None:
@@ -479,6 +555,31 @@ class RoiNet(nn.Module):
         scale_BT = self._constrain_raw_scale(raw_scale_BT)
         return torch.cat((centers_BT_2, scale_BT.unsqueeze(-1)), dim=-1)
 
+    def _constrain_logit_logit_params(
+        self,
+        raw_logit_logit_BT_GS: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_dim = self.patch_grid_size + self.scale_num_bins
+        if raw_logit_logit_BT_GS.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Expected raw logit_logit params with last dimension {expected_dim}."
+            )
+
+        center_logits_BT_G = raw_logit_logit_BT_GS[:, : self.patch_grid_size]
+        scale_logits_BT_S = raw_logit_logit_BT_GS[:, self.patch_grid_size :]
+
+        center_probs_BT_G = torch.softmax(center_logits_BT_G, dim=-1)
+        centers_BT_2 = center_probs_BT_G @ self._patch_centers_G_2.to(
+            device=raw_logit_logit_BT_GS.device,
+            dtype=raw_logit_logit_BT_GS.dtype,
+        )
+        scale_probs_BT_S = torch.softmax(scale_logits_BT_S, dim=-1)
+        scale_BT = scale_probs_BT_S @ self._scale_bins_S.to(
+            device=raw_logit_logit_BT_GS.device,
+            dtype=raw_logit_logit_BT_GS.dtype,
+        )
+        return torch.cat((centers_BT_2, scale_BT.unsqueeze(-1)), dim=-1)
+
     def _constrain_raw_head_output(
         self,
         raw_head_output_BT_D: torch.Tensor,
@@ -487,6 +588,8 @@ class RoiNet(nn.Module):
             return self._constrain_raw_params(raw_head_output_BT_D)
         if self.predict_type == "logit_scale":
             return self._constrain_logit_scale_params(raw_head_output_BT_D)
+        if self.predict_type == "logit_logit":
+            return self._constrain_logit_logit_params(raw_head_output_BT_D)
         raise RuntimeError(f"Unsupported predict_type {self.predict_type}.")
 
     @staticmethod
@@ -796,7 +899,9 @@ class RoiNet(nn.Module):
             f"init_head_weight_std={self.init_head_weight_std}, "
             f"init_center_raw_std={self.init_center_raw_std}, "
             f"init_patch_logit_raw_std={self.init_patch_logit_raw_std}, "
+            f"init_scale_logit_raw_std={self.init_scale_logit_raw_std}, "
             f"detach_input_grad={self.detach_input_grad}, "
             f"predict_type='{self.predict_type}', "
-            f"patchify_wh={self.patchify_wh}"
+            f"patchify_wh={self.patchify_wh}, "
+            f"scale_num_bins={self.scale_num_bins}"
         )
