@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import builtins, types, inspect
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import pathlib
 import dill
 import copy
@@ -30,6 +30,8 @@ from robomimic.models.base_nets import VisualCore
 from robomimic.models.base_nets import ResNet18Conv, SpatialSoftmax
 import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
+
+from robokit.debug_utils.time_profiler import global_time_profiler as gtp
 
 
 # Copied from: video2world_force_dit.py
@@ -62,7 +64,16 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                  eval_fixed_crop=False,
                  roi_net=None,
                  roi_area_loss_weight: float = 0.01,
+                 roi_area_loss_weight_increase_ratio: Optional[float] = None,
+                 roi_area_loss_weight_increase_per_steps: Optional[int] = None,
+                 roi_area_loss_weight_max: float = 0.01,
+                 roi_center_diversity_loss_weight: float = 0.0,
+                 roi_center_diversity_margin: float = 0.25,
                  p_drop_full_image: float = 0.3,
+                 concat_roi: bool = False,
+                 use_image_roi_only: bool = False,
+                 roi_coord_conv: bool = False,
+                 roi_coord_conv_detach: bool = True,
                  # arch
                  n_layer=8,
                  n_cond_layers=0,
@@ -91,12 +102,79 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                  **kwargs):
         super().__init__()
 
+        shape_meta = OmegaConf.to_container(shape_meta, resolve=True) \
+            if isinstance(shape_meta, DictConfig) else copy.deepcopy(shape_meta)
+        concat_roi = bool(concat_roi)
+        use_image_roi_only = bool(use_image_roi_only)
+        roi_coord_conv = bool(roi_coord_conv)
+        roi_coord_conv_detach = bool(roi_coord_conv_detach)
+        obs_shape_meta = shape_meta['obs']
+        encoder_shape_meta = copy.deepcopy(shape_meta)
+        if roi_coord_conv and concat_roi:
+            raise ValueError("`roi_coord_conv=True` is not supported with `concat_roi=True`.")
+        if 'image_roi' in obs_shape_meta:
+            roi_shape = list(obs_shape_meta['image_roi']['shape'])
+            if len(roi_shape) != 3:
+                raise ValueError(
+                    "`image_roi` shape must be [C, H, W]. "
+                    f"Got image_roi={roi_shape}."
+                )
+            encoder_shape_meta['obs']['image_roi']['shape'] = [
+                roi_shape[0] + 1,
+                roi_shape[1],
+                roi_shape[2],
+            ]
+        if roi_coord_conv:
+            if 'image_roi' not in obs_shape_meta:
+                raise ValueError("`roi_coord_conv=True` requires `image_roi` in shape_meta['obs'].")
+            roi_shape = list(obs_shape_meta['image_roi']['shape'])
+            encoder_shape_meta['obs']['image_roi']['shape'] = [
+                roi_shape[0] + 3,
+                roi_shape[1],
+                roi_shape[2],
+            ]
+        if use_image_roi_only:
+            if 'image' not in obs_shape_meta or 'image_roi' not in obs_shape_meta:
+                raise ValueError(
+                    "`use_image_roi_only=True` requires `image` and `image_roi` in shape_meta['obs']. "
+                    "`image` is still used to generate ROI crops."
+                )
+            if 'image' in encoder_shape_meta['obs']:
+                del encoder_shape_meta['obs']['image']
+        elif concat_roi:
+            if 'image' not in obs_shape_meta or 'image_roi' not in obs_shape_meta:
+                raise ValueError("`concat_roi=True` requires `image` and `image_roi` in shape_meta['obs'].")
+
+            image_shape = list(obs_shape_meta['image']['shape'])
+            roi_shape = list(obs_shape_meta['image_roi']['shape'])
+            if len(image_shape) != 3 or len(roi_shape) != 3:
+                raise ValueError(
+                    "`concat_roi=True` expects `image` and `image_roi` shapes to be [C, H, W]. "
+                    f"Got image={image_shape}, image_roi={roi_shape}."
+                )
+            if image_shape[:2] != roi_shape[:2]:
+                raise ValueError(
+                    "`concat_roi=True` requires `image` and `image_roi` to have matching C and H. "
+                    f"Got image={image_shape}, image_roi={roi_shape}."
+                )
+
+            encoder_shape_meta['obs']['image']['shape'] = [
+                image_shape[0] + 1,
+                image_shape[1],
+                image_shape[2] + roi_shape[2],
+            ]
+            del encoder_shape_meta['obs']['image_roi']
+
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
         assert len(action_shape) == 1
         action_dim = action_shape[0]
-        obs_shape_meta = shape_meta['obs']
         self.obs_shape_meta = obs_shape_meta
+        self.encoder_obs_shape_meta = encoder_shape_meta['obs']
+        self.concat_roi = concat_roi
+        self.use_image_roi_only = use_image_roi_only
+        self.roi_coord_conv = roi_coord_conv
+        self.roi_coord_conv_detach = roi_coord_conv_detach
         obs_config = {
             'low_dim': [],
             'rgb': [],
@@ -104,7 +182,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             'scan': []
         }
         obs_key_shapes = dict()
-        for key, attr in obs_shape_meta.items():
+        for key, attr in self.encoder_obs_shape_meta.items():
             shape = attr['shape']
             obs_key_shapes[key] = list(shape)
 
@@ -142,6 +220,13 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         # init global state
         ObsUtils.initialize_obs_utils_with_config(config)
         print("[DEBUG] ObsUtils initialized with:", config.observation.modalities.obs)
+        print(
+            "[DEBUG] concat_roi:", self.concat_roi,
+            "use_image_roi_only:", self.use_image_roi_only,
+            "roi_coord_conv:", self.roi_coord_conv,
+            "roi_coord_conv_detach:", self.roi_coord_conv_detach,
+            "obs_key_shapes:", obs_key_shapes,
+        )
 
         # load model
         policy: PolicyAlgo = algo_factory(
@@ -246,9 +331,42 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         self.pretrained_ckpt = None
         self.roi_area_loss_weight = float(roi_area_loss_weight)
+        self.roi_center_diversity_loss_weight = float(roi_center_diversity_loss_weight)
+        self.roi_center_diversity_margin = float(roi_center_diversity_margin)
+        if self.roi_center_diversity_loss_weight < 0.0:
+            raise ValueError("`roi_center_diversity_loss_weight` must be non-negative.")
+        if self.roi_center_diversity_margin < 0.0:
+            raise ValueError("`roi_center_diversity_margin` must be non-negative.")
+        self.roi_area_loss_weight_increase_ratio = (
+            None if roi_area_loss_weight_increase_ratio is None
+            else float(roi_area_loss_weight_increase_ratio)
+        )
+        self.roi_area_loss_weight_increase_per_steps = (
+            None if roi_area_loss_weight_increase_per_steps is None
+            else int(roi_area_loss_weight_increase_per_steps)
+        )
+        if (
+                (self.roi_area_loss_weight_increase_ratio is None)
+                != (self.roi_area_loss_weight_increase_per_steps is None)
+        ):
+            raise ValueError(
+                "`roi_area_loss_weight_increase_ratio` and "
+                "`roi_area_loss_weight_increase_per_steps` must be set together."
+            )
+        if (
+                self.roi_area_loss_weight_increase_per_steps is not None
+                and self.roi_area_loss_weight_increase_per_steps <= 0
+        ):
+            raise ValueError("`roi_area_loss_weight_increase_per_steps` must be > 0.")
+        self.roi_area_loss_weight_max = roi_area_loss_weight_max
+        self._roi_area_loss_step = 0
+        self._effective_roi_area_loss_weight = min(
+            self.roi_area_loss_weight,
+            self.roi_area_loss_weight_max,
+        )
         self.p_drop_full_image = float(p_drop_full_image)
-        image_shape = obs_key_shapes['image']
-        roi_shape = obs_key_shapes['image_roi']
+        image_shape = list(self.obs_shape_meta['image']['shape'])
+        roi_shape = list(self.obs_shape_meta['image_roi']['shape'])
         if roi_net is None:
             roi_net = RoiNet(in_channels=image_shape[0], roi_size=roi_shape[1:])
         elif isinstance(roi_net, (dict, DictConfig)):
@@ -700,11 +818,20 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         image_B_T_C_H_W = obs_dict["image"]
         roi_input_B_C_T_H_W = rearrange(image_B_T_C_H_W, "b t c h w -> b c t h w")
-        roi_out = self.roi_net(roi_input_B_C_T_H_W)
+        roi_out = self.roi_net(
+            roi_input_B_C_T_H_W,
+            return_grid=self.roi_coord_conv,
+        )
 
         image_roi_B_T_C_H_W = rearrange(
             roi_out["roi_B_C_T_RH_RW"],
             "b c t h w -> b t c h w",
+        )
+        image_roi_B_T_C_H_W = torch.cat(
+            [image_roi_B_T_C_H_W, roi_out["valid_mask_B_T_1_RH_RW"].to(
+                dtype=image_roi_B_T_C_H_W.dtype,
+            )],
+            dim=2,
         )
         generated_obs = {
             "image": self._maybe_drop_full_image(
@@ -716,6 +843,73 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         for key in self.obs_shape_meta:
             dp_obs[key] = generated_obs[key] if key in generated_obs else obs_dict[key]
         return dp_obs, roi_out
+
+    def _append_roi_coord_channels(
+            self,
+            image_roi_B_T_C_H_W: torch.Tensor,
+            roi_out: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if "grid_B_T_RH_RW_2" not in roi_out:
+            raise KeyError(
+                "`roi_coord_conv=True` requires RoiNet output `grid_B_T_RH_RW_2`."
+            )
+        roi_coord_B_T_2_H_W = roi_out["grid_B_T_RH_RW_2"].permute(
+            0,
+            1,
+            4,
+            2,
+            3,
+        ).contiguous()
+        if self.roi_coord_conv_detach:
+            roi_coord_B_T_2_H_W = roi_coord_B_T_2_H_W.detach()
+        return torch.cat([image_roi_B_T_C_H_W, roi_coord_B_T_2_H_W], dim=2)
+
+    @staticmethod
+    def _append_full_image_valid_mask(
+            image_B_T_C_H_W: torch.Tensor,
+    ) -> torch.Tensor:
+        valid_mask_B_T_1_H_W = torch.ones(
+            *image_B_T_C_H_W.shape[:2],
+            1,
+            *image_B_T_C_H_W.shape[-2:],
+            device=image_B_T_C_H_W.device,
+            dtype=image_B_T_C_H_W.dtype,
+        )
+        return torch.cat([image_B_T_C_H_W, valid_mask_B_T_1_H_W], dim=2)
+
+    def _prepare_obs_encoder_input(
+            self,
+            obs_dict: Dict[str, torch.Tensor],
+            roi_out: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if self.roi_coord_conv:
+            if roi_out is None:
+                raise ValueError("`roi_out` is required when `roi_coord_conv=True`.")
+            obs_dict = dict(obs_dict)
+            obs_dict["image_roi"] = self._append_roi_coord_channels(
+                obs_dict["image_roi"],
+                roi_out,
+            )
+
+        if self.use_image_roi_only:
+            return {key: obs_dict[key] for key in self.encoder_obs_shape_meta}
+
+        if not self.concat_roi:
+            return obs_dict
+
+        obs_encoder_input = {}
+        for key in self.encoder_obs_shape_meta:
+            if key == "image":
+                image_B_T_C_H_W = self._append_full_image_valid_mask(
+                    obs_dict["image"]
+                )
+                obs_encoder_input[key] = torch.cat(
+                    [image_B_T_C_H_W, obs_dict["image_roi"]],
+                    dim=-1,
+                )
+            else:
+                obs_encoder_input[key] = obs_dict[key]
+        return obs_encoder_input
 
     def conditional_sample(self,
                            condition_data, condition_mask,
@@ -761,8 +955,9 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         """
         assert 'past_action' not in obs_dict  # not implemented yet
         # normalize input
-        roi_obs, _ = self._build_roi_obs(obs_dict)
+        roi_obs, roi_out = self._build_roi_obs(obs_dict)
         nobs = self.normalizer.normalize(roi_obs)
+        encoder_nobs = self._prepare_obs_encoder_input(nobs, roi_out=roi_out)
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -779,7 +974,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         cond_data = None
         cond_mask = None
         if self.obs_as_cond:
-            this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
+            this_nobs = dict_apply(encoder_nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, To, Do
             cond = nobs_features.reshape(B, To, -1)
@@ -790,7 +985,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
-            this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
+            this_nobs = dict_apply(encoder_nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, To, Do
             nobs_features = nobs_features.reshape(B, To, -1)
@@ -862,11 +1057,29 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         )
         return optimizer
 
+    def set_roi_area_loss_step(self, global_step: int) -> None:
+        self._roi_area_loss_step = int(global_step)
+        if self.roi_area_loss_weight_increase_ratio is None:
+            self._effective_roi_area_loss_weight = min(
+                self.roi_area_loss_weight,
+                self.roi_area_loss_weight_max,
+            )
+            return
+
+        stage = self._roi_area_loss_step // self.roi_area_loss_weight_increase_per_steps
+        self._effective_roi_area_loss_weight = min(
+            self.roi_area_loss_weight + self.roi_area_loss_weight_increase_ratio * stage,
+            self.roi_area_loss_weight_max,
+        )
+
     def compute_loss(self, batch, return_roi_params: bool = False) -> Dict[str, torch.Tensor]:
         # normalize input
         assert 'valid_mask' not in batch
+        gtp_open = self.training
+        gtp_training = "train" if self.training else "val"
         roi_obs, roi_out = self._build_roi_obs(batch['obs'])
         nobs = self.normalizer.normalize(roi_obs)
+        encoder_nobs = self._prepare_obs_encoder_input(nobs, roi_out=roi_out)
         nactions = self.normalizer['action'].normalize(batch['action'])
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
@@ -877,9 +1090,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         trajectory = nactions
         if self.obs_as_cond:  # default: go here
             # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs,
+            this_nobs = dict_apply(encoder_nobs,
                                    lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            with gtp(f"{gtp_training}/obs_enc.forward", group=f"{gtp_training}/obs_enc"):
+                nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             cond = nobs_features.reshape(batch_size, To, -1)
             if self.pred_action_steps_only:
@@ -888,7 +1102,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                 trajectory = nactions[:, start:end]
         else:
             # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
+            this_nobs = dict_apply(encoder_nobs, lambda x: x.reshape(-1, *x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
@@ -920,7 +1134,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
 
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, cond)
+        with gtp(f"{gtp_training}/action.forward", group=f"{gtp_training}/action"):
+            pred = self.model(noisy_trajectory, timesteps, cond)
 
         pred_type = self.noise_scheduler.config.prediction_type
         if pred_type == 'epsilon':
@@ -939,13 +1154,29 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         if self.obs_as_cond:
             roi_params = roi_params[:, :To]
         roi_area_loss = self.roi_net.area_loss(roi_params)
-        roi_area_weighted_loss = self.roi_area_loss_weight * roi_area_loss
-        total_loss = diffusion_loss + roi_area_weighted_loss
+        effective_roi_area_loss_weight = self._effective_roi_area_loss_weight
+        roi_area_weighted_loss = effective_roi_area_loss_weight * roi_area_loss
+        roi_center_diversity_loss = self.roi_net.center_diversity_loss(
+            roi_params,
+            margin=self.roi_center_diversity_margin,
+        )
+        roi_center_diversity_weighted_loss = (
+            self.roi_center_diversity_loss_weight * roi_center_diversity_loss
+        )
+        total_loss = (
+            diffusion_loss
+            + roi_area_weighted_loss
+            + roi_center_diversity_weighted_loss
+        )
 
         losses = {
             "diffusion_loss": diffusion_loss,
             "roi_area_loss": roi_area_loss,
+            "roi_area_loss_weight": effective_roi_area_loss_weight,
             "roi_area_weighted_loss": roi_area_weighted_loss,
+            "roi_center_diversity_loss": roi_center_diversity_loss,
+            "roi_center_diversity_loss_weight": self.roi_center_diversity_loss_weight,
+            "roi_center_diversity_weighted_loss": roi_center_diversity_weighted_loss,
             "total_loss": total_loss,
         }
         if return_roi_params:
