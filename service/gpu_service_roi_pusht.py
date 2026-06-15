@@ -30,12 +30,10 @@ conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
 export CKPT_INDEX=-2
-LOG_TIME=2026.05.31-12.58.06 CUDA_VISIBLE_DEVICES=6 uvicorn service.gpu_service_roi_pusht:gpu_app --port 7076
+LOG_TIME=2026.06.07-15.05.23 CUDA_VISIBLE_DEVICES=6 uvicorn service.gpu_service_roi_pusht:gpu_app --port 7076
 """
 gpu_app = FastAPI()
-SERVICE_CONFIG_PATH = os.environ.get("ROI_DP_SERVICE_CONFIG", "configs/pusht256_roi_dp.yaml")
 ROI_DP_LOG_TIME = os.environ.get("LOG_TIME", os.environ.get("ROI_DP_LOG_TIME", "")).strip()
-ROI_DP_USE_EMA = os.environ.get("ROI_DP_USE_EMA", "1").strip().lower() not in {"0", "false", "no"}
 ROI_DP_CKPT_INDEX = int(os.environ.get("CKPT_INDEX", os.environ.get("ROI_DP_CKPT_INDEX", "-2")))
 max_cache_action = int(os.environ.get("ROI_DP_MAX_CACHE_ACTION", "8"))
 
@@ -52,18 +50,35 @@ def _resolve_indexed_ckpt(ckpt_dir: Path) -> str:
     return str(ckpt_paths[idx])
 
 
-def _resolve_checkpoint_path() -> str:
+def _resolve_train_dir_from_log_time() -> Path:
     if ROI_DP_LOG_TIME:
         log_time_dir = str(ROI_DP_LOG_TIME).replace('-', '/')
-        train_dir = Path(f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time_dir}_train_diffusion_transformer_hybrid_pusht256")
-        ckpt_dir = train_dir / "checkpoints"
-        if not ckpt_dir.exists():
-            raise FileNotFoundError(f"ROI_DP_LOG_TIME resolved checkpoint dir does not exist: {ckpt_dir}")
-        return _resolve_indexed_ckpt(ckpt_dir)
+        return Path(
+            f"/home/geyuan/code/dp23rss_fork/data/outputs/"
+            f"{log_time_dir}_train_diffusion_transformer_hybrid_pusht256"
+        )
 
     raise FileNotFoundError(
-        "Please set one of `ROI_DP_CKPT_PATH`, `ROI_DP_LOG_TIME`, or `ROI_DP_TRAIN_DIR` for the ROI PushT service."
+        "Please set `LOG_TIME` or `ROI_DP_LOG_TIME` for the ROI PushT service."
     )
+
+
+def _resolve_hydra_config_path() -> str:
+    train_dir = _resolve_train_dir_from_log_time()
+    config_path = train_dir / ".hydra" / "config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"ROI_DP_LOG_TIME resolved hydra config does not exist: {config_path}"
+        )
+    return str(config_path)
+
+
+def _resolve_checkpoint_path() -> str:
+    train_dir = _resolve_train_dir_from_log_time()
+    ckpt_dir = train_dir / "checkpoints"
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(f"ROI_DP_LOG_TIME resolved checkpoint dir does not exist: {ckpt_dir}")
+    return _resolve_indexed_ckpt(ckpt_dir)
 
 # NO Need to: Load dataset statistics and save to train_project_dir if not exists
 
@@ -82,9 +97,10 @@ dataset_states_min = np.array([0, 0], dtype=np.float32)
 
 
 @lru_cache()
-def get_agent(device: str, use_ema: bool = ROI_DP_USE_EMA):
+def get_agent(device: str):
     # 1. Load hydra config
-    hydra_config = OmegaConf.load(SERVICE_CONFIG_PATH)
+    hydra_config_path = _resolve_hydra_config_path()
+    hydra_config = OmegaConf.load(hydra_config_path)
     model = hydra.utils.instantiate(hydra_config.policy)
     print(type(model))
 
@@ -94,9 +110,12 @@ def get_agent(device: str, use_ema: bool = ROI_DP_USE_EMA):
         weight_path = _resolve_checkpoint_path()
     weight_path = str(weight_path)
 
-    model.load_weight_from_ckpt(weight_path, use_ema=use_ema)
+    model.load_weight_from_ckpt(weight_path, use_ema=True)
     model = model.to(device).eval()
-    print(f"[get_agent] model loaded from: {weight_path}, use_ema={use_ema}")
+    print(
+        f"[get_agent] config loaded from: {hydra_config_path}; "
+        f"model loaded from: {weight_path}, use_ema=True"
+    )
 
     # 3. Other settings
     model.infer_frame_idx = 0
@@ -146,6 +165,7 @@ def model_step(step_request: StepRequestFromEvaluator):
     B, Ts, D_state = tcp_state.shape
     T_cond = int(hydra_config.n_obs_steps)
     gt_video = torch.from_numpy(gt_video).float() / 127.5 - 1.  # (B,V*Ts,H,W,3), in [-1,1]
+    gt_video_B_T_C_H_W = gt_video.permute(0, 1, 4, 2, 3).contiguous()  # (B,Ts,C,H,W), V=1
     gt_view0_B_T_C_H_W = gt_video[:, -T_cond:].permute(0, 1, 4, 2, 3)  # (B,T,C,H,W), single view for now
 
     tcp_pose_B_T_D = tcp_state[:, -T_cond:, :].astype(np.float32)  # (B,T,2), in [0,512]
@@ -170,6 +190,9 @@ def model_step(step_request: StepRequestFromEvaluator):
     with torch.no_grad():  # always enter
         action_pred = agent.predict_action(obs_dict)["action_pred"]
         action = action_pred[:, :]  # keep batch_dim, (B,T,D)
+        roi_input_B_C_T_H_W = gt_video_B_T_C_H_W.to("cuda").permute(0, 2, 1, 3, 4).contiguous()
+        roi_out = agent.roi_net(roi_input_B_C_T_H_W, return_grid=False)
+        roi_param = roi_out["params_B_T_3"].detach().cpu().numpy().astype(np.float32)  # (B,Ts,3)
 
     # 3.b Postprocess
     # print(action.shape, action.min(dim=0)[0], action.max(dim=0)[0])
@@ -183,17 +206,21 @@ def model_step(step_request: StepRequestFromEvaluator):
     agent.infer_frame_idx += 1
     # return {"action": cache_action.detach().numpy().tolist()}
     out_action = cache_action[:, :, :].numpy()  # (B,T,D)
+    if roi_param.shape[:2] != out_action.shape[:2]:
+        raise ValueError(
+            f"roi_param B,T should match action B,T for StepRequestFromPolicy, "
+            f"got {roi_param.shape[:2]} vs {out_action.shape[:2]}"
+        )
     print("[DEBUG] gpu_service output action shape:", out_action.shape)
-    request_to_evaluator = StepRequestFromPolicy.encode_from_raw(action=out_action)
+    print("[DEBUG] gpu_service output roi_param shape:", roi_param.shape)
+    request_to_evaluator = StepRequestFromPolicy.encode_from_raw(
+        action=out_action,
+        extra_vector={"roi_param": roi_param},
+        max_cache_action=_get_effective_max_cache_action(hydra_config),
+    )
     return request_to_evaluator.model_dump(mode="json")
 
 
 if __name__ == "__main__":
     agent = get_agent("cuda")
     print(f"[gpu_service_roi_pusht] ready with max_cache_action={max_cache_action}")
-"""
-Usage:
-  export ROI_DP_LOG_TIME=2026.04.16-17.04.04
-  export ROI_DP_CKPT_INDEX=-2
-  CUDA_VISIBLE_DEVICES=6 uvicorn service.gpu_service_roi_pusht:gpu_app --port 7076
-"""
