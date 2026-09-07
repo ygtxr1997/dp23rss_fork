@@ -215,7 +215,7 @@ task:
   name: pusht_image
   shape_meta: ${shape_meta}
 task_name: pusht_image
-#pretrained_ckpt: "data/outputs/2026.04.27/01.29.21_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+pretrained_ckpt: "data/outputs/2026.04.27/01.29.21_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
 training:
   checkpoint_every: 200  # ori:50
   debug: false

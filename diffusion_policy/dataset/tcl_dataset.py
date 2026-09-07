@@ -4,7 +4,7 @@ import bisect
 import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import List
+from typing import List, Optional, Union
 from torch.utils.data import ConcatDataset
 from torchvision.transforms import transforms
 
@@ -13,58 +13,14 @@ from robokit.debug_utils.printer import print_batch
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
+from diffusion_policy.dataset.libero_dataset import RandomShiftsAug as LiberoRandomShiftsAug, VideoTransformTHWC
 
 
-# source: https://github.com/facebookresearch/drqv2/blob/main/drqv2.py
-class RandomShiftsAug(torch.nn.Module):
-    def __init__(self, pad):
-        super().__init__()
-        self.pad = pad
-
-    def forward(self, x_B_C_H_W: torch.Tensor) -> torch.Tensor:
-        input_ndim = x_B_C_H_W.ndim
-        if input_ndim == 3:
-            x_B_C_H_W = x_B_C_H_W.unsqueeze(0)
-
-        x = x_B_C_H_W.float()
-        n, c, h, w = x.size()
-
-        # 1. 对图像进行填充
-        padding = tuple([self.pad] * 4)
-        x_padded = F.pad(x, padding, "replicate")
-
-        # 2. 创建一个标准化的坐标网格 ([-1, 1])
-        # 这个网格对应于原始图像尺寸 (h, w)
-        arange_h = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype)
-        arange_w = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype)
-
-        # 使用 meshgrid 创建一个 (h, w, 2) 的网格
-        grid_h, grid_w = torch.meshgrid(arange_h, arange_w, indexing='ij')
-        base_grid = torch.stack((grid_w, grid_h), dim=-1)  # (x, y) 坐标
-        base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)  # 扩展到批次维度 (n, h, w, 2)
-
-        # 3. 生成单个随机位移，并将其应用于所有帧
-        # 在填充后的像素空间中生成随机整数位移
-        # 将 size 的第一个维度从 n 改为 1，以确保所有帧使用相同的位移
-        shift_xy = torch.randint(0, 2 * self.pad + 1, size=(1, 1, 1, 2), device=x.device, dtype=x.dtype)
-
-        # 4. 将像素位移转换为 [-1, 1] 坐标空间的位移
-        # 注意：h 和 w 的缩放因子不同
-        shift_w = shift_xy[..., 0] * 2.0 / (w + 2 * self.pad)
-        shift_h = shift_xy[..., 1] * 2.0 / (h + 2 * self.pad)
-        shift = torch.stack((shift_w, shift_h), dim=-1)
-
-        # 5. 将位移应用到基础网格上
-        # shift 的形状是 (1, 1, 1, 2)，会自动广播到 base_grid 的 (n, h, w, 2)
-        grid = base_grid + shift
-
-        # 6. 使用 grid_sample 进行采样
-        grid_B_C_H_W = F.grid_sample(x_padded, grid, padding_mode="zeros", align_corners=False)
-
-        if input_ndim == 3:
-            grid_B_C_H_W = grid_B_C_H_W[0]  # (B,C,H,W) -> (C,H,W)
-
-        return grid_B_C_H_W
+class RandomShiftsAug(LiberoRandomShiftsAug):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            return super().forward(x.unsqueeze(0))[0]
+        return super().forward(x)
 
 
 class TCLImageDataset(BaseImageDataset):
@@ -80,6 +36,8 @@ class TCLImageDataset(BaseImageDataset):
                  norm_force_type: str = "quantile",
                  zero_force: bool = False,
                  p_camera_drop: float = 0.,
+                 p_cond_drop: float = 0.,
+                 default_success_label: Optional[int] = None,
                  # Others
                  seed: int = 42,
                  val_ratio: float = 0.02,
@@ -98,6 +56,9 @@ class TCLImageDataset(BaseImageDataset):
         self.norm_force_type = norm_force_type
         self.zero_force = zero_force
         self.p_camera_drop = p_camera_drop
+        self.p_cond_drop = p_cond_drop
+        self.default_success_label = default_success_label
+        self.use_success_label = "success" in self.shape_meta["obs"]
 
         self.load_keys = ["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text", "force_torque"]
         self.h5_path = h5_path
@@ -171,7 +132,8 @@ class TCLImageDataset(BaseImageDataset):
 
         print(f"[diffusion_policy.dataset.TCLImageDataset] dataset loaded, "
               f"action_min={self.dataset_action_min}, action_max={self.dataset_action_max}, "
-              f"zero_force={self.zero_force}, p_camera_drop={self.p_camera_drop}.")
+              f"zero_force={self.zero_force}, p_camera_drop={self.p_camera_drop}, "
+              f"p_cond_drop={self.p_cond_drop}, default_success_label={self.default_success_label}.")
 
     def get_validation_dataset(self) -> 'TCLImageDataset':
         return self.create_val_dataset(self)
@@ -186,6 +148,9 @@ class TCLImageDataset(BaseImageDataset):
             shape_meta=instance.shape_meta,
             norm_force_type=instance.norm_force_type,
             zero_force=instance.zero_force,
+            p_camera_drop=0.0,
+            p_cond_drop=0.0,
+            default_success_label=instance.default_success_label,
             seed=instance.seed,
             val_ratio=instance.val_ratio,
             max_train_episodes=instance.max_train_episodes,
@@ -253,16 +218,13 @@ class TCLImageDataset(BaseImageDataset):
         start_idx = rel_now_idx
         end_idx = rel_now_idx + self.horizon
         rel_indices = list(range(start_idx, end_idx))
-        return [self._rel_idx_to_abs_idx(rel_id, task_id) for rel_id in rel_indices]
+        abs_indices = [self._rel_idx_to_abs_idx(rel_id, task_id) for rel_id in rel_indices]
+        action_len = len(self.all_rel_actions)  # edge safety
+        return [idx if (idx is None or idx < action_len) else None for idx in abs_indices]
 
-    def _get_obs_data(self, abs_idx: int):
+    def _get_obs_data_deprecated(self, abs_idx: int):
         task_id = self.map_index_to_task_id[abs_idx]
         abs_obs_indices = self._get_abs_obs_indices(abs_idx)
-        # print(f"[DEBUG] _get_obs_data: abs_idx={abs_idx}, task_id={task_id}, "
-        #       f"task_1st_ep={self.task_prefix_lengths[task_id]}, "
-        #       f"task_last_ep={self.task_prefix_lengths[task_id] + self.task_lengths[task_id]}"
-        #       )
-        # print(f"[DEBUG] _get_obs_data: abs_obs_indices={abs_obs_indices} ")
         obs_keys = self.shape_meta["obs"].keys()
         obs_data = {
             k: [] for k in obs_keys
@@ -314,14 +276,68 @@ class TCLImageDataset(BaseImageDataset):
         # obs_data["joint_state"] = torch.stack(obs_data["joint_state"])  # (T,6)
         return obs_data
 
-    def _get_act_data(self, abs_idx: int):
+    def _get_obs_data(self, abs_idx: int):
+        abs_obs_indices = self._get_abs_obs_indices(abs_idx)
+        obs_keys = self.shape_meta["obs"].keys()
+        batch = self.tcl_dataset.get_item_by_indices(abs_obs_indices)
+
+        obs_data = {k: [] for k in obs_keys}
+        for t in range(len(abs_obs_indices)):
+            primary_rgb = batch["primary_rgb"][t]
+            gripper_rgb = batch["gripper_rgb"][t] if "gripper" in obs_keys else None
+            tcp_pose = batch["robot_obs"][t][:6]
+
+            primary_rgb = self.obs_image_transform(primary_rgb)
+            primary_rgb = primary_rgb * 2. - 1.
+
+            tcp_pose = torch.from_numpy(tcp_pose).to(torch.float32)
+
+            if "gripper" in obs_keys:
+                gripper_rgb = self.obs_image_transform(gripper_rgb)
+                gripper_rgb = gripper_rgb * 2. - 1.
+
+            if "force" in obs_keys:
+                force_torque = batch["force_torque"][t]
+                force_torque = self.norm_state_or_force(
+                    force_torque,
+                    self.norm_force_type,
+                    self.dataset_stats["force_torque"],
+                )
+                force_torque = torch.from_numpy(force_torque).to(torch.float32)
+
+            drop_all_cond = bool(torch.rand(1).item() < self.p_cond_drop)
+            if torch.rand(1).item() < self.p_camera_drop:
+                primary_rgb = torch.zeros_like(primary_rgb)
+            if "gripper" in obs_keys and torch.rand(1).item() < self.p_camera_drop:
+                gripper_rgb = torch.zeros_like(gripper_rgb)
+            if torch.rand(1).item() < self.p_camera_drop:
+                tcp_pose = torch.zeros_like(tcp_pose)
+            if drop_all_cond:
+                primary_rgb = torch.zeros_like(primary_rgb)
+                if "gripper" in obs_keys:
+                    gripper_rgb = torch.zeros_like(gripper_rgb)
+                tcp_pose = torch.zeros_like(tcp_pose)
+
+            obs_data["image"].append(primary_rgb)
+            obs_data["joint_state"].append(tcp_pose)
+            if "gripper" in obs_keys:
+                obs_data["gripper"].append(gripper_rgb)
+            if "force" in obs_keys:
+                if self.zero_force:
+                    force_torque = torch.zeros_like(force_torque)
+                obs_data["force"].append(force_torque)
+
+            if "success" in obs_keys:
+                success_label = batch["success"][t] if "success" in batch else self.default_success_label
+                if success_label is None:
+                    raise ValueError("`success` is missing and `default_success_label` is None.")
+                obs_data["success"].append(torch.as_tensor(success_label, dtype=torch.float32).reshape(-1))
+
+        return {k: torch.stack(v) for k, v in obs_data.items()}
+
+    def _get_act_data_deprecated(self, abs_idx: int):
         task_id = self.map_index_to_task_id[abs_idx]
         abs_act_indices = self._get_abs_act_indices(abs_idx)
-        # print(f"[DEBUG] _get_act_data: abs_idx={abs_idx}, task_id={task_id}, "
-        #       f"task_1st_ep={self.task_prefix_lengths[task_id]}, "
-        #       f"task_last_ep={self.task_prefix_lengths[task_id] + self.task_lengths[task_id]}"
-        #       )
-        # print(f"[DEBUG] _get_obs_data: abs_obs_indices={abs_act_indices} ")
         act_data = []
         for idx in abs_act_indices:
             if idx is None:
@@ -333,6 +349,33 @@ class TCLImageDataset(BaseImageDataset):
         act_data = np.stack(act_data)  # (T,7), in [act_min, act_max]
         act_data = (act_data - self.dataset_action_min) / (self.dataset_action_max - self.dataset_action_min)  # norm here, in [0,1]
         return act_data * 2. - 1.  # in [-1,1]
+
+    def _get_act_data(self, abs_idx: int):
+        abs_act_indices = self._get_abs_act_indices(abs_idx)
+
+        valid_positions = [i for i, idx in enumerate(abs_act_indices) if idx is not None]
+        if len(valid_positions) == 0:
+            raise ValueError("abs_act_indices should contain at least one valid index")
+
+        first_pos, last_pos = valid_positions[0], valid_positions[-1]
+        if any(idx is None for idx in abs_act_indices[first_pos:last_pos + 1]):
+            raise ValueError("None is only allowed at the beginning or end of abs_act_indices")
+
+        first_idx = abs_act_indices[first_pos]
+        last_idx = abs_act_indices[last_pos]
+
+        # Same padding: boundary None values repeat the nearest valid action.
+        padded_indices = [
+            first_idx if i < first_pos else last_idx if i > last_pos else idx
+            for i, idx in enumerate(abs_act_indices)
+        ]
+
+        act_data = self.all_rel_actions[padded_indices].astype(np.float32)  # (T, action_dim)
+
+        act_data = (act_data - self.dataset_action_min) / (
+                self.dataset_action_max - self.dataset_action_min
+        )
+        return act_data * 2. - 1.
 
     @staticmethod
     def norm_state_or_force(in_data: np.ndarray, norm_type: str, meta_data: dict):
@@ -380,6 +423,9 @@ class TCLMasterSlaveDataset(BaseImageDataset):
             norm_force_type: str = "quantile",
             zero_force: bool = False,
             p_camera_drop: float = 0.,
+            p_cond_drop: float = 0.,
+            default_success_label: Optional[int] = None,  # for `Master`
+            slave_default_success_labels: Optional[Union[int, List[Optional[int]]]] = None,  # for `Slaves`
             # Others
             seed: int = 42,
             val_ratio: float = 0.02,
@@ -388,6 +434,7 @@ class TCLMasterSlaveDataset(BaseImageDataset):
             # H5 config for master
             h5_path: str = None,
             use_h5: bool = False,
+            enable_master: bool = True,
     ):
         super().__init__()
         slave_data_roots = slave_data_roots or []
@@ -401,6 +448,15 @@ class TCLMasterSlaveDataset(BaseImageDataset):
             raise ValueError("`h5_path` for master dataset must be provided when use_h5=True.")
         if use_h5 and any(p is None for p in slave_h5_paths):
             raise ValueError("All `slave_h5_paths` must be provided when use_h5=True.")
+        if isinstance(slave_default_success_labels, list):
+            if len(slave_default_success_labels) != len(slave_data_roots):
+                raise ValueError(
+                    f"`slave_default_success_labels` list length must match slave datasets, "
+                    f"got {len(slave_default_success_labels)} vs {len(slave_data_roots)}."
+                )
+            resolved_slave_default_success_labels = slave_default_success_labels
+        else:
+            resolved_slave_default_success_labels = [slave_default_success_labels for _ in slave_data_roots]
 
         self.master_dataset = TCLImageDataset(
             data_root=data_root,
@@ -411,6 +467,8 @@ class TCLMasterSlaveDataset(BaseImageDataset):
             norm_force_type=norm_force_type,
             zero_force=zero_force,
             p_camera_drop=p_camera_drop,
+            p_cond_drop=p_cond_drop,
+            default_success_label=default_success_label,
             seed=seed,
             val_ratio=val_ratio,
             max_train_episodes=max_train_episodes,
@@ -419,7 +477,8 @@ class TCLMasterSlaveDataset(BaseImageDataset):
             use_h5=use_h5,
         )
         self.slave_datasets: List[TCLImageDataset] = []
-        for slave_root, slave_h5_path in zip(slave_data_roots, slave_h5_paths):
+        for slave_root, slave_h5_path, slave_default_success_label in zip(
+                slave_data_roots, slave_h5_paths, resolved_slave_default_success_labels):
             slave_ds = TCLImageDataset(
                 data_root=slave_root,
                 horizon=horizon,
@@ -429,6 +488,8 @@ class TCLMasterSlaveDataset(BaseImageDataset):
                 norm_force_type=norm_force_type,
                 zero_force=zero_force,
                 p_camera_drop=p_camera_drop,
+                p_cond_drop=p_cond_drop,
+                default_success_label=slave_default_success_label,
                 seed=seed,
                 val_ratio=val_ratio,
                 max_train_episodes=max_train_episodes,
@@ -438,7 +499,11 @@ class TCLMasterSlaveDataset(BaseImageDataset):
             )
             self.slave_datasets.append(slave_ds)
 
-        self.datasets = [self.master_dataset] + self.slave_datasets
+        self.enable_master = enable_master
+        self.datasets = ([self.master_dataset] if self.enable_master else []) + self.slave_datasets
+        self.dataset_is_master = ([True] if self.enable_master else []) + [False] * len(self.slave_datasets)
+        if len(self.datasets) == 0:
+            raise ValueError("No dataset selected: master is disabled and no slave dataset is provided.")
         self.concat_dataset = ConcatDataset(self.datasets)
         self._sync_master_stats_to_slaves()
 
@@ -456,6 +521,9 @@ class TCLMasterSlaveDataset(BaseImageDataset):
         self.norm_force_type = norm_force_type
         self.zero_force = zero_force
         self.p_camera_drop = p_camera_drop
+        self.p_cond_drop = p_cond_drop
+        self.default_success_label = default_success_label
+        self.slave_default_success_labels = resolved_slave_default_success_labels
         self.seed = seed
         self.val_ratio = val_ratio
         self.max_train_episodes = max_train_episodes
@@ -463,7 +531,7 @@ class TCLMasterSlaveDataset(BaseImageDataset):
 
         print(
             f"[diffusion_policy.dataset.TCLMasterSlaveDataset] "
-            f"loaded with 1 master + {len(self.slave_datasets)} slaves, "
+            f"loaded with {'1 master + ' if self.enable_master else ''}{len(self.slave_datasets)} slaves, "
             f"total_len={len(self.concat_dataset)}."
         )
 
@@ -482,7 +550,8 @@ class TCLMasterSlaveDataset(BaseImageDataset):
         val_set = copy.copy(self)
         val_set.master_dataset = self.master_dataset.get_validation_dataset()
         val_set.slave_datasets = [ds.get_validation_dataset() for ds in self.slave_datasets]
-        val_set.datasets = [val_set.master_dataset] + val_set.slave_datasets
+        val_set.datasets = ([val_set.master_dataset] if val_set.enable_master else []) + val_set.slave_datasets
+        val_set.dataset_is_master = ([True] if val_set.enable_master else []) + [False] * len(val_set.slave_datasets)
         val_set.concat_dataset = ConcatDataset(val_set.datasets)
         val_set._sync_master_stats_to_slaves()
         return val_set
@@ -502,7 +571,7 @@ class TCLMasterSlaveDataset(BaseImageDataset):
         item = self.datasets[ds_idx][local_idx]
         item["dataset_idx"] = torch.tensor(ds_idx, dtype=torch.long)
         item["local_idx"] = torch.tensor(local_idx, dtype=torch.long)
-        item["is_master"] = torch.tensor(ds_idx == 0, dtype=torch.bool)
+        item["is_master"] = torch.tensor(self.dataset_is_master[ds_idx], dtype=torch.bool)
         return item
 
 

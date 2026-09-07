@@ -4,7 +4,7 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 bash scripts/sh_train_reverse_rollout.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/sh_train_reverse_rollout.sh
 "
 
 ### Most configs are inherited from the iter_0 reverse config
@@ -98,7 +98,8 @@ SLAVE_H5_PATHS=(
 )
 #PRETRAINED_TIME_LOG="2026.04.29-22.22.19"  # iter_0
 #PRETRAINED_TIME_LOG="2026.04.30-13.26.46"  # iter_1
-PRETRAINED_TIME_LOG="2026.04.30-15.04.56"  # iter_2
+#PRETRAINED_TIME_LOG="2026.04.30-15.04.56"  # iter_2
+PRETRAINED_TIME_LOG="2026.05.01-02.07.32"  # iter_3
 
 
 

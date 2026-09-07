@@ -54,6 +54,19 @@ map_time_to_dataset = {
     "2026.04.29-01.30.55": "0417_french_press_reversed",
     "2026.04.29-22.22.19": "0417_brush_reversed",
     "2026.04.29-01.20.15": "0209_tower_boby_easy_reversed",
+    "2026.04.29-01.26.47": "0417_put_mouse_reversed",
+    "2026.04.29-14.23.51": "0417_test_tube_reversed",
+    "2026.05.01-02.07.32": "0417_brush_reversed",
+    "2026.05.01-14.35.36": "0417_brush_reversed",
+    ## TR-DRL
+    "2026.05.02-13.34.17": "0417_brush_reversed",
+    ## CFG-RL
+    "2026.05.02-21.38.01": "0417_brush_reversed",  # iter0
+    "2026.05.04-16.03.02": "0417_brush_reversed",  # iter1/2
+    "2026.05.04-15.23.16": "0417_brush_reversed",  # iter1/2/3
+    "2026.05.04-16.33.54": "0417_test_tube_reversed",  # iter1/2
+    "2026.05.04-15.35.37": "0417_put_mouse_reversed",  # iter1/2/3
+    "2026.05.04-15.32.48": "0209_tower_boby_easy_reversed",  # iter1/2/3
 }
 # train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
@@ -315,6 +328,9 @@ def model_step(step_request: StepRequestFromEvaluator):
     #     "lang_text": instruction_text,
     #     "proprioception": joint_state,
     # }
+    if hasattr(hydra_config.shape_meta.obs, "success"):
+        B, _, _ = force_B_T_D.shape
+        obs_dict["success"] = torch.ones((B, 1), device="cuda") * 1.  # for CFG-RL
 
     # 3.a Model inference
     # action_idx = agent.infer_frame_idx % max_cache_action

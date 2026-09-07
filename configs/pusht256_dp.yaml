@@ -10,7 +10,7 @@ checkpoint:
 dataloader:
   batch_size: 64  # ori:64
   num_workers: 12
-  persistent_workers: false
+  persistent_workers: true
   pin_memory: true
   shuffle: true
 dataset_obs_steps: 2
@@ -101,8 +101,8 @@ policy:
 
   causal_attn: true
   crop_shape:
-  - 240  # ori:84
-  - 240  # ori:84
+  - 250  # ori:84,240
+  - 250  # ori:84,240
   eval_fixed_crop: true
   horizon: 10
   n_action_steps: 8
@@ -112,22 +112,34 @@ policy:
   n_layer: 8
   n_obs_steps: 2
   noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
-    beta_end: 0.02
-    beta_schedule: squaredcos_cap_v2
-    beta_start: 0.0001
-    clip_sample: true
+#    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+#    beta_end: 0.02
+#    beta_schedule: squaredcos_cap_v2
+#    beta_start: 0.0001
+#    clip_sample: true
+#    num_train_timesteps: 100
+#    prediction_type: epsilon
+#    variance_type: fixed_small
+#  num_inference_steps: 100
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
     num_train_timesteps: 100
-    prediction_type: epsilon
-    variance_type: fixed_small
-  num_inference_steps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    # beta_schedule is important
+    # this is the best we found
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon # or sample
+  num_inference_steps: 10
   obs_as_cond: true
   obs_encoder_group_norm: true
   p_drop_attn: 0.3
   p_drop_emb: 0.0
   shape_meta: ${shape_meta}
   time_as_cond: true
-image_shape: &image_shape [3, 256, 256]  # ori:[3, 96, 96]
+image_shape: &image_shape [3, 256, 256]  # ori:[3, 96, 96], [3,256,256]
 shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
   # acceptable types: rgb, low_dim
   obs:
@@ -145,6 +157,8 @@ task:
 #    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: ${shape_meta}
     horizon: 10
+    n_obs_steps: ${n_obs_steps}
+    load_future_frames: false
     max_train_episodes: 90
     pad_after: 7
     pad_before: 1
@@ -162,7 +176,10 @@ task:
 #    zarr_path: data/pusht/pusht_256_goal.zarr  # shift: goal
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
+    shape_meta: ${shape_meta}
     horizon: 10
+    n_obs_steps: ${n_obs_steps}
+    load_future_frames: false
     max_train_episodes: 200  # ori:90
     pad_after: 7
     pad_before: 1
@@ -214,6 +231,6 @@ training:
 val_dataloader:
   batch_size: 64
   num_workers: 8
-  persistent_workers: false
+  persistent_workers: true
   pin_memory: true
   shuffle: false

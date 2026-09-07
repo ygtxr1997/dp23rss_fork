@@ -3,7 +3,7 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=4,5,6,7 TRAIN_PRESET=tcl_force_table bash scripts/moe/sh_train_tcl_expert.sh
+CUDA_VISIBLE_DEVICES=0,2,3,4 TRAIN_PRESET=tcl_force_light bash scripts/moe/sh_train_tcl_expert.sh
 "
 
 ### Merge MoE ###
@@ -13,8 +13,10 @@ CONFIG_NAME="tcl_force_dp.yaml"
 # ===== Expert presets (domain_shift, task_name, ffn_expand_factor) =====
 TRAIN_PRESET="${TRAIN_PRESET:-tcl_force}"
 EXPERT_TRIPLETS=(
-  "tcl_force         1201_screw_bulb_turn_off       4"
-  "tcl_force_table   1201_screw_bulb_turn_off_table 6"
+  "tcl_force          1201_screw_bulb_turn_off        4"
+  "tcl_force_table    1201_screw_bulb_turn_off_table  6"
+  "tcl_force_object   1201_screw_bulb_turn_off_object 4"
+  "tcl_force_light    1201_screw_bulb_turn_off_light  2"
 )
 PRETRAINED_TIME_LOG="2026.01.17-00.06.29"  # 1201_screw_bulb_turn_off, original
 

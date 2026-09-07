@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import builtins, types, inspect
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 import pathlib
 import dill
 import copy
@@ -29,6 +29,8 @@ from robomimic.models.base_nets import VisualCore
 from robomimic.models.base_nets import ResNet18Conv, SpatialSoftmax
 import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
+
+from robokit.debug_utils.time_profiler import global_time_profiler as gtp
 
 
 # Copied from: video2world_force_dit.py
@@ -134,7 +136,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         # init global state
         ObsUtils.initialize_obs_utils_with_config(config)
-        print("[DEBUG] ObsUtils initialized with:", config.observation.modalities.obs)
+        print("[DEBUG] ObsUtils initialized with:", config.observation.modalities.obs, f" crop_shape:{crop_shape}")
 
         # load model
         policy: PolicyAlgo = algo_factory(
@@ -349,8 +351,12 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                 )
             else:
                 # B) 无 teacher 直接初始化 MoE
+                if isinstance(ffn_expand_factor, ListConfig):
+                    ffn_expand_factor = list(ffn_expand_factor)
+                ffn_expand_factor = [ffn_expand_factor] if isinstance(ffn_expand_factor, (int, float)) else ffn_expand_factor
                 return MoEForDiffusion(
                     num_experts=len(ffn_expand_factor),
+                    ffn_expand_factor=ffn_expand_factor,
                     **model_kwargs
                 )
         raise ValueError(f"[DiffusionTransformerHybridImagePolicy] Unsupported backbone_type = {backbone_type}")
@@ -721,6 +727,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
     def compute_loss(self, batch) -> Dict[str, torch.Tensor]:
         # normalize input
         assert 'valid_mask' not in batch
+        gtp_open = self.training
+        gtp_training = "train" if self.training else "val"
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
         batch_size = nactions.shape[0]
@@ -734,7 +742,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
                 lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            with gtp(f"{gtp_training}/obs_enc.forward", group=f"{gtp_training}/obs_enc"):
+                nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             cond = nobs_features.reshape(batch_size, To, -1)
             if self.pred_action_steps_only:
@@ -775,7 +784,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, cond)
+        with gtp(f"{gtp_training}/action.forward", group=f"{gtp_training}/action"):
+            pred = self.model(noisy_trajectory, timesteps, cond)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':

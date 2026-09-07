@@ -23,14 +23,14 @@ Example usage:
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-yes | CUDA_VISIBLE_DEVICES=6 python eval_socket.py  \
+yes | CUDA_VISIBLE_DEVICES=7 python eval_socket.py  \
     -c "None"  \
     -o data/pusht_eval_output  \
-    -p 7076  \
+    -p 6067  \
     -s none  \
     -a 1  \
     -r -1  \
-    -n 10  \
+    -n 1  \
     --max_repeats 10  \
     --close_online
 '''
@@ -67,13 +67,13 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
         "max_steps": 300,  # ori:300, quick_debug:110
         "n_action_steps": 1,  # ori:8
         "n_envs": num_envs,  # ori:8
-        "n_obs_steps": 4*5,  # Ts can be larger than v2, ori:4+1,
+        "n_obs_steps": 4*5,  # Ts can be larger than v2, ori:4+1,4*5
         "n_test": num_envs*1,  # ori:8*1
         "n_test_vis": 1,  # ori:4
         "n_train": 0,  # ori: 6
         "n_train_vis": 0,  # ori: 2
         "past_action": False,
-        "test_start_seed": 4300000, # now:4300050, ori:4300000, NOTE: start from +50?
+        "test_start_seed": 4300000+50, # now:4300050(AWP), ori:4300000, NOTE: start from +50?
         "train_start_seed": 0,
         "domain_shift": domain_shift,  # `none`, `orange`, `texture`, `light`, `size`
         "render_size": 256,  # ori:96
@@ -95,12 +95,14 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
         # cfg.task.env_runner.n_train = 0
         # cfg.task.env_runner.n_test = 10
         # cfg.task.env_runner.max_steps = 110  # for quick debug
-        # reset_to_state = np.array([  # agent,block,block_rot
-        #     256 + 100, 256 - 100,
-        #     256 - 100, 256 + 50,
-        #     np.pi / 4
-        # ])
-        reset_to_state = None
+        x_shift = np.random.uniform(-50, 50)
+        y_shift = np.random.uniform(-50, 50)
+        reset_to_state = np.array([  # agent,block,block_rot
+            256 + 100 + x_shift, 256 - 100 + y_shift,
+            256 - 100, 256 + 50,
+            np.pi / 4
+        ])  # only for vis traj
+        # reset_to_state = None  # default setting
         # domain_shift = "size"  # in 'none', 'orange', 'texture', 'light', 'size'
         domain_shift = env_runner_config.domain_shift
         # save_name = f"size_hdfree_vis@{idx:02d}"  # in 'baseline', 'orange', 'orange_hdfree', 'texture', 'light', 'size_'
@@ -120,7 +122,7 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
         )
 
         # runner_log = env_runner.run(policy)
-        env_runner.init_socket("push the T-block into the green area.")
+        env_runner.init_socket(f"push the T-block into the green area.(dom={domain_shift})")
         if reset_each > 0 and idx % reset_each == 0:
             env_runner.send_reset()  # NOTE: send reset before each evaluator?
             stage_flag = 0  # reset to cold-start when seed changes
@@ -130,8 +132,8 @@ def main(checkpoint, output_dir, device, from_config='', port=6060, domain_shift
             stage_flag=stage_flag,
         )  # {'test/mean_score': 0.123, 'test/sim_max_reward_0': 0.5, ...}
         if not close_online:
-            # stage_flag = 1  # NOTE: after first eval, set to 1-online next time
-            stage_flag = 2  # after first eval, set to 2-copy weights next time
+            stage_flag = 1  # NOTE: after first eval, set to 1-online next time
+            # stage_flag = 2  # after first eval, set to 2-copy weights next time
 
         # dump log to json
         json_log = dict()

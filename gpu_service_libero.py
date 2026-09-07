@@ -29,7 +29,7 @@ from robokit.debug_utils.printer import print_batch
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=2 CKPT_INDEX=0 uvicorn gpu_service_libero:gpu_app --port 7072
+CUDA_VISIBLE_DEVICES=7 CKPT_INDEX=0 uvicorn gpu_service_libero:gpu_app --port 7077
 """
 gpu_app = FastAPI()
 max_cache_action = 4  # ori:32
@@ -62,12 +62,15 @@ max_cache_action = 4  # ori:32
 # log_time = "2026.04.30-11.31.13"  # k1_open_top_put_bowl, texture_slice
 # log_time = "2026.04.30-10.49.39"  # k1_open_top_put_bowl, view_slice, ffn*4
 # log_time = "2026.04.30-10.49.10"  # k1_open_top_put_bowl, color_slice
-# log_time = "2026.04.30-13.28.53"  # k1_open_top_put_bowl, color_slice, ffn*10
+# log_time = "2026.04.30-13.28.53"  # k1_open_top_put_bowl, view_slice, ffn*10
 
 # log_time = "2026.04.30-07.39.51"  # k1_open_top_put_bowl, MoE:texture/view/color
 # log_time = "2026.04.30-09.42.59"  # k1_open_top_put_bowl, MoE:view only
 # log_time = "2026.04.30-10.47.46"  # k1_open_top_put_bowl, MoE:all 3, fix weight decay
-log_time = "2026.04.30-12.33.08"  # k1_open_top_put_bowl, MoE:all 3 slice
+# log_time = "2026.04.30-12.33.08"  # k1_open_top_put_bowl, MoE:all 3 slice
+log_time = "2026.04.30-16.41.02"  # k1_open_top_put_bowl, MoE:all 3 slice, (2,6,10)
+# log_time = "2026.05.01-17.22.28"  # k1_open_top_put_bowl, MoE:w/o init, (2,6,10)
+# log_time = "2026.05.02-15.17.48"  # k1_open_top_put_bowl, MoE:w/ original init, (2,6,10)
 
 # log_time = "2026.04.27-08.52.45"  # s3_pick_book_place_leftcaddy
 # log_time = "2026.04.27-09.00.26"  # k6_close

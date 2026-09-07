@@ -1,0 +1,162 @@
+_target_: diffusion_policy.workspace.train_foveation_dp_transformer_workspace.TrainFoveationDPTransformerWorkspace
+
+name: train_foveation_dp_transformer
+task_name: liberoft
+horizon: 32
+n_obs_steps: 1
+n_action_steps: 8
+obs_as_cond: true
+vis_rot_image: true  # rotate LIBERO image visualizations for readability
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-val_total_loss={val_total_loss:.3f}.ckpt
+    k: 3
+    mode: min
+    monitor_key: val_total_loss
+
+dataloader:
+  batch_size: 128
+  num_workers: 12
+  persistent_workers: true
+  pin_memory: true
+  shuffle: true
+val_dataloader:
+  batch_size: 32
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  shuffle: false
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+logging:
+  mode: online
+  project: diffusion_policy_debug
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  group: null
+  id: null
+  tags: ["${name}", "${task_name}"]
+
+optimizer:
+  learning_rate: 1.0e-4
+  visual_encoder_lr_multiplier: 1.0
+  betas: [0.9, 0.95]
+  transformer_weight_decay: 0.01
+  obs_encoder_weight_decay: 0.01
+
+policy:
+  _target_: diffusion_policy.policy.foveation_dp_transformer_policy.FoveationTransformerHybridImagePolicy
+  shape_meta: ${shape_meta}
+  horizon: ${horizon}
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  obs_as_cond: ${obs_as_cond}
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+  num_inference_steps: 10
+  n_layer: 8
+  n_head: 4
+  n_emb: 256
+  n_cond_layers: 0
+  p_drop_emb: 0.0
+  p_drop_attn: 0.1
+  causal_attn: true
+  time_as_cond: true
+  visual_dim: 256
+  visual_encoder_layers: 2
+  visual_encoder_heads: 8
+  position_encoding_types: [apt_interpolated]
+  patch_embedding_type: linear
+  foveation_net:
+    _target_: diffusion_policy.model.roi.foveation_net.FoveationNet
+    in_channels: 3
+    input_hw: ${foveation_input_hw}
+    num_levels: 3
+    global_level: 0
+    global_encoder_type: "vjepa2_1_vit_base_384"
+    global_feature_dim: 768
+    torch_home: "/home/geyuan/pretrained/torch"
+    patch_size: 16
+    freeze_global_encoder: true
+    freeze_router: false
+    router_temperature: 1.0
+    target_num_patches: 0.25
+    budget_loss_weight: 0.1
+
+image_shape: &image_shape [3, 384, 384]
+foveation_input_hw: &foveation_input_hw [384, 384]
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+#    gripper:
+#      shape: *image_shape
+#      type: rgb
+#    joint_state:
+#      shape: [6]
+#      type: low_dim
+#    force:
+#      shape: [6]
+#      type: low_dim
+  action:
+    shape: [7]
+
+task:
+  dataset:
+    _target_: diffusion_policy.dataset.libero_dataset.LiberoFTDataset
+    shape_meta: ${shape_meta}
+    horizon: ${horizon}
+    max_train_episodes: 90
+    pad_before: 0
+    pad_after: 7
+    seed: 42
+    val_ratio: 0.02
+    transform_color_jitter: true
+    dataset_root: "/home/geyuan/code/LIBERO-FT/libero/datasets/"
+    dataset_subname: "libero_force_384/libero_10"
+    hdf5_fns:
+      - KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo_wrench.hdf5
+      - KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo_wrench.hdf5
+      - KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it_demo_wrench.hdf5
+      - KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_demo_wrench.hdf5
+      - LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket_demo_wrench.hdf5
+    zero_force: false
+
+training:
+  seed: 42
+  device: cuda:0
+  num_epochs: 3000
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  resume: false
+  use_ema: true
+  val_every: 10
+  checkpoint_every: 10
+  sample_every: 10
+  max_train_steps: null
+  max_val_steps: null
+  router_temperature_start: 1.0
+  router_temperature_end: 0.2
+  router_temperature_steps: 100000
+  router_temperature_schedule: cosine
+
+pretrained_ckpt: null

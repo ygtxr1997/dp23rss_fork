@@ -23,36 +23,44 @@ class RandomShiftsAug(torch.nn.Module):
         x = x.float()
         n, c, h, w = x.size()
 
-        # 1. 对图像进行填充
         padding = tuple([self.pad] * 4)
         x_padded = F.pad(x, padding, "replicate")
+        padded_h = h + 2 * self.pad
+        padded_w = w + 2 * self.pad
 
-        # 2. 创建一个标准化的坐标网格 ([-1, 1])
-        # 这个网格对应于原始图像尺寸 (h, w)
-        arange_h = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype)
-        arange_w = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype)
+        eps_h = 1.0 / padded_h
+        eps_w = 1.0 / padded_w
+        arange_h = torch.linspace(
+            -1.0 + eps_h,
+            1.0 - eps_h,
+            padded_h,
+            device=x.device,
+            dtype=x.dtype,
+        )[:h]
+        arange_w = torch.linspace(
+            -1.0 + eps_w,
+            1.0 - eps_w,
+            padded_w,
+            device=x.device,
+            dtype=x.dtype,
+        )[:w]
 
-        # 使用 meshgrid 创建一个 (h, w, 2) 的网格
         grid_h, grid_w = torch.meshgrid(arange_h, arange_w, indexing='ij')
-        base_grid = torch.stack((grid_w, grid_h), dim=-1)  # (x, y) 坐标
-        base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)  # 扩展到批次维度 (n, h, w, 2)
+        base_grid = torch.stack((grid_w, grid_h), dim=-1)
+        base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)
 
-        # 3. 生成单个随机位移，并将其应用于所有帧
-        # 在填充后的像素空间中生成随机整数位移
-        # 将 size 的第一个维度从 n 改为 1，以确保所有帧使用相同的位移
-        shift_xy = torch.randint(0, 2 * self.pad + 1, size=(1, 1, 1, 2), device=x.device, dtype=x.dtype)
+        shift_xy = torch.randint(
+            0,
+            2 * self.pad + 1,
+            size=(1, 1, 1, 2),
+            device=x.device,
+        ).to(dtype=x.dtype)
 
-        # 4. 将像素位移转换为 [-1, 1] 坐标空间的位移
-        # 注意：h 和 w 的缩放因子不同
-        shift_w = shift_xy[..., 0] * 2.0 / (w + 2 * self.pad)
-        shift_h = shift_xy[..., 1] * 2.0 / (h + 2 * self.pad)
+        shift_w = shift_xy[..., 0] * 2.0 / padded_w
+        shift_h = shift_xy[..., 1] * 2.0 / padded_h
         shift = torch.stack((shift_w, shift_h), dim=-1)
-
-        # 5. 将位移应用到基础网格上
-        # shift 的形状是 (1, 1, 1, 2)，会自动广播到 base_grid 的 (n, h, w, 2)
         grid = base_grid + shift
 
-        # 6. 使用 grid_sample 进行采样
         return F.grid_sample(x_padded, grid, padding_mode="zeros", align_corners=False)
 
 
@@ -172,17 +180,30 @@ class LiberoFTDataset(BaseImageDataset):
                     hdf5_path,
                 )
             )
+        obs_meta = shape_meta["obs"]
+        merge_obs_keys = ["agentview_rgb"]
+        if "gripper" in obs_meta:
+            merge_obs_keys.append("eye_in_hand_rgb")
+        if "joint_state" in obs_meta:
+            merge_obs_keys.append("ee_states")
+        if "force" in obs_meta or "force_torque" in obs_meta:
+            merge_obs_keys.append("wrenches")
         self.merge_dataset = MergeDataset(
             self.libero_h5_datasets,
             n_obs=pad_before + 1,
             chunk_size=horizon,
-            obs_keys=["agentview_rgb", "eye_in_hand_rgb", "ee_states", "gripper_states", "wrenches"],
+            obs_keys=merge_obs_keys,
             max_len=max_len,
             load_future_obs=load_future_obs,
         )
+        stats_obs_keys = []
+        if "joint_state" in obs_meta:
+            stats_obs_keys.append("ee_states")
+        if "force" in obs_meta or "force_torque" in obs_meta:
+            stats_obs_keys.append("wrenches")
         self.dataset_stats = self.merge_dataset.compute_statistics(
             keys={
-                "obs": ["wrenches", "ee_states"],
+                "obs": stats_obs_keys,
                 "state": [],
                 "action": ["actions"],
             }
@@ -223,9 +244,16 @@ class LiberoFTDataset(BaseImageDataset):
         self.shape_meta = shape_meta
         self.obs_image_shape = shape_meta["obs"]["image"]["shape"]  # [3, H, W]
         self.obs_gripper_shape = shape_meta["obs"]["gripper"]["shape"] if "gripper" in shape_meta["obs"] else None
-        self.joint_state_shape = shape_meta["obs"]["joint_state"]["shape"]
-        self.force_torque_shape = shape_meta["obs"]["force_torque"]["shape"] if "force_torque" in shape_meta[
-            "obs"] else None
+        self.joint_state_shape = (
+            obs_meta["joint_state"]["shape"] if "joint_state" in obs_meta else None
+        )
+        self.force_torque_shape = (
+            obs_meta["force"]["shape"]
+            if "force" in obs_meta
+            else obs_meta["force_torque"]["shape"]
+            if "force_torque" in obs_meta
+            else None
+        )
         self.action_shape = shape_meta["action"]["shape"]  # [7,]
         obs_image_wh_ratio = float(self.obs_image_shape[2]) / float(self.obs_image_shape[1])  # wh 4:3=16:12=12:9
         obs_h, obs_w = self.obs_image_shape[1:]  # 你原写法: (H,W)
@@ -327,41 +355,50 @@ class LiberoFTDataset(BaseImageDataset):
         obs_data = {k: [] for k in obs_keys}
 
         history_primary_rgb = sample_dict["history"]["obs"]["agentview_rgb"]  # (T,H,W,C)
-        history_gripper_rgb = sample_dict["history"]["obs"]["eye_in_hand_rgb"]  # (T,H,W,C)
-        history_ee_states = sample_dict["history"]["obs"]["ee_states"]  # (T,D)
-        history_wrenches = sample_dict["history"]["obs"]["wrenches"]  # (T,D)
         actions = sample_dict["action"]  # (T,D)
 
         # Preprocess
         history_primary_rgb = self.obs_image_transform(history_primary_rgb)  # (T,C,H,W)
-        history_gripper_rgb = self.obs_image_transform(history_gripper_rgb)
         history_primary_rgb = history_primary_rgb * 2. - 1.  # in [-1,1]
-        history_gripper_rgb = history_gripper_rgb * 2. - 1.  # in [-1,1]
-        # NOTE: Randomly zero out gripper image with 0.3 probability
-        if torch.rand(1).item() < 0.3:
-            history_gripper_rgb = torch.zeros_like(history_gripper_rgb)
-
-        tcp_pose = self.norm_state_or_force(
-            history_ee_states,
-            norm_type="mean",
-            meta_data=self.dataset_stats["obs.ee_states"],
-        )
-
-        force_torque = self.norm_state_or_force(
-            history_wrenches,
-            norm_type=self.norm_force_type,
-            meta_data=self.dataset_stats["obs.wrenches"],
-        )
 
         obs_data["image"] = history_primary_rgb  # (T,C,H,W)
-        obs_data["gripper"] = history_gripper_rgb  # (T,C,H,W)
-        obs_data["joint_state"] = tcp_pose  # (T,D)
-        obs_data["force"] = force_torque  # (T,D)
+        if "gripper" in obs_data:
+            history_gripper_rgb = self.obs_image_transform(
+                sample_dict["history"]["obs"]["eye_in_hand_rgb"]
+            )
+            history_gripper_rgb = history_gripper_rgb * 2. - 1.  # in [-1,1]
+            # NOTE: Randomly zero out gripper image with 0.3 probability
+            if torch.rand(1).item() < 0.3:
+                history_gripper_rgb = torch.zeros_like(history_gripper_rgb)
+            obs_data["gripper"] = history_gripper_rgb  # (T,C,H,W)
+        if "joint_state" in obs_data:
+            tcp_pose = self.norm_state_or_force(
+                sample_dict["history"]["obs"]["ee_states"],
+                norm_type="mean",
+                meta_data=self.dataset_stats["obs.ee_states"],
+            )
+            obs_data["joint_state"] = tcp_pose  # (T,D)
+        if "force" in obs_data:
+            force_torque = self.norm_state_or_force(
+                sample_dict["history"]["obs"]["wrenches"],
+                norm_type=self.norm_force_type,
+                meta_data=self.dataset_stats["obs.wrenches"],
+            )
+            obs_data["force"] = force_torque  # (T,D)
+        if "force_torque" in obs_data:
+            force_torque = self.norm_state_or_force(
+                sample_dict["history"]["obs"]["wrenches"],
+                norm_type=self.norm_force_type,
+                meta_data=self.dataset_stats["obs.wrenches"],
+            )
+            obs_data["force_torque"] = force_torque  # (T,D)
         for k in obs_data.keys():
             assert obs_data[k] != [], f"obs_data[{k}] is empty!"
 
-        if self.zero_force:
+        if self.zero_force and "force" in obs_data:
             obs_data["force"] *= 0.0
+        if self.zero_force and "force_torque" in obs_data:
+            obs_data["force_torque"] *= 0.0
 
         # act_data = (actions - self.dataset_stats["action.actions"]["min"]) / (
         #         self.dataset_stats["action.actions"]["max"] - self.dataset_stats["action.actions"]["min"] + 1e-8

@@ -123,12 +123,12 @@ class RoiNet(nn.Module):
             "base_channels": 128,
             "num_stages": 8,
             "blocks_per_stage": 2,
-            "locator_input_size": (160, 160),
+            "locator_input_size": (96, 96),
             "hidden_dim": 512,
         },
     }
     _LOCATOR_TYPES = {"residual", "resnet"}
-    _PREDICT_TYPES = {"xys", "logit_scale", "logit_logit"}
+    _PREDICT_TYPES = {"xys", "logit_scale", "logit_logit", "logit_meanstd"}
     _RESNET_BLOCKS_PER_STAGE_BY_PRESET = {
         "tiny": (1, 1, 1, 1),    # ResNet-10-style: stem + 4 BasicBlock stages.
         "small": (2, 2, 2, 2),   # ResNet-18-style.
@@ -275,7 +275,7 @@ class RoiNet(nn.Module):
             raise ValueError("scale_num_bins must be at least 2.")
         self.patch_grid_h = self.locator_input_h // self.patchify_wh
         self.patch_grid_w = self.locator_input_w // self.patchify_wh
-        if self.predict_type in {"logit_scale", "logit_logit"}:
+        if self.predict_type in {"logit_scale", "logit_logit", "logit_meanstd"}:
             if (
                 self.locator_input_h % self.patchify_wh != 0
                 or self.locator_input_w % self.patchify_wh != 0
@@ -308,6 +308,8 @@ class RoiNet(nn.Module):
             locator_head_out_dim = self.patch_grid_size + 1
         elif self.predict_type == "logit_logit":
             locator_head_out_dim = self.patch_grid_size + self.scale_num_bins
+        elif self.predict_type == "logit_meanstd":
+            locator_head_out_dim = self.patch_grid_size + 2
         else:
             raise RuntimeError(f"Unsupported predict_type {self.predict_type}.")
         self.locator_head = nn.Sequential(
@@ -463,7 +465,7 @@ class RoiNet(nn.Module):
                         mean=0.0,
                         std=center_weight_std,
                     )
-            elif self.predict_type in {"logit_scale", "logit_logit"}:
+            elif self.predict_type in {"logit_scale", "logit_logit", "logit_meanstd"}:
                 patch_logit_weight_std = self._resolve_head_weight_std(
                     self.init_patch_logit_raw_std
                 )
@@ -483,8 +485,21 @@ class RoiNet(nn.Module):
                             mean=0.0,
                             std=scale_logit_weight_std,
                         )
+                elif self.predict_type == "logit_meanstd":
+                    scale_weight_std = self._resolve_head_weight_std(
+                        self.init_scale_logit_raw_std
+                    )
+                    if scale_weight_std > 0.0:
+                        nn.init.normal_(
+                            last_linear.weight[self.patch_grid_size :],
+                            mean=0.0,
+                            std=scale_weight_std,
+                        )
             else:
                 raise RuntimeError(f"Unsupported predict_type {self.predict_type}.")
+
+            if self.predict_type == "logit_meanstd":
+                last_linear.bias[self.patch_grid_size + 1] = math.log(0.2)
 
             if self.max_scale > self.min_scale:
                 if self.predict_type == "logit_logit":
@@ -493,6 +508,14 @@ class RoiNet(nn.Module):
                             device=last_linear.bias.device,
                             dtype=last_linear.bias.dtype,
                         )
+                    )
+                elif self.predict_type == "logit_meanstd":
+                    init_scale_ratio = (
+                        (self.init_scale - self.min_scale)
+                        / (self.max_scale - self.min_scale)
+                    )
+                    last_linear.bias[self.patch_grid_size] = math.log(
+                        init_scale_ratio / (1.0 - init_scale_ratio)
                     )
                 else:
                     init_scale_ratio = (
@@ -580,22 +603,69 @@ class RoiNet(nn.Module):
         )
         return torch.cat((centers_BT_2, scale_BT.unsqueeze(-1)), dim=-1)
 
+    def _constrain_logit_meanstd_params(
+        self,
+        raw_logit_meanstd_BT_G2: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        expected_dim = self.patch_grid_size + 2
+        if raw_logit_meanstd_BT_G2.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Expected raw logit_meanstd params with last dimension {expected_dim}."
+            )
+
+        center_logits_BT_G = raw_logit_meanstd_BT_G2[:, : self.patch_grid_size]
+        raw_scale_mu_BT = raw_logit_meanstd_BT_G2[:, self.patch_grid_size]
+        raw_scale_logstd_BT = raw_logit_meanstd_BT_G2[:, self.patch_grid_size + 1]
+
+        center_probs_BT_G = torch.softmax(center_logits_BT_G, dim=-1)
+        centers_BT_2 = center_probs_BT_G @ self._patch_centers_G_2.to(
+            device=raw_logit_meanstd_BT_G2.device,
+            dtype=raw_logit_meanstd_BT_G2.dtype,
+        )
+        raw_scale_std_BT = torch.exp(raw_scale_logstd_BT)
+        if self.training:
+            raw_scale_BT = raw_scale_mu_BT + raw_scale_std_BT * torch.randn_like(
+                raw_scale_mu_BT
+            )
+        else:
+            raw_scale_BT = raw_scale_mu_BT
+
+        scale_BT = self._constrain_raw_scale(raw_scale_BT)
+        scale_mean_BT = self._constrain_raw_scale(raw_scale_mu_BT)
+        params_BT_3 = torch.cat((centers_BT_2, scale_BT.unsqueeze(-1)), dim=-1)
+        params_mean_BT_3 = torch.cat(
+            (centers_BT_2, scale_mean_BT.unsqueeze(-1)),
+            dim=-1,
+        )
+        aux = {
+            "params_mean_BT_3": params_mean_BT_3,
+            "raw_scale_mu_BT": raw_scale_mu_BT,
+            "raw_scale_logstd_BT": raw_scale_logstd_BT,
+            "raw_scale_std_BT": raw_scale_std_BT,
+        }
+        return params_BT_3, aux
+
     def _constrain_raw_head_output(
         self,
         raw_head_output_BT_D: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if self.predict_type == "xys":
-            return self._constrain_raw_params(raw_head_output_BT_D)
+            return self._constrain_raw_params(raw_head_output_BT_D), {}
         if self.predict_type == "logit_scale":
-            return self._constrain_logit_scale_params(raw_head_output_BT_D)
+            return self._constrain_logit_scale_params(raw_head_output_BT_D), {}
         if self.predict_type == "logit_logit":
-            return self._constrain_logit_logit_params(raw_head_output_BT_D)
+            return self._constrain_logit_logit_params(raw_head_output_BT_D), {}
+        if self.predict_type == "logit_meanstd":
+            return self._constrain_logit_meanstd_params(raw_head_output_BT_D)
         raise RuntimeError(f"Unsupported predict_type {self.predict_type}.")
 
     @staticmethod
     def area_loss(
         params_or_output: Union[Dict[str, torch.Tensor], torch.Tensor],
         reduction: str = "mean",
+        mode: str = "square",
+        upper_bound: Optional[float] = None,
+        lower_bound: Optional[float] = None,
     ) -> torch.Tensor:
         if isinstance(params_or_output, dict):
             params_B_T_3 = params_or_output["params_B_T_3"]
@@ -604,14 +674,40 @@ class RoiNet(nn.Module):
         if params_B_T_3.shape[-1] != 3:
             raise ValueError("Expected ROI params with last dimension 3.")
 
-        # Current RoiNet uses isotropic scale, so percentage area is scale^2.
-        area_percent = params_B_T_3[..., 2].square()
+        scale = params_B_T_3[..., 2]
+        if mode == "square":
+            # Current RoiNet uses isotropic scale, so percentage area is scale^2.
+            loss_value = scale.square()
+        elif mode == "identity":
+            loss_value = scale
+        elif mode == "upper":
+            if upper_bound is None:
+                raise ValueError("upper_bound must be set when mode is 'upper'.")
+            if upper_bound < 0.0:
+                raise ValueError("upper_bound must be non-negative.")
+            loss_value = torch.relu(scale - float(upper_bound)).square()
+        elif mode == "range":
+            if lower_bound is None or upper_bound is None:
+                raise ValueError(
+                    "lower_bound and upper_bound must be set when mode is 'range'."
+                )
+            if lower_bound < 0.0 or upper_bound < 0.0:
+                raise ValueError("lower_bound and upper_bound must be non-negative.")
+            if lower_bound > upper_bound:
+                raise ValueError("lower_bound must be <= upper_bound.")
+            loss_value = (
+                torch.relu(float(lower_bound) - scale).square()
+                + torch.relu(scale - float(upper_bound)).square()
+            )
+        else:
+            raise ValueError("mode must be 'square', 'identity', 'upper', or 'range'.")
+
         if reduction == "none":
-            return area_percent
+            return loss_value
         if reduction == "mean":
-            return area_percent.mean()
+            return loss_value.mean()
         if reduction == "sum":
-            return area_percent.sum()
+            return loss_value.sum()
         raise ValueError("reduction must be 'none', 'mean', or 'sum'.")
 
     @staticmethod
@@ -655,6 +751,104 @@ class RoiNet(nn.Module):
         )
         pair_dist_P_T = center_dist_B_B_T[pair_mask_B_B]
         return torch.relu(float(margin) - pair_dist_P_T).square().mean()
+
+    @staticmethod
+    def scale_diversity_loss(
+        params_or_output: Union[Dict[str, torch.Tensor], torch.Tensor],
+        margin: float = 0.05,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if isinstance(params_or_output, dict):
+            params_B_T_3 = params_or_output["params_B_T_3"]
+        else:
+            params_B_T_3 = params_or_output
+        if params_B_T_3.shape[-1] != 3:
+            raise ValueError("Expected ROI params with last dimension 3.")
+        if params_B_T_3.ndim != 3:
+            raise ValueError("Expected ROI params with shape (B, T, 3).")
+        if margin < 0.0:
+            raise ValueError("margin must be non-negative.")
+        if eps < 0.0:
+            raise ValueError("eps must be non-negative.")
+
+        scales_B_T = params_B_T_3[..., 2]
+        batch_size = scales_B_T.shape[0]
+        if batch_size < 2:
+            return scales_B_T.sum() * 0.0
+
+        scale_diff_B_B_T = scales_B_T[:, None, :] - scales_B_T[None, :, :]
+        scale_dist_B_B_T = torch.sqrt(scale_diff_B_B_T.square() + eps)
+        pair_mask_B_B = torch.triu(
+            torch.ones(
+                batch_size,
+                batch_size,
+                device=scales_B_T.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+        pair_dist_P_T = scale_dist_B_B_T[pair_mask_B_B]
+        return torch.relu(float(margin) - pair_dist_P_T).square().mean()
+
+    @staticmethod
+    def scale_batch_std_loss(
+        params_or_output: Union[Dict[str, torch.Tensor], torch.Tensor],
+        std_target: float = 0.05,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if isinstance(params_or_output, dict):
+            params_B_T_3 = params_or_output["params_B_T_3"]
+        else:
+            params_B_T_3 = params_or_output
+        if params_B_T_3.shape[-1] != 3:
+            raise ValueError("Expected ROI params with last dimension 3.")
+        if params_B_T_3.ndim != 3:
+            raise ValueError("Expected ROI params with shape (B, T, 3).")
+        if std_target < 0.0:
+            raise ValueError("std_target must be non-negative.")
+        if eps < 0.0:
+            raise ValueError("eps must be non-negative.")
+
+        scales_B_T = params_B_T_3[..., 2]
+        batch_size = scales_B_T.shape[0]
+        if batch_size < 2:
+            return scales_B_T.sum() * 0.0
+
+        std_T = torch.sqrt(scales_B_T.var(dim=0, unbiased=False) + eps)
+        return torch.relu(float(std_target) - std_T).square().mean()
+
+    @staticmethod
+    def scale_batch_mean_std_target_loss(
+        params_or_output: Union[Dict[str, torch.Tensor], torch.Tensor],
+        mean_target: float = 0.2,
+        std_target: float = 0.05,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if isinstance(params_or_output, dict):
+            params_B_T_3 = params_or_output["params_B_T_3"]
+        else:
+            params_B_T_3 = params_or_output
+        if params_B_T_3.shape[-1] != 3:
+            raise ValueError("Expected ROI params with last dimension 3.")
+        if params_B_T_3.ndim != 3:
+            raise ValueError("Expected ROI params with shape (B, T, 3).")
+        if mean_target < 0.0:
+            raise ValueError("mean_target must be non-negative.")
+        if std_target < 0.0:
+            raise ValueError("std_target must be non-negative.")
+        if eps < 0.0:
+            raise ValueError("eps must be non-negative.")
+
+        scales_B_T = params_B_T_3[..., 2]
+        mean_T = scales_B_T.mean(dim=0)
+        if scales_B_T.shape[0] < 2:
+            std_T = scales_B_T.sum(dim=0) * 0.0
+        else:
+            std_T = torch.sqrt(scales_B_T.var(dim=0, unbiased=False) + eps)
+        return (
+            (mean_T - float(mean_target)).square()
+            + (std_T - float(std_target)).square()
+        ).mean()
 
     def _make_theta(self, params_BT_3: torch.Tensor) -> torch.Tensor:
         center_x_BT = params_BT_3[:, 0]
@@ -731,7 +925,7 @@ class RoiNet(nn.Module):
             raw_head_output_BT_D = self.locator_head(locator_features_BT_D)
 
         # Map unconstrained network outputs into normalized ROI parameters.
-        params_BT_3 = self._constrain_raw_head_output(raw_head_output_BT_D)
+        params_BT_3, param_aux = self._constrain_raw_head_output(raw_head_output_BT_D)
 
         # theta maps output normalized coordinates to input normalized coordinates.
         # With center=(0,0), scale=1 this is an identity full-frame resize.
@@ -783,6 +977,11 @@ class RoiNet(nn.Module):
             "params_B_T_3": params_B_T_3,
             "valid_mask_B_T_1_RH_RW": valid_mask_B_T_1_RH_RW,
         }
+        if "params_mean_BT_3" in param_aux:
+            out["params_mean_B_T_3"] = param_aux["params_mean_BT_3"].view(B, T, 3)
+            out["raw_scale_mu_B_T"] = param_aux["raw_scale_mu_BT"].view(B, T)
+            out["raw_scale_logstd_B_T"] = param_aux["raw_scale_logstd_BT"].view(B, T)
+            out["raw_scale_std_B_T"] = param_aux["raw_scale_std_BT"].view(B, T)
         if should_return_grid:
             out["grid_B_T_RH_RW_2"] = grid_BT_RH_RW_2.view(
                 B,

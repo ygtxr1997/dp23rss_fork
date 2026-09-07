@@ -1,0 +1,219 @@
+_target_: diffusion_policy.workspace.train_foveation_dp_transformer_workspace.TrainFoveationDPTransformerWorkspace
+
+name: train_foveation_dp_transformer
+task_name: pusht256
+exp_name: default
+horizon: 10
+n_obs_steps: 2
+n_action_steps: 8
+obs_as_cond: true
+vis_rot_image: false
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+    k: 5
+    mode: max
+    monitor_key: test_mean_score
+
+dataloader:
+  batch_size: 64
+  num_workers: 24
+  persistent_workers: true
+  pin_memory: true
+  shuffle: true
+val_dataloader:
+  batch_size: 64
+  num_workers: 12
+  persistent_workers: true
+  pin_memory: true
+  shuffle: true
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+logging:
+  mode: online
+  project: diffusion_policy_debug
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  group: null
+  id: null
+  resume: true
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+optimizer:
+  learning_rate: 1.0e-4
+  visual_encoder_lr_multiplier: 1.0
+  betas: [0.9, 0.95]
+  transformer_weight_decay: 0.01
+  obs_encoder_weight_decay: 0.01
+
+policy:
+  _target_: diffusion_policy.policy.foveation_dp_transformer_policy.FoveationTransformerHybridImagePolicy
+  shape_meta: ${shape_meta}
+  horizon: ${horizon}
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  obs_as_cond: ${obs_as_cond}
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+  num_inference_steps: 10
+  n_layer: 8
+  n_head: 4
+  n_emb: 256
+  n_cond_layers: 0
+  p_drop_emb: 0.0
+  p_drop_attn: 0.1
+  causal_attn: true
+  time_as_cond: true
+  router_condition_key: agent_pos
+  visual_dim: 256  # ori:256, reducing this will lead to performance drop
+  visual_encoder_layers: 4
+  visual_encoder_heads: 8  # ori:8
+  position_encoding_types: [apt_interpolated, level_embedding]
+  pooling_type: cls_token
+  patch_embedding_type: conv  # ori:conv
+  st_gate_location: content_embedding
+  patch_level_adapter_channels: null
+  foveation_net:
+    _target_: diffusion_policy.model.roi.foveation_net.FoveationNet
+    in_channels: 3
+    input_hw: ${foveation_input_hw}
+    num_levels: 3
+    global_level: 0
+    router_type: node_aligned_fpn  # or: node_aligned_vit
+    # For frozen JEPA ablation, use vjepa2_1_vit_base_384 and freeze=true.
+    global_encoder_type: resnet10  # or: resnet10-768, quadtree_vit_tiny-128
+    global_feature_dim: 768
+    # Only used by JEPA encoders.
+    torch_home: "/home/geyuan/pretrained/torch"
+    patch_size: 16
+    router_hidden_dim: 128
+    router_layers: 4
+    router_heads: 8
+    router_mlp_ratio: 4.0
+    router_dropout: 0.0
+    router_cond_dim: 512
+    freeze_global_encoder: false
+    freeze_router: false
+    # random:<ratio>[,<ratio>...] selects a ratio per sample, then resamples one
+    # topology shared by its frames; fixed:<ratio> is sampled once and saved.
+    # Also supports null, coarsest, and finest.
+    fix_split_mode: null
+    # Training-only per-frame topology dropout; preserves router patch count.
+    random_topology_prob: 0.2
+    router_temperature: 1.0
+    # Use binary action 1 (default) or 0 (low logit) for split in this ablation.
+    split_action_value: 1
+    target_num_patches: 0.75  # TODO:ori:0.25
+    budget_loss_weight: 0.1
+    budget_probability_type: clean_expected
+
+image_shape: &image_shape [3, 256, 256]
+foveation_input_hw: &foveation_input_hw [256, 256]
+shape_meta: &shape_meta
+  obs:
+    # Foveation consumes the original PushT frame; there is no ROI-derived key.
+    image:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+
+task:
+  dataset:
+    _target_: diffusion_policy.dataset.pusht_image_dataset.MergedPushTImageDataset
+    shape_meta: ${shape_meta}
+    horizon: ${horizon}
+    n_obs_steps: ${n_obs_steps}
+    load_future_frames: false
+    max_train_episodes: 90
+    pad_after: 7
+    pad_before: 1
+    seed: 42
+    val_ratio: 0.01
+    transform_color_jitter: true
+    zarr_paths:
+      - data/pusht/pusht_256_size15.zarr
+  # Retained from the PushT task config for future target-domain experiments.
+  dataset_target:
+    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
+    shape_meta: ${shape_meta}
+    horizon: ${horizon}
+    n_obs_steps: ${n_obs_steps}
+    load_future_frames: false
+    max_train_episodes: 200
+    pad_after: 7
+    pad_before: 1
+    seed: 42
+    val_ratio: 0.02
+    zarr_path: data/pusht/pusht_size.zarr
+  env_runner:
+    _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
+    fps: 10
+    legacy_test: true
+    max_steps: 300
+    n_action_steps: ${n_action_steps}
+    n_envs: null
+    n_obs_steps: ${n_obs_steps}
+    n_test: 100  # ori:50
+    n_test_vis: 4
+    n_train: 0
+    n_train_vis: 0
+    past_action: false
+    test_start_seed: 4300000
+    train_start_seed: 0
+    domain_shift: size15
+    render_size: 256
+  image_shape: *image_shape
+  name: pusht_image
+  shape_meta: ${shape_meta}
+
+training:
+  seed: 42
+  device: cuda:0
+  num_epochs: 2000
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  resume: false
+  use_ema: true
+  # Freeze visual/action weights in eval mode; requires an unfrozen learned router.
+  router_only: false
+  val_every: 25
+  rollout_every: 50
+  checkpoint_every: ${training.rollout_every}
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  router_temperature_start: 1.0  # ori:1.0
+  router_temperature_end: 1.0  # ori:0.2
+  router_temperature_steps: 90000  # ori:100000
+  router_temperature_schedule: constant  # ori:cosine
+  target_num_patches_start: 0.75  # ori:0.75
+  target_num_patches_decay_epochs: 1200
+  router_grad_norm_every: 100
+
+pretrained_ckpt: null

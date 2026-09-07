@@ -64,11 +64,22 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                  eval_fixed_crop=False,
                  roi_net=None,
                  roi_area_loss_weight: float = 0.01,
+                 roi_area_loss_mode: str = "square",
+                 roi_area_loss_upper_bound: Optional[float] = None,
+                 roi_area_loss_lower_bound: Optional[float] = None,
                  roi_area_loss_weight_increase_ratio: Optional[float] = None,
                  roi_area_loss_weight_increase_per_steps: Optional[int] = None,
                  roi_area_loss_weight_max: float = 0.01,
                  roi_center_diversity_loss_weight: float = 0.0,
                  roi_center_diversity_margin: float = 0.25,
+                 roi_scale_diversity_loss_weight: float = 0.0,
+                 roi_scale_diversity_mode: str = "pairwise_hinge",
+                 roi_scale_diversity_value: Optional[float] = None,
+                 roi_scale_diversity_margin: Optional[float] = None,
+                 roi_scale_mean_target: float = 0.2,
+                 roi_scale_std_target: float = 0.2,
+                 roi_scale_sample_std_loss_weight: float = 0.0,
+                 roi_scale_sample_std_target: float = 0.05,
                  p_drop_full_image: float = 0.3,
                  concat_roi: bool = False,
                  use_image_roi_only: bool = False,
@@ -331,12 +342,93 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         self.pretrained_ckpt = None
         self.roi_area_loss_weight = float(roi_area_loss_weight)
+        self.roi_area_loss_mode = str(roi_area_loss_mode)
+        self.roi_area_loss_upper_bound = (
+            None if roi_area_loss_upper_bound is None
+            else float(roi_area_loss_upper_bound)
+        )
+        self.roi_area_loss_lower_bound = (
+            None if roi_area_loss_lower_bound is None
+            else float(roi_area_loss_lower_bound)
+        )
         self.roi_center_diversity_loss_weight = float(roi_center_diversity_loss_weight)
         self.roi_center_diversity_margin = float(roi_center_diversity_margin)
+        self.roi_scale_diversity_loss_weight = float(roi_scale_diversity_loss_weight)
+        self.roi_scale_diversity_mode = str(roi_scale_diversity_mode)
+        self.roi_scale_mean_target = float(roi_scale_mean_target)
+        self.roi_scale_std_target = float(roi_scale_std_target)
+        self.roi_scale_sample_std_target = float(roi_scale_sample_std_target)
+        self.roi_scale_sample_std_loss_weight = float(roi_scale_sample_std_loss_weight)
+        if roi_scale_diversity_value is not None and roi_scale_diversity_margin is not None:
+            raise ValueError(
+                "`roi_scale_diversity_value` and deprecated "
+                "`roi_scale_diversity_margin` cannot both be set."
+            )
+        if roi_scale_diversity_value is None:
+            roi_scale_diversity_value = (
+                0.05 if roi_scale_diversity_margin is None
+                else roi_scale_diversity_margin
+            )
+        # Mode-dependent: pairwise_hinge uses this as a margin; batch_std_target
+        # uses it as the target lower bound for batch std over scale.
+        self.roi_scale_diversity_value = float(roi_scale_diversity_value)
+        self.roi_scale_diversity_margin = self.roi_scale_diversity_value
+        if self.roi_area_loss_mode not in {"square", "identity", "upper", "range"}:
+            raise ValueError("`roi_area_loss_mode` must be 'square', 'identity', 'upper', or 'range'.")
+        if self.roi_area_loss_mode == "upper" and self.roi_area_loss_upper_bound is None:
+            raise ValueError("`roi_area_loss_upper_bound` must be set when `roi_area_loss_mode='upper'`.")
+        if (
+                self.roi_area_loss_mode == "range"
+                and (
+                    self.roi_area_loss_lower_bound is None
+                    or self.roi_area_loss_upper_bound is None
+                )
+        ):
+            raise ValueError(
+                "`roi_area_loss_lower_bound` and `roi_area_loss_upper_bound` "
+                "must be set when `roi_area_loss_mode='range'`."
+            )
+        if (
+                self.roi_area_loss_upper_bound is not None
+                and self.roi_area_loss_upper_bound < 0.0
+        ):
+            raise ValueError("`roi_area_loss_upper_bound` must be non-negative.")
+        if (
+                self.roi_area_loss_lower_bound is not None
+                and self.roi_area_loss_lower_bound < 0.0
+        ):
+            raise ValueError("`roi_area_loss_lower_bound` must be non-negative.")
+        if (
+                self.roi_area_loss_lower_bound is not None
+                and self.roi_area_loss_upper_bound is not None
+                and self.roi_area_loss_lower_bound > self.roi_area_loss_upper_bound
+        ):
+            raise ValueError("`roi_area_loss_lower_bound` must be <= `roi_area_loss_upper_bound`.")
+        if self.roi_scale_diversity_mode not in {
+            "pairwise_hinge",
+            "batch_std_target",
+            "batch_mean_std_target",
+        }:
+            raise ValueError(
+                "`roi_scale_diversity_mode` must be 'pairwise_hinge', "
+                "'batch_std_target', or 'batch_mean_std_target'."
+            )
         if self.roi_center_diversity_loss_weight < 0.0:
             raise ValueError("`roi_center_diversity_loss_weight` must be non-negative.")
         if self.roi_center_diversity_margin < 0.0:
             raise ValueError("`roi_center_diversity_margin` must be non-negative.")
+        if self.roi_scale_diversity_loss_weight < 0.0:
+            raise ValueError("`roi_scale_diversity_loss_weight` must be non-negative.")
+        if self.roi_scale_diversity_value < 0.0:
+            raise ValueError("`roi_scale_diversity_value` must be non-negative.")
+        if self.roi_scale_mean_target < 0.0:
+            raise ValueError("`roi_scale_mean_target` must be non-negative.")
+        if self.roi_scale_std_target < 0.0:
+            raise ValueError("`roi_scale_std_target` must be non-negative.")
+        if self.roi_scale_sample_std_target < 0.0:
+            raise ValueError("`roi_scale_sample_std_target` must be non-negative.")
+        if self.roi_scale_sample_std_loss_weight < 0.0:
+            raise ValueError("`roi_scale_sample_std_loss_weight` must be non-negative.")
         self.roi_area_loss_weight_increase_ratio = (
             None if roi_area_loss_weight_increase_ratio is None
             else float(roi_area_loss_weight_increase_ratio)
@@ -358,7 +450,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                 and self.roi_area_loss_weight_increase_per_steps <= 0
         ):
             raise ValueError("`roi_area_loss_weight_increase_per_steps` must be > 0.")
-        self.roi_area_loss_weight_max = roi_area_loss_weight_max
+        self.roi_area_loss_weight_max = roi_area_loss_weight_max if roi_area_loss_weight_max is not None else 100.0
         self._roi_area_loss_step = 0
         self._effective_roi_area_loss_weight = min(
             self.roi_area_loss_weight,
@@ -1024,6 +1116,9 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             'action': action,
             'action_pred': action_pred
         }
+        result["roi_params_B_T_3"] = roi_out["params_B_T_3"]
+        if "params_mean_B_T_3" in roi_out:
+            result["roi_params_mean_B_T_3"] = roi_out["params_mean_B_T_3"]
         return result
 
     def reset(self):
@@ -1151,22 +1246,64 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         diffusion_loss = diffusion_loss.mean()
 
         roi_params = roi_out["params_B_T_3"]
+        roi_regularizer_params = roi_out.get("params_mean_B_T_3", roi_params)
         if self.obs_as_cond:
             roi_params = roi_params[:, :To]
-        roi_area_loss = self.roi_net.area_loss(roi_params)
+            roi_regularizer_params = roi_regularizer_params[:, :To]
+        roi_area_loss = self.roi_net.area_loss(
+            roi_regularizer_params,
+            mode=self.roi_area_loss_mode,
+            upper_bound=self.roi_area_loss_upper_bound,
+            lower_bound=self.roi_area_loss_lower_bound,
+        )
         effective_roi_area_loss_weight = self._effective_roi_area_loss_weight
         roi_area_weighted_loss = effective_roi_area_loss_weight * roi_area_loss
         roi_center_diversity_loss = self.roi_net.center_diversity_loss(
-            roi_params,
+            roi_regularizer_params,
             margin=self.roi_center_diversity_margin,
         )
         roi_center_diversity_weighted_loss = (
             self.roi_center_diversity_loss_weight * roi_center_diversity_loss
         )
+        if self.roi_scale_diversity_mode == "pairwise_hinge":
+            roi_scale_diversity_loss = self.roi_net.scale_diversity_loss(
+                roi_regularizer_params,
+                margin=self.roi_scale_diversity_value,
+            )
+        elif self.roi_scale_diversity_mode == "batch_std_target":
+            roi_scale_diversity_loss = self.roi_net.scale_batch_std_loss(
+                roi_regularizer_params,
+                std_target=self.roi_scale_diversity_value,
+            )
+        elif self.roi_scale_diversity_mode == "batch_mean_std_target":
+            roi_scale_diversity_loss = self.roi_net.scale_batch_mean_std_target_loss(
+                roi_regularizer_params,
+                mean_target=self.roi_scale_mean_target,
+                std_target=self.roi_scale_std_target,
+            )
+        else:
+            raise RuntimeError(f"Unsupported roi_scale_diversity_mode {self.roi_scale_diversity_mode}.")
+        roi_scale_diversity_weighted_loss = (
+            self.roi_scale_diversity_loss_weight * roi_scale_diversity_loss
+        )
+        raw_scale_std = roi_out.get("raw_scale_std_B_T")
+        if raw_scale_std is None:
+            roi_scale_sample_std_loss = roi_params.sum() * 0.0
+        else:
+            if self.obs_as_cond:
+                raw_scale_std = raw_scale_std[:, :To]
+            roi_scale_sample_std_loss = (
+                raw_scale_std - self.roi_scale_sample_std_target
+            ).square().mean()
+        roi_scale_sample_std_weighted_loss = (
+            self.roi_scale_sample_std_loss_weight * roi_scale_sample_std_loss
+        )
         total_loss = (
             diffusion_loss
             + roi_area_weighted_loss
             + roi_center_diversity_weighted_loss
+            + roi_scale_diversity_weighted_loss
+            + roi_scale_sample_std_weighted_loss
         )
 
         losses = {
@@ -1177,10 +1314,18 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             "roi_center_diversity_loss": roi_center_diversity_loss,
             "roi_center_diversity_loss_weight": self.roi_center_diversity_loss_weight,
             "roi_center_diversity_weighted_loss": roi_center_diversity_weighted_loss,
+            "roi_scale_diversity_loss": roi_scale_diversity_loss,
+            "roi_scale_diversity_loss_weight": self.roi_scale_diversity_loss_weight,
+            "roi_scale_diversity_weighted_loss": roi_scale_diversity_weighted_loss,
+            "roi_scale_sample_std_loss": roi_scale_sample_std_loss,
+            "roi_scale_sample_std_loss_weight": self.roi_scale_sample_std_loss_weight,
+            "roi_scale_sample_std_weighted_loss": roi_scale_sample_std_weighted_loss,
             "total_loss": total_loss,
         }
         if return_roi_params:
             losses["_roi_params_B_T_3"] = roi_out["params_B_T_3"].detach()
+            if "params_mean_B_T_3" in roi_out:
+                losses["_roi_params_mean_B_T_3"] = roi_out["params_mean_B_T_3"].detach()
 
         return losses
 

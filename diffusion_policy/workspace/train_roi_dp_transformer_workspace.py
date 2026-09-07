@@ -31,6 +31,9 @@ from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
+from robokit.debug_utils.time_profiler import global_time_profiler as gtp
+
+
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
@@ -57,6 +60,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
+        self.vis_rotate_image = bool(getattr(cfg, "vis_rotate_image", False))
 
         # configure model
         self.model: DiffusionTransformerHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
@@ -137,6 +141,8 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                     image_B_T_C_H_W[batch_idx, step_idx])
                 params = params_B_T_3[batch_idx, step_idx]
                 boxed_image = self._draw_roi_box(image, params)
+                if self.vis_rotate_image:
+                    boxed_image = np.flip(boxed_image, axis=(0, 1)).copy()
                 center_x, center_y, scale = params.detach().float().cpu().tolist()
                 caption = (
                     f"b={batch_idx}, t={step_idx}, "
@@ -308,23 +314,28 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         with accelerator.accumulate(self.model):
+                            policy_live = accelerator.unwrap_model(self.model)
+                            policy_live.set_roi_area_loss_step(self.global_step)
+                            if cfg.training.use_ema:
+                                self.ema_model.set_roi_area_loss_step(self.global_step)
                             want_train_vis = (
                                 train_vis_batch is None
                                 and (self.epoch % cfg.training.sample_every) == 0
                             )
-                            losses: dict = self.model(batch, return_roi_params=want_train_vis)
+                            losses: dict = self.model(batch, return_roi_params=want_train_vis)  # will call `compute_loss`
                             if want_train_vis:
                                 train_vis_batch = batch
                                 train_vis_roi_params = losses["_roi_params_B_T_3"]
                             raw_loss = losses['total_loss']
-                            accelerator.backward(raw_loss)
+                            with gtp("train/backward", group="train/backward"):
+                                accelerator.backward(raw_loss)
 
-                            if accelerator.sync_gradients:
-                                self.optimizer.step()
-                                self.lr_scheduler.step()
-                                self.optimizer.zero_grad()
-                                if cfg.training.use_ema:
-                                    ema.step(accelerator.unwrap_model(self.model))
+                                if accelerator.sync_gradients:
+                                    self.optimizer.step()
+                                    self.lr_scheduler.step()
+                                    self.optimizer.zero_grad()
+                                    if cfg.training.use_ema:
+                                        ema.step(accelerator.unwrap_model(self.model))
 
                             for k, v in losses.items():
                                 if k == 'total_loss' or k.startswith("_"):
@@ -349,6 +360,11 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             if not is_last_batch:
                                 wandb_run.log(step_log, step=self.global_step)
                                 json_logger.log(step_log)
+
+                            # TODO: debug training speed
+                            gtp.step()
+                            if self.global_step > 1 and self.global_step % 100 == 0:
+                                gtp.report()
 
                         self.global_step += 1
 
@@ -383,7 +399,17 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         "total_loss": torch.tensor(0.0, device=device),
                         "diffusion_loss": torch.tensor(0.0, device=device),
                         "roi_area_loss": torch.tensor(0.0, device=device),
+                        "roi_area_loss_weight": torch.tensor(0.0, device=device),
                         "roi_area_weighted_loss": torch.tensor(0.0, device=device),
+                        "roi_center_diversity_loss": torch.tensor(0.0, device=device),
+                        "roi_center_diversity_loss_weight": torch.tensor(0.0, device=device),
+                        "roi_center_diversity_weighted_loss": torch.tensor(0.0, device=device),
+                        "roi_scale_diversity_loss": torch.tensor(0.0, device=device),
+                        "roi_scale_diversity_loss_weight": torch.tensor(0.0, device=device),
+                        "roi_scale_diversity_weighted_loss": torch.tensor(0.0, device=device),
+                        "roi_scale_sample_std_loss": torch.tensor(0.0, device=device),
+                        "roi_scale_sample_std_loss_weight": torch.tensor(0.0, device=device),
+                        "roi_scale_sample_std_weighted_loss": torch.tensor(0.0, device=device),
                     }
                     val_batches = torch.tensor(0, device=device)
                     val_vis_batch = None
@@ -416,6 +442,8 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                                             if not isinstance(value, torch.Tensor):
                                                 value = torch.tensor(value, device=device)
                                             val_loss_sums[key] += value.detach()
+
+                                    gtp.step()
                                     val_batches += 1
                     finally:
                         policy_live.train(policy_live_was_training)
@@ -426,7 +454,17 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         val_loss_sums["total_loss"],
                         val_loss_sums["diffusion_loss"],
                         val_loss_sums["roi_area_loss"],
+                        val_loss_sums["roi_area_loss_weight"],
                         val_loss_sums["roi_area_weighted_loss"],
+                        val_loss_sums["roi_center_diversity_loss"],
+                        val_loss_sums["roi_center_diversity_loss_weight"],
+                        val_loss_sums["roi_center_diversity_weighted_loss"],
+                        val_loss_sums["roi_scale_diversity_loss"],
+                        val_loss_sums["roi_scale_diversity_loss_weight"],
+                        val_loss_sums["roi_scale_diversity_weighted_loss"],
+                        val_loss_sums["roi_scale_sample_std_loss"],
+                        val_loss_sums["roi_scale_sample_std_loss_weight"],
+                        val_loss_sums["roi_scale_sample_std_weighted_loss"],
                         val_batches.float(),
                     ])
                     stats = accelerator.reduce(stats, reduction="sum")
@@ -436,7 +474,17 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         step_log["val_loss"] = (stats[0] / val_count).item()
                         step_log["val_diffusion_loss"] = (stats[1] / val_count).item()
                         step_log["val_roi_area_loss"] = (stats[2] / val_count).item()
-                        step_log["val_roi_area_weighted_loss"] = (stats[3] / val_count).item()
+                        step_log["val_roi_area_loss_weight"] = (stats[3] / val_count).item()
+                        step_log["val_roi_area_weighted_loss"] = (stats[4] / val_count).item()
+                        step_log["val_roi_center_diversity_loss"] = (stats[5] / val_count).item()
+                        step_log["val_roi_center_diversity_loss_weight"] = (stats[6] / val_count).item()
+                        step_log["val_roi_center_diversity_weighted_loss"] = (stats[7] / val_count).item()
+                        step_log["val_roi_scale_diversity_loss"] = (stats[8] / val_count).item()
+                        step_log["val_roi_scale_diversity_loss_weight"] = (stats[9] / val_count).item()
+                        step_log["val_roi_scale_diversity_weighted_loss"] = (stats[10] / val_count).item()
+                        step_log["val_roi_scale_sample_std_loss"] = (stats[11] / val_count).item()
+                        step_log["val_roi_scale_sample_std_loss_weight"] = (stats[12] / val_count).item()
+                        step_log["val_roi_scale_sample_std_weighted_loss"] = (stats[13] / val_count).item()
                         if val_vis_batch is not None and val_vis_roi_params is not None:
                             step_log["vis/val_roi_box"] = self._make_roi_vis_images(
                                 val_vis_batch, val_vis_roi_params)
@@ -464,7 +512,18 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         gt_action = train_sampling_batch['action']
                         result = policy.predict_action(obs_dict)
                         mse = torch.nn.functional.mse_loss(result['action_pred'], gt_action)
-                        step_log['train_action_mse_error'] = mse.item()
+                        step_log['sample/train_action_mse_error'] = mse.item()
+                        roi_params = result.get("roi_params_B_T_3")
+                        if roi_params is not None:
+                            roi_params_flat = roi_params.detach().float().reshape(-1, 3)
+                            step_log["sample/roi_center_x_mean"] = roi_params_flat[:, 0].mean().item()
+                            step_log["sample/roi_center_x_var"] = roi_params_flat[:, 0].var(unbiased=False).item()
+                            step_log["sample/roi_center_y_mean"] = roi_params_flat[:, 1].mean().item()
+                            step_log["sample/roi_center_y_var"] = roi_params_flat[:, 1].var(unbiased=False).item()
+                            step_log["sample/roi_scale_mean"] = roi_params_flat[:, 2].mean().item()
+                            step_log["sample/roi_scale_var"] = roi_params_flat[:, 2].var(unbiased=False).item()
+                            step_log["sample/roi_scale_min"] = roi_params_flat[:, 2].min().item()
+                            step_log["sample/roi_scale_max"] = roi_params_flat[:, 2].max().item()
                         if train_vis_batch is not None and train_vis_roi_params is not None:
                             step_log["vis/train_roi_box"] = self._make_roi_vis_images(
                                 train_vis_batch, train_vis_roi_params)
@@ -482,7 +541,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             self.save_snapshot()
 
                         metric_dict = {k.replace('/', '_'): v for k, v in step_log.items()}
-                        # NOTE: why no val_loss? {'train_loss': 0.44689754078118626, 'global_step': 282, 'epoch': 0, 'lr': 5.66e-05, 'train_action_mse_error': 0.2813175352475294}
+                        # NOTE: why no val_loss? {'train_loss': 0.44689754078118626, 'global_step': 282, 'epoch': 0, 'lr': 5.66e-05, 'sample/train_action_mse_error': 0.2813175352475294}
                         monitor_key = cfg.checkpoint.topk.monitor_key
                         assert monitor_key in metric_dict, f"skip topk ckpt: monitor_key `{monitor_key}` not in step_log."
                         topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)

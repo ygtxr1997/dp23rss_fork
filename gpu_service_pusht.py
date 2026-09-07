@@ -49,9 +49,9 @@ max_cache_action = 8  # ori:32
 # log_time = "2026.04.15-01.26.00"  # `light`, vis_encoder from `predict_all`
 # log_time = "2026.04.15-01.24.54"  # `block`, vis_encoder from `predict_all`
 
-log_time = "2026.04.17-02.40.03"  # `none+goal+light`, moe from scratch
+# log_time = "2026.04.17-02.40.03"  # `none+goal+light`, moe from scratch
 # log_time = "2026.04.11-00.08.53"  # `none+goal+light`, moe from teacher + freeze FFN
-# log_time = "2026.04.16-17.04.04"  # `none+goal+light`, moe from teacher + finetune
+log_time = "2026.04.16-17.04.04"  # `none+goal+light`, moe from teacher + finetune
 
 w_idx = -2
 

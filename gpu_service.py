@@ -26,12 +26,12 @@ from robokit.debug_utils.time_profiler import global_time_profiler as gtp
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=4 uvicorn gpu_service:gpu_app --port 6070
+CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service:gpu_app --port 6070
 """
 gpu_app = FastAPI()
 max_cache_action = 32
 
-log_time = "2026.04.29-22.07.32"
+log_time = "2026.05.01-17.54.53"
 w_idx = -1
 
 map_time_to_dataset = {
@@ -60,7 +60,10 @@ map_time_to_dataset = {
     "2026.04.24-18.38.41": "0417_test_tube",
     "2026.04.22-18.15.26": "0417_french_press",
     "2026.04.28-21.28.06": "1201_screw_bulb_turn_off_table",
-    "2026.04.29-22.07.32": "0417_brush",
+    "2026.04.30-22.33.39": "1201_screw_bulb_turn_off_object",
+    "2026.05.01-17.54.53": "1201_screw_bulb_turn_off_light",
+    "2026.05.01-01.51.17": "0417_brush",
+    "2026.05.20-01.34.58": "260514_ethernet",
 }
 # train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
@@ -293,6 +296,9 @@ def model_step(step_request: StepRequestFromEvaluator):
     #     "lang_text": instruction_text,
     #     "proprioception": joint_state,
     # }
+    if hasattr(hydra_config.shape_meta.obs, "success"):
+        B, _, _ = force_B_T_D.shape
+        obs_dict["success"] = torch.ones((B, 1), device="cuda") * 1.  # for CFG-RL
 
     # 3.a Model inference
     # action_idx = agent.infer_frame_idx % max_cache_action
@@ -324,7 +330,8 @@ def model_step(step_request: StepRequestFromEvaluator):
     out_action = cache_action[None, :, :].numpy()  # (1,T,D)
     print(f"[DEBUG] index={agent.infer_frame_idx}, gpu_service output action shape:", out_action.shape)
     with gtp("encode", group="process_request"):
-        request_to_evaluator = StepRequestFromPolicy.encode_from_raw(action=out_action)
+        request_to_evaluator = StepRequestFromPolicy.encode_from_raw(action=out_action,
+                                                                     max_cache_action=max_cache_action)
 
     if agent.infer_frame_idx % 15 == 0:
         gtp.report()

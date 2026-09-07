@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 import bisect
 import torch
 from torch.utils.data import ConcatDataset
@@ -27,7 +27,9 @@ class PushTImageDataset(BaseImageDataset):
             max_train_episodes=None,
             shape_meta: Dict = None,
             transform_color_jitter: bool = False,
-            return_all_state: bool = False
+            return_all_state: bool = False,
+            n_obs_steps: Optional[int] = None,
+            load_future_frames: bool = False,
             ):
         
         super().__init__()
@@ -43,12 +45,25 @@ class PushTImageDataset(BaseImageDataset):
             max_n=max_train_episodes, 
             seed=seed)
 
+        self.n_obs_steps = horizon if n_obs_steps is None else int(n_obs_steps)
+        if self.n_obs_steps < 1 or self.n_obs_steps > horizon:
+            raise ValueError(
+                f"n_obs_steps must be in [1, horizon], got n_obs_steps={self.n_obs_steps}, horizon={horizon}"
+            )
+        self.load_future_frames = bool(load_future_frames)
+        self.loaded_obs_steps = horizon if self.load_future_frames else self.n_obs_steps
+        key_first_k = {
+            'img': self.loaded_obs_steps,
+            'state': self.loaded_obs_steps,
+        } if self.loaded_obs_steps < horizon else {}
+
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer, 
             sequence_length=horizon,
             pad_before=pad_before, 
             pad_after=pad_after,
-            episode_mask=train_mask)
+            episode_mask=train_mask,
+            key_first_k=key_first_k)
         self.train_mask = train_mask
         self.horizon = horizon
         self.pad_before = pad_before
@@ -82,7 +97,11 @@ class PushTImageDataset(BaseImageDataset):
             sequence_length=self.horizon,
             pad_before=self.pad_before, 
             pad_after=self.pad_after,
-            episode_mask=~self.train_mask
+            episode_mask=~self.train_mask,
+            key_first_k={
+                'img': self.loaded_obs_steps,
+                'state': self.loaded_obs_steps,
+            } if self.loaded_obs_steps < self.horizon else {}
             )
         val_set.train_mask = ~self.train_mask
         return val_set
@@ -110,12 +129,15 @@ class PushTImageDataset(BaseImageDataset):
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
-        all_state = sample['state'].astype(np.float32)  # (agent_posx2, block_posex3)
+        obs_state = sample['state'][:self.loaded_obs_steps]
+        obs_img = sample['img'][:self.loaded_obs_steps]
+
+        all_state = obs_state.astype(np.float32)  # (agent_posx2, block_posex3)
         all_state_data = all_state / 256. - 1. # from (0,512) to (-1,1)
         agent_pos_data = all_state_data[:, :2].astype(np.float32) # (agent_posx2, block_posex3)
 
         # image = np.moveaxis(sample['img'],-1,1) / 255  # (B,H,W,C) -> (B,C,H,W), in [0,1]
-        image = self.obs_image_transform(sample['img'])  # (T,H,W,C) in [0,255] -> (T,C,H,W) in [0,1]
+        image = self.obs_image_transform(obs_img)  # (T,H,W,C) in [0,255] -> (T,C,H,W) in [0,1]
 
         # print(sample.keys(), type(sample['img']))
         # print(sample['img'].mean(), sample['img'].max(),sample['img'].min())
@@ -185,7 +207,9 @@ class MergedPushTImageDataset(BaseImageDataset):
                  max_train_episodes=None,
                  shape_meta: Dict = None,
                  transform_color_jitter: bool = False,
-                 return_all_state: bool = False
+                 return_all_state: bool = False,
+                 n_obs_steps: Optional[int] = None,
+                 load_future_frames: bool = False,
                  ):
         super().__init__()
 
@@ -203,6 +227,8 @@ class MergedPushTImageDataset(BaseImageDataset):
                 shape_meta=shape_meta,
                 transform_color_jitter=transform_color_jitter,
                 return_all_state=return_all_state,
+                n_obs_steps=n_obs_steps,
+                load_future_frames=load_future_frames,
             )
             self.datasets.append(dataset)
 
@@ -215,6 +241,9 @@ class MergedPushTImageDataset(BaseImageDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.shape_meta = shape_meta
+        self.n_obs_steps = horizon if n_obs_steps is None else int(n_obs_steps)
+        self.load_future_frames = bool(load_future_frames)
+        self.loaded_obs_steps = horizon if self.load_future_frames else self.n_obs_steps
 
     def get_validation_dataset(self):
         """

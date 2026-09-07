@@ -3,7 +3,7 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=4,5,6,7 bash scripts/moe/sh_train_libero_moe.sh
+CUDA_VISIBLE_DEVICES=5,7 bash scripts/moe/sh_train_libero_moe.sh
 "
 
 ### Merge MoE ###
@@ -22,9 +22,9 @@ hdf5_fns=(
 )
 ffn_expand_factor=(6 10 2)
 teacher_ckpts=(
-  "data/outputs/2026.04.30/11.31.13_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
-  "data/outputs/2026.04.30/13.28.53_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
-  "data/outputs/2026.04.30/10.49.10_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+#  "data/outputs/2026.04.30/11.31.13_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+#  "data/outputs/2026.04.30/13.28.53_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+#  "data/outputs/2026.04.30/10.49.10_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
 )
 
 dataset_subnames_override="[$(IFS=,; echo "${dataset_subnames[*]}")]"

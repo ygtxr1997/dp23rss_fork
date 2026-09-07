@@ -20,112 +20,17 @@ from diffusion_policy.env.pusht.pusht_image_env import PushTImageEnv
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
 # from diffusion_policy.gym_util.sync_vector_env import SyncVectorEnv
 from diffusion_policy.gym_util.multistep_wrapper import MultiStepWrapper
-from diffusion_policy.gym_util.video_recording_wrapper import VideoRecordingWrapper, VideoRecorder
+from diffusion_policy.gym_util.video_recording_wrapper import (
+    VideoRecordingWrapper,
+    VideoRecorder,
+    ROIVideoSaver,
+)
 
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 
-
-class StepRequestFromEvaluator(pydantic.BaseModel):
-    """
-    Sent from evaluator to policy.
-
-        gt_video (B,Ts,H,W,3) uint8 \n
-        tcp_state: (B,Ts,D) float32, optional \n
-        stage_flag: 0:cold start, 1:hot start \n
-        instruction: str
-    """
-    instruction: str
-    stage_flag: int  # 0:cold start, 1:hot start
-
-    gt_video: List[List[str]]  # len1=B, len2=Ts (Ts>=v1), each str is base64 of (H,W,rgb)
-    tcp_state: Optional[List[List[List[float]]]] = None # len1=B, len2=Ts, len3=D, float32
-
-    def decode_to_raw(self) -> Dict[str, Any]:
-        def base64_to_image_H_W_C(img_base64: str) -> np.ndarray:
-            img_byte = base64.b64decode(img_base64)
-            img_pil = Image.open(io.BytesIO(img_byte), formats=["JPEG"])
-            img_np = np.array(img_pil)  # (H,W,3) uint8
-            return img_np
-
-        def base64_to_video_T_H_W_C(vid_base64: List[str]) -> np.ndarray:
-            return np.stack([base64_to_image_H_W_C(img_b64) for img_b64 in vid_base64], axis=0)
-
-        gt_video_B_T_H_W_C = np.stack([base64_to_video_T_H_W_C(vid_b64) for vid_b64 in self.gt_video], axis=0)  # (B,Ts,H,W,3) uint8
-        tcp_state_B_T_D = None if self.tcp_state is None else np.array(self.tcp_state, dtype=np.float32)  # (B,Ts,2) float32
-        return {
-            "instruction": self.instruction,
-            "stage_flag": self.stage_flag,
-            "gt_video": gt_video_B_T_H_W_C,
-            "tcp_state": tcp_state_B_T_D,
-        }
-
-    @classmethod
-    def encode_from_raw(cls,
-                        instruction: str,
-                        stage_flag: int,
-                        gt_video: np.ndarray,  # (B,Ts,H,W,3) uint8
-                        tcp_state: Optional[np.ndarray] = None,  # (B,2) float32
-                        ) -> 'StepRequestFromEvaluator':
-        instance = cls(
-            instruction=instruction,
-            stage_flag=stage_flag,
-            gt_video=cls.video_np_to_base64(gt_video),
-            tcp_state=None if tcp_state is None else tcp_state.tolist()
-        )
-        return instance
-
-    @staticmethod
-    def video_np_to_base64(video: np.ndarray) -> List[List[str]]:
-        assert video.ndim in [4, 5], f"video should be (B,Ts,H,W,3) or (Ts,H,W,3), got {video.shape}"
-        assert video.dtype == np.uint8
-
-        def image_to_base64(img_H_W_C) -> str:
-            image_pil = Image.fromarray(img_H_W_C)
-            image_bytes = io.BytesIO()
-            image_pil.save(image_bytes, format="JPEG")
-            image_bytes = image_bytes.getvalue()
-            image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-            return image_base64
-
-        def video_to_base64(vid_T_H_W_C) -> List[str]:
-            return [image_to_base64(img) for img in vid_T_H_W_C]
-
-        if video.ndim == 4:  # No batch-dim
-            video_base64 = [video_to_base64(video)]  # add batch-dim
-        elif video.ndim == 5:
-            video_base64 = [video_to_base64(vid) for vid in video]
-        else:
-            raise NotImplementedError
-
-        return video_base64
-
-
-class StepRequestFromPolicy(pydantic.BaseModel):
-    """
-    Sent from policy to evaluator.
-
-        action: (B,v2,D) float32 \n
-        max_cache_action: int, optional, tell evaluator how many actions to cache, None means
-    """
-
-    action: List[List[List[float]]]  # len1=B, len2=v2 (v2=H), len3=D
-    max_cache_action: int = None  # tell evaluator how many actions to cache, None means no limit
-
-    def decode_to_raw(self) -> Dict[str, Any]:
-        return {
-            "action": np.array(self.action, dtype=np.float32)  # (B,v2,D) float32
-        }
-
-    @classmethod
-    def encode_from_raw(cls, action: np.ndarray) -> 'StepRequestFromPolicy':
-        if action.ndim == 2:  # (H,D)
-            action = action[np.newaxis, ...]  # add batch dim
-        assert action.ndim == 3, f"action should be (B,H,D), got {action.shape}"
-        assert action.dtype in [np.float32, np.float64], f"action should be float32 or float64, got {action.dtype}"
-        instance = cls(action=action.tolist())
-        return instance
+from robokit.connects.protocols import StepRequestFromEvaluator, StepRequestFromPolicy
 
 
 class PushTImageSocketRunner(BaseImageRunner):
@@ -202,7 +107,7 @@ class PushTImageSocketRunner(BaseImageRunner):
                 env.env.file_path = None
                 if enable_render:
                     filename = pathlib.Path(output_dir).joinpath(
-                        'media', wv.util.generate_id() + ".mp4")
+                        'media', f"domain={domain_shift}_{wv.util.generate_id()}" + ".mp4")
                     filename.parent.mkdir(parents=False, exist_ok=True)
                     filename = str(filename)
                     env.env.file_path = filename
@@ -228,7 +133,7 @@ class PushTImageSocketRunner(BaseImageRunner):
                 env.env.file_path = None
                 if enable_render:
                     filename = pathlib.Path(output_dir).joinpath(
-                        'media', wv.util.generate_id() + ".mp4")
+                        'media', f"domain={domain_shift}_{wv.util.generate_id()}" + ".mp4")
                     filename.parent.mkdir(parents=False, exist_ok=True)
                     filename = str(filename)
                     env.env.file_path = filename
@@ -271,7 +176,9 @@ class PushTImageSocketRunner(BaseImageRunner):
         self.send_per_frames = send_per_frames
         self.send_cnt = 0
         self.cache_actions_B_T_D = None
+        self.cache_extra_vector = None
         self.http_session = requests.Session()
+        self.stage_flag = None
         self.task_instruction = None
         self.cache_frames_B_H_W_C = None
 
@@ -284,6 +191,7 @@ class PushTImageSocketRunner(BaseImageRunner):
         self.send_per_frames = max(max_cache_action, 1)
         self.send_cnt = 0
         self.cache_actions_B_T_D = None
+        self.cache_extra_vector = None
         self.cache_frames_B_H_W_C = None
 
         self.task_instruction = task_instruction
@@ -304,6 +212,7 @@ class PushTImageSocketRunner(BaseImageRunner):
         self.send_per_frames = max(max_cache_action, 1)
         self.send_cnt = 0
         self.cache_actions_B_T_D = None
+        self.cache_extra_vector = None
         self.cache_frames_B_H_W_C = None
 
         print("[PushTImageSocketRunner] Reset policy server:", self.policy_url,
@@ -315,7 +224,7 @@ class PushTImageSocketRunner(BaseImageRunner):
                                 image_B_T_H_W_C: np.ndarray,
                                 stage_flag: int,
                                 robot_states_B_T_D: np.ndarray = None,
-                                ) -> np.ndarray:
+                                ) -> Tuple[np.ndarray, Optional[Dict[str, np.ndarray]]]:
         assert self.task_instruction is not None, "Please call init_socket first."
 
         if self.send_cnt % self.send_per_frames == 0:
@@ -325,6 +234,7 @@ class PushTImageSocketRunner(BaseImageRunner):
                 stage_flag=stage_flag,
                 gt_video=video_B_v2_H_W_C,  # (B,Ts,H,W,3) uint8
                 tcp_state=robot_states_B_T_D,  # (B,Ts,D) float32, not used
+                max_cache_action=self.send_per_frames,
             )
 
             # print(f"[PushTImageSocketRunner] sending frames, i={self.send_cnt}, per={self.send_per_frames}, "
@@ -337,19 +247,42 @@ class PushTImageSocketRunner(BaseImageRunner):
             response.raise_for_status()
 
             response = response.json()
-            raw_actions = StepRequestFromPolicy(action=response["action"]).decode_to_raw()["action"]  # (B,H,7)
+            response_data = StepRequestFromPolicy(
+                action=response["action"],
+                extra_vector=response.get("extra_vector", None),
+                max_cache_action=response.get("max_cache_action", None),
+            ).decode_to_raw()
+            raw_actions = response_data["action"]  # (B,H,7)
 
             # assert raw_actions.shape[0] == self.send_per_frames
             self.cache_actions_B_T_D = raw_actions
+            self.cache_extra_vector = response_data["extra_vector"]
             self.cache_frames_B_H_W_C = None
-        else:  # don't send anything, to save network bandwidth
-            pass
+            new_extra_vector = response_data["extra_vector"]
+        else:
+            new_extra_vector = None
 
-        ret_actions = self.cache_actions_B_T_D[:, self.send_cnt % self.send_per_frames]  # (B,D)
+        step_cache_idx = self.send_cnt % self.send_per_frames
+        ret_actions = self.cache_actions_B_T_D[:, step_cache_idx]  # (B,D)
         ret_actions_B_1_D = ret_actions[:, None]  # [B,D] -> (B,1,D)
 
         self.send_cnt += 1
-        return ret_actions_B_1_D
+        return ret_actions_B_1_D, new_extra_vector
+
+    def send_rollout_end(self) -> dict:
+        request = StepRequestFromEvaluator.create_rollout_end(
+            instruction=self.task_instruction or "",
+            stage_flag=self.stage_flag,
+        )
+
+        print("[DEBUG][PushTImageSocketRunner] Sending rollout end", request.model_dump(mode="json"))
+
+        response = self.http_session.post(
+            f"{self.policy_url}/rollout_end",
+            json=request.model_dump(mode="json"),
+        )
+        response.raise_for_status()
+        return response.json()
 
     def run(self, device: Union[torch.device, str] = "cuda", close_online: bool = True, stage_flag: int = 0):
         env = self.env
@@ -386,6 +319,7 @@ class PushTImageSocketRunner(BaseImageRunner):
             # start rollout
             obs = env.reset()
             past_action = None
+            chunk_roi_savers = [None] * this_n_active_envs
             # policy.reset()
 
             pbar = tqdm.tqdm(total=self.max_steps,
@@ -426,11 +360,29 @@ class PushTImageSocketRunner(BaseImageRunner):
                     # action_dict = {
                     #     "action": torch.randn((len(this_init_fns), 12, 2)).to(device=device) * 20 + 256.,
                     # }
-                    out_action_B_1_D = self.send_obs_and_get_action(
+                    out_action_B_1_D, extra_vector = self.send_obs_and_get_action(
                         image_B_T_H_W_C=latest_obs_B_T_H_W_C,  # (B,V*T,H,W,C) uint8
                         stage_flag=stage_flag,
                         robot_states_B_T_D=latest_robot_states_B_T_D,  # (B,T,2) float32
                     )
+                    if extra_vector is not None:
+                        roi_param_B_T_3 = extra_vector.get("roi_param", None)
+                        if roi_param_B_T_3 is not None:
+                            for env_idx in range(this_n_active_envs):
+                                if chunk_roi_savers[env_idx] is None:
+                                    chunk_roi_savers[env_idx] = ROIVideoSaver(
+                                        fps=self.fps,
+                                        codec='h264',
+                                        input_pix_fmt='rgb24',
+                                        save_crop_side_by_side=False,
+                                        crf=self.crf,
+                                        thread_type='FRAME',
+                                        thread_count=1,
+                                    )
+                                chunk_roi_savers[env_idx].append_window(
+                                    latest_obs_B_T_H_W_C[env_idx],
+                                    roi_param_B_T_3[env_idx],
+                                )
                     action_dict = {
                         "action": torch.from_numpy(out_action_B_1_D).to(device=device),  # (B,1,2)
                     }
@@ -443,6 +395,7 @@ class PushTImageSocketRunner(BaseImageRunner):
                         pass
                     else:
                         assert stage_flag == 2, f"Expected stage_flag to be 2 after first eval, got {stage_flag}"
+                    self.stage_flag = stage_flag
 
                 # print("[DEBUG] action:", action_dict["action"].min(), action_dict["action"].max(), action_dict["action"].shape,
                 #       "agent_pos:", obs_dict["agent_pos"].min(), obs_dict["agent_pos"].max(), obs_dict["agent_pos"].shape,
@@ -480,8 +433,9 @@ class PushTImageSocketRunner(BaseImageRunner):
                 step_idx += 1
                 pbar.update(action.shape[1])
             pbar.close()
+            self.send_rollout_end()  # notify GPU service that a rollout is finished
 
-            if self.reset_to_state is not None:
+            if False and self.reset_to_state is not None:  # NOTE: set to close for now
                 # Save trajectories (positions)
                 plt.imshow(np.flipud(first_obs_img), origin='lower')
 
@@ -535,7 +489,7 @@ class PushTImageSocketRunner(BaseImageRunner):
                     rgba_colors[:, 3] = alphas  # 修改透明度
                     plt.scatter(x, y, color=rgba_colors, s=1)
 
-            if self.reset_to_state is not None:
+            if False and self.reset_to_state is not None:
                 plt.xlim(0, 512)
                 plt.ylim(0, 512)
                 # plt.xlabel("X 坐标")
@@ -553,6 +507,11 @@ class PushTImageSocketRunner(BaseImageRunner):
                 np.save(f"data/pusht_eval_output/{save_name}.npy", all_positions)
 
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
+            for local_idx in range(this_n_active_envs):
+                saver = chunk_roi_savers[local_idx]
+                video_path = all_video_paths[start + local_idx]
+                if saver is not None and saver.has_data() and video_path is not None:
+                    saver.save_like(video_path)
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
         # clear out video buffer
         _ = env.reset()

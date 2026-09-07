@@ -38,6 +38,8 @@ from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.dataset.pusht_image_dataset import SourceTargetDataset
 
+from robokit.debug_utils.time_profiler import global_time_profiler as gtp
+
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -132,7 +134,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
-        val_dataloader = DataLoader(val_dataset, drop_last=True, **cfg.val_dataloader)
+        val_dataloader = DataLoader(val_dataset, drop_last=False, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -266,12 +268,13 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                                 losses: dict = self.model(batch)
                                 raw_loss = losses['total_loss']
                                 loss = raw_loss
-                                accelerator.backward(loss)
+                                with gtp("train/backward", group="train/backward"):
+                                    accelerator.backward(loss)
 
-                                if accelerator.sync_gradients:
-                                    self.optimizer.step()
-                                    self.lr_scheduler.step()
-                                    self.optimizer.zero_grad()
+                                    if accelerator.sync_gradients:
+                                        self.optimizer.step()
+                                        self.lr_scheduler.step()
+                                        self.optimizer.zero_grad()
 
                                 for k, v in losses.items():
                                     if k == 'total_loss': continue
@@ -322,6 +325,11 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                                 wandb_run.log(step_log, step=self.global_step)
                                 json_logger.log(step_log)
 
+                            # TODO: debug training speed
+                            gtp.step()
+                            if self.global_step > 1 and self.global_step % 100 == 0:
+                                gtp.report()
+
                         self.global_step += 1
 
                 # ========= 评测阶段 (仅让主进程执行 Rollout 和保存，避免冲突) =========
@@ -364,6 +372,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                                 loss = loss.detach() if isinstance(loss, torch.Tensor) else loss["total_loss"].detach()
                                 val_loss_sum += loss
                                 val_batches += 1
+                                gtp.step()
 
                     stats = torch.stack([val_loss_sum, val_batches.float()])
                     stats = accelerator.reduce(stats, reduction="sum")

@@ -3,10 +3,10 @@ checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
   topk:
-    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+    format_str: epoch={epoch:04d}-mse_error={sample_train_action_mse_error:.3f}.ckpt
     k: 5
-    mode: max
-    monitor_key: test_mean_score
+    mode: min
+    monitor_key: sample_train_action_mse_error
 dataloader:
   batch_size: 64  # ori:64
   num_workers: 24
@@ -22,8 +22,9 @@ ema:
   power: 0.75
   update_after_step: 0
 exp_name: default
-horizon: 10
+horizon: 32
 keypoint_visible_rate: 1.0
+vis_rotate_image: true  # just for libero vis in training
 logging:
   group: null
   id: null
@@ -37,7 +38,7 @@ multi_run:
   wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
 n_action_steps: 8
 n_latency_steps: 0
-n_obs_steps: 2
+n_obs_steps: 1
 name: train_diffusion_transformer_hybrid
 obs_as_cond: true
 optimizer:
@@ -49,12 +50,10 @@ optimizer:
   transformer_weight_decay: 0.01  # ori:0.001
 past_action_visible: false
 policy:
-  # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  # hdfree: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
   _target_: diffusion_policy.policy.roi_dp_transformer_hybrid_policy.DiffusionTransformerHybridImagePolicy
   ### MoE related configs
   en_freeze_obs_encoder: false  # ori: false
-  load_parts_from_ckpt: "all"  # ori: `all`; or: `obs_encoder`
+  load_parts_from_ckpt: "obs_encoder"  # ori: `all`; or: `obs_encoder`
   ffn_expand_factor: 4  # ori:4
 
   use_da: false  # ori: true
@@ -102,8 +101,8 @@ policy:
   causal_attn: true
   crop_shape: null
   eval_fixed_crop: true
-  horizon: 10
-  n_action_steps: 8
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
   n_cond_layers: 0
   n_emb: 256
   n_head: 4
@@ -131,20 +130,34 @@ policy:
   use_image_roi_only: true  # TODO: true or false?
   roi_coord_conv: true
   roi_coord_conv_detach: true
-  roi_area_loss_weight: 0.01
+  roi_area_loss_weight: 0.01  # ori:0.01 TODO: will let box larger or smaller or unchanged?
+  roi_area_loss_mode: square
+  roi_area_loss_upper_bound: null
+  roi_area_loss_weight_increase_ratio: null
+  roi_area_loss_weight_increase_per_steps: null  # ori:50
+  roi_area_loss_weight_max: null  # ori:0.01
+  roi_center_diversity_loss_weight: 0.0
+  roi_center_diversity_margin: 0.25
+  roi_scale_diversity_loss_weight: 0.0
+  roi_scale_diversity_mode: pairwise_hinge
+  roi_scale_diversity_value: 0.05
   roi_net:
     _target_: diffusion_policy.model.roi.roinet.RoiNet
     locator_type: residual  # TODO: net arch? `residual` or `resnet`
-    init_scale: null  # TODO: 0.98 or ?
+    init_scale: null  # ori: null, TODO: 0.98 or ?
+    init_head_weight_std: 1e-4  # TODO: how large is ok?
+    init_patch_logit_raw_std: null  # TODO: how large is ok?
     in_channels: 3
-    roi_size:  # ori:96
-    - 96
-    - 96
+    predict_type: xys  # TODO: `xys` or `logit_scale`?
+    patchify_wh: 16
+    roi_size: # ori:96
+      - 96
+      - 96
     preset: tiny
   shape_meta: ${shape_meta}
   time_as_cond: true
-image_shape: &image_shape [3, 96, 96]  # ori:96
-raw_image_shape: &raw_image_shape [3, 256, 256]  # always fixed, not changed with the crop_shape
+image_shape: &image_shape [3, 384, 384]
+roi_image_shape: &roi_image_shape [3, 96, 96]
 shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!!!
   # acceptable types: rgb, low_dim
   obs:
@@ -152,42 +165,63 @@ shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!
       shape: *image_shape
       type: rgb
     image_roi:
-      shape: *image_shape
+      shape: *roi_image_shape
       type: rgb
-#    roi_param:  # NOTE: removing this leads to better performance
-#      shape: [3]
-#      type: low_dim
-    agent_pos:
-      shape: [2]
+#    gripper:
+#      shape: *image_shape
+#      type: rgb
+    joint_state:
+      shape: [6]
       type: low_dim
+#    force:
+#      shape: [6]
+#      type: low_dim
   action:
-    shape: [2]
+    shape: [7]
 dataset_shape_meta: &dataset_shape_meta
   obs:
     image:
-      shape: *raw_image_shape
+      shape: *image_shape
       type: rgb
-    agent_pos:
-      shape: [2]
+    gripper:
+      shape: *image_shape
+      type: rgb
+    joint_state:
+      shape: [6]
+      type: low_dim
+    force:
+      shape: [6]
       type: low_dim
   action:
-    shape: [2]
+    shape: [7]
 task:
   dataset:  # Source domain
-    _target_: diffusion_policy.dataset.pusht_image_dataset.MergedPushTImageDataset
+    _target_: diffusion_policy.dataset.libero_dataset.LiberoFTDataset
     shape_meta: ${dataset_shape_meta}
-    horizon: 10
-    n_obs_steps: ${n_obs_steps}
-    load_future_frames: false
+    horizon: ${horizon}
     max_train_episodes: 90
-    pad_after: 7
-    pad_before: 1
+    pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+    pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
-    val_ratio: 0.01
+    val_ratio: 0.02
     transform_color_jitter: true  # ori:false
-    zarr_paths:
-#      - data/pusht/pusht_256.zarr  # source domain
-      - data/pusht/pusht_256_size15.zarr  # smaller T size
+    dataset_root: "/home/geyuan/code/LIBERO-FT/libero/datasets/"
+    dataset_subname: "libero_force_384/libero_10"
+    hdf5_fns:
+#      - "tmp_replayed_wrench.hdf5"
+#      - "KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo_wrench.hdf5"
+#      - "KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo_wrench.hdf5"
+      # libero-10
+      - "KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo_wrench.hdf5"
+      - "KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo_wrench.hdf5"
+      - "KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it_demo_wrench.hdf5"
+      - "KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_demo_wrench.hdf5"
+      - "LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket_demo_wrench.hdf5"
+      # others
+#      - "KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_demo_wrench.hdf5"
+#      - "LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate_demo_wrench.hdf5"
+#      - "STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_demo_wrench.hdf5"
+    zero_force: false  # ori:false
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: ${dataset_shape_meta}
@@ -217,13 +251,13 @@ task:
     train_start_seed: 0
     domain_shift: size15  # ori:size,goal,none,light
     render_size: 256  # ori:96
-  image_shape: *raw_image_shape
+  image_shape: *image_shape
   name: pusht_image
   shape_meta: ${dataset_shape_meta}
 task_name: liberoft
-#pretrained_ckpt: "data/outputs/2026.05.28/13.16.18_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
+pretrained_ckpt: null
 training:
-  checkpoint_every: ${training.rollout_every}  # ori:50
+  checkpoint_every: 50  # ori:50
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
@@ -231,14 +265,14 @@ training:
   lr_warmup_steps: 1000
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 2000  # ori:3050
+  num_epochs: 3000  # ori:3050
   resume: false
-  rollout_every: 50  # ori:50
+  rollout_every: -1  # ori:50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
   use_ema: true
-  val_every: 25  # ori: 10
+  val_every: 50  # ori: 10
 val_dataloader:
   batch_size: 64
   num_workers: 12

@@ -4,7 +4,7 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/sh_train_reverse.sh
+CUDA_VISIBLE_DEVICES=4,5,6,7 bash scripts/sh_train_reverse.sh
 "
 
 CONFIG_DIR="./"

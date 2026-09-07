@@ -112,8 +112,9 @@ FoveationNet 输出所选的原始像素 patch，以及它们在原图坐标系�
 * `_encode_global_images()` 返回和输入时间维对齐的 `[B,T,N,D]` visual token；VJEPA 原始输出按空间网格 reshape，并将每个时间块重复回填到对应输入帧
 * 暂时假设所有分辨率都可以被 16 整除，方便设计
 
-需要进一步确定的设计：
-* 下游如何融合原图二维坐标、分辨率级别与现有位置编码或 RoPE (下游任务再考虑，这里只要保证尽可能输出可能有用的tensor或信息即可)
+与下游的接口约定：
+* FoveationNet 只负责输出 patch-bank index、原图坐标、归一化中心、归一化覆盖尺寸、分辨率 level 和 valid mask，不在内部生成下游位置编码
+* 当前下游使用 APT 式 learned fine-grid absolute PE，并为各粗尺度插值得到 PE map；完整设计见 `plan/position_embedding.md`
 
 可以参考的代码：
 * @diffusion_policy.model.roi.roinet.py
@@ -125,16 +126,54 @@ FoveationNet 输出所选的原始像素 patch，以及它们在原图坐标系�
 代码位置：diffusion_policy.policy.foveation_dp_transformer_policy.py
 
 功能概述：利用 FoveationNet 输出的 mixed-resolution patch sequence，作为输入给下游的 diffusion policy (DP) 模型，
-此时由于 DP 的输入不再是完整分辨率图像，而是数量动态变化的 patches + 位置编码 + padding mask，这里使用的 DP 结构需要做相应修改
+数量动态变化的 patches + 几何信息 + padding mask 由新的 FoveationObsEncoder 处理，并聚合为每帧固定维度的 visual latent。
+TransformerForDiffusion 继续接收固定形状的 `[B,T_obs,cond_dim]` observation condition，其时序结构、位置编码、causal mask 和 diffusion sampling 行为保持不变。
 
 已经确定的设计：
-* DP 模型需要尽可能服用 TransformerForDiffusion，但可以忽略参考代码 roi_dp_transformer_hybrid_policy 的 MoE/Merge 相关逻辑
+* DP 模型复用 TransformerForDiffusion，忽略参考代码 roi_dp_transformer_hybrid_policy 的 MoE/Merge 和 ROI-specific 逻辑
+* 动态 token 数只存在于 FoveationObsEncoder 内部；聚合后的固定维度 observation feature 再交给 TransformerForDiffusion
+* shape_meta 中的每个 RGB key 都执行 foveation；多路 RGB 共享同一个 FoveationNet 和同一个 FoveationObsEncoder 参数，但每张图像仍独立产生 split decision
+* 首版要求所有 RGB key 的 C/H/W 和 foveation geometry 相同，否则直接报错
+* 多路 RGB 按 shape_meta 中固定的 key 顺序组织，沿 batch 维拼接后一次调用共享 FoveationNet，再拆回各相机并拼接每路 visual latent
+* shape_meta 中的 low_dim observation 按固定 key 顺序展平，并与所有 RGB visual latent 拼接
+* 没有文本或其他条件 embedding 时，policy 向 FoveationNet 传 `cond_B_T_D=None`，由 FoveationNet 在正确 device/dtype 上生成严格的 hidden-space 全零条件；不在 dataset/dataloader 中新增全零 tensor
+* policy 暴露 `set_router_temperature(router_temp)`，只负责转发给共享 FoveationNet；具体模拟退火曲线和调用时机由 workspace/config 控制
+* FoveationNet 输出的 patch 已经乘过 ST leaf weight，FoveationObsEncoder 不再重复乘权重，从而保留 diffusion task loss 到 Router 的梯度路径
 
-需要进一步确定的设计：
-* mixed-resolution patch sequence 是原始像素，这里要如何用提取成 embedding, 用什么 encoder 提取？
-* 位置编码先用朴素的相对位置编码，这个能否从 foveation net 的输出计算出来？后续可以考虑用更复杂的相对位置编码或 RoPE
-* 需要设置 FoveationNet 的模拟退火 Gumbel temperature，是否需要在 policy 中暴露接口
-* 保留哪些函数名对应的函数
+FoveationObsEncoder 结构：
+* 默认参数量和计算量要控制在和现有 ObsEncoder 差不多的水平，大约是几十M
+* pixel embedding 由 `patch_embedding_type` 选择：`linear` 保留共享的 ViT-style Flatten + Linear baseline；`conv` 对每个 leaf 独立应用共享的两层 stride-2 Conv stem，再 Flatten + Linear 到 visual_dim。Conv 只建模 leaf 内部局部性，不跨越 leaf 边界
+* 在最高分辨率 patch 网格学习一张二维 absolute PE，各粗尺度使用 bicubic interpolation 生成对应 PE map
+* 根据 FoveationNet 返回的全局 patch-bank index gather leaf PE；padding index 为 `-1` 并由 valid mask 屏蔽
+* pixel embedding 与 APT position embedding 相加后，输入使用 `batch_first=True` 的 TransformerEncoder；不再叠加旧 geometry MLP 或 level embedding
+* 不添加 CLS token；`src_key_padding_mask` 由 `~token_valid_mask_B_T_N` 构造，TransformerEncoder 输出后仅对 valid patch token 做普通 mean pooling，得到该帧固定维度 visual latent
+* 普通 mean pooling 对每个有效 leaf token 使用相同权重，不做面积加权、attentive pooling 或其他额外 token 重加权；mixed-resolution 下高分辨率区域因 token 数量更多而自然获得更高的 token-level 权重
+* 首版不实现 token 两两之间的 pairwise relative position bias；后续若实验需要，再考虑自定义 attention bias 或 RoPE
+* 单路输出形状为 `[B,T,visual_dim]`；最终 `obs_feature_dim = num_rgb * visual_dim + sum(low_dim_dims)`
+
+训练和损失：
+* compute_loss 保留现有 diffusion policy 的 action normalization、noise sampling、condition mask、prediction target 和 diffusion MSE 逻辑
+* 多路 RGB 合并进 FoveationNet 的 batch 维，因此其 budget loss 自然对 batch、时间和 RGB 路数取 mean，新增相机不会自动放大正则项
+* `total_loss = diffusion_loss + budget_loss`，其中 FoveationNet 返回的 budget_loss 已经乘过 budget_loss_weight
+* 日志至少返回 total_loss、diffusion_loss、budget_loss 和实际 num_patches 的 mean；需要可视化时才返回按 RGB key 组织并 detach 的 foveation outputs，普通路径不保留完整 patch 输出
+* train 模式使用 ST Gumbel-Sigmoid，eval 模式使用确定性 hard decision；temperature 不改变 eval 时以 logit 0 为阈值的 hard split 结果
+
+保留的 public policy 函数：
+* conditional_sample()
+* predict_action()
+* reset()
+* set_normalizer()
+* get_optimizer()
+* compute_loss()
+* forward()
+* freeze_obs_encoder()
+* print_training_status()
+* 新增 set_router_temperature()
+
+不保留的参考 policy 逻辑：
+* `_build_roi_obs()`、ROI crop/coord-conv 和 ROI area/diversity loss
+* `set_roi_area_loss_step()`
+* MoE、teacher merge 和 domain adaptation 相关函数及参数
 
 参考代码：
 * @diffusion_policy.policy.roi_dp_transformer_hybrid_policy.py
@@ -146,9 +185,22 @@ FoveationNet 输出所选的原始像素 patch，以及它们在原图坐标系�
 
 功能概述：训练框架、train/val 日志
 
+VJEPA 权重共享约束：
+* VJEPA 始终冻结，`freeze_global_encoder` 必须为 True，不加入 optimizer，也不参与 EMA 更新
+* 多路 RGB 共享同一个 FoveationNet，因此同一个 policy 内只持有一个 VJEPA module 实例
+* live policy 和 EMA policy 必须引用同一个 VJEPA module object，不能各自持有数值相同但物理独立的权重副本
+* workspace 创建 EMA policy 时，可以 deepcopy 其他模块，但随后必须把 EMA FoveationNet 的 global_encoder 重新绑定到 live policy 的同一实例；不能因为 `.to(device)`、train/eval 切换或 rollout 再创建副本
+* checkpoint 只保存一份 VJEPA 权重，EMA state 中排除重复的 VJEPA keys；加载 checkpoint 后重新建立共享引用
+* 初始化和 checkpoint 恢复后都要验证 live/EMA global_encoder 的对象 identity 相同、所有参数 `requires_grad=False`，并由 FoveationNet.train() 保证该模块始终处于 eval 模式
+* 如果未来需要解冻 VJEPA，必须重新设计 optimizer、EMA 和共享策略，不能沿用当前约束
+
+temperature 调度约定：
+* workspace 在训练 forward 前通过 unwrap 后的 live policy 调用 `set_router_temperature()`；启用 EMA 时同步记录相同 temperature，保证 train/val 日志可比较
+* 退火起始值、结束值、调度总步数和调度类型放在 config 中，policy 本身不维护 global_step 或退火曲线
+
 其他相关配套文件：
-* configs/liberoft_foveation_dp.yaml
-* scripts/roi/sh_train_foveation_libero.sh
+* configs/liberoft_foveation_dp.yaml (参考 configs/liberoft_roi_dp.yaml)
+* scripts/roi/sh_train_foveation_libero.sh (参考 scripts/roi/sh_train_roi_libero.sh)
 
 参考代码：
 * @diffusion_policy.workspace.train_roi_dp_transformer_workspace.py

@@ -1,6 +1,7 @@
 import gym
 import math
 import random
+import re
 from gym import spaces
 
 import collections
@@ -107,8 +108,6 @@ class PushTEnv(gym.Env):
         self.light_y = None
         self.light_dx = None
         self.light_dy = None
-        self.light_direction_timer = 0
-        self.light_direction_interval = 10
 
     def reset(self):
         seed = self._seed
@@ -286,67 +285,6 @@ class PushTEnv(gym.Env):
         # Draw agent and block.
         self.space.debug_draw(draw_options)
 
-        # # 绘制 T 形物体及其自定义图像
-        # # self.load_images()
-        # for tee in self.tees:
-        #     body = tee["body"]
-        #     angle = body.angle
-        #
-        #     # 获取横梁和竖杆的顶点的世界坐标
-        #     vertices1_world = [
-        #         body.local_to_world((v[0], v[1])) for v in tee["vertices1"]
-        #     ]
-        #     vertices2_world = [
-        #         body.local_to_world((v[0], v[1])) for v in tee["vertices2"]
-        #     ]
-        #
-        #     # 如果图像已加载，使用图像绘制 T 的横梁和竖杆
-        #     if tee["image1"] and tee["image2"]:
-        #         # 计算横梁的中心点
-        #         center1 = (
-        #             (vertices1_world[0][0] + vertices1_world[2][0]) / 2,
-        #             (vertices1_world[0][1] + vertices1_world[2][1]) / 2,
-        #         )
-        #         # 绘制横梁图像
-        #         image1_rotated = pygame.transform.rotate(tee["image1"], -angle * 57.2958)  # 角度制
-        #         rect1 = image1_rotated.get_rect(center=center1)  # 将图像中心对齐到横梁中心
-        #         # canvas.blit(image1_rotated, rect1.topleft)
-        #
-        #         # 计算竖杆的中心点
-        #         center2 = (
-        #             (vertices2_world[0][0] + vertices2_world[2][0]) / 2,
-        #             (vertices2_world[0][1] + vertices2_world[2][1]) / 2,
-        #         )
-        #         # 绘制竖杆图像
-        #         image2_rotated = pygame.transform.rotate(tee["image2"], -angle * 57.2958)  # 角度制
-        #         rect2 = image2_rotated.get_rect(center=center2)  # 将图像中心对齐到竖杆中心
-        #         # canvas.blit(image2_rotated, rect2.topleft)
-        #
-        #     # 如果没有加载图像，绘制形状边框（占位）
-        #     else:
-        #         # 绘制横梁的边框
-        #         pygame.draw.polygon(
-        #             canvas,
-        #             (0, 0, 0),  # 黑色
-        #             [(v[0], v[1]) for v in vertices1_world],
-        #             width=1,
-        #         )
-        #         # 绘制竖杆的边框
-        #         pygame.draw.polygon(
-        #             canvas,
-        #             (0, 0, 0),  # 黑色
-        #             [(v[0], v[1]) for v in vertices2_world],
-        #             width=1,
-        #         )
-
-        # # 对于其他非 T 的物体，使用 debug_draw
-        # for shape in self.space.shapes:
-        #     if shape not in [t["shape1"] for t in self.tees] and shape not in [t["shape2"] for t in self.tees]:
-        #         self.space.debug_draw(draw_options)
-
-        # # Draw agent and block.
-        # self.space.debug_draw(draw_options)
-
         ## 添加光照效果, 0.15
         if "light" in self.domain_shift:  # NOTE: can be compatiable with other shifts
             self._apply_random_lighting(canvas)
@@ -457,11 +395,11 @@ class PushTEnv(gym.Env):
         self.start_x = self.np_random.integers(10, self.window_size - 10)
         self.start_y = self.np_random.integers(10, self.window_size - 10)
 
-        self.light_x = self.np_random.integers(100, self.window_size - 100)
-        self.light_y = self.np_random.integers(100, self.window_size - 100)
-        self.light_dx = self.np_random.choice([-3, -2, -1, 1, 2, 3])
-        self.light_dy = self.np_random.choice([-3, -2, -1, 1, 2, 3])
-        self.light_direction_timer = 0
+        self.light_x = self.window_size / 2
+        self.light_y = self.window_size / 2
+        light_angle = self.np_random.uniform(0, 2 * np.pi)
+        self.light_dx = np.cos(light_angle)
+        self.light_dy = np.sin(light_angle)
 
         self.sim_time = 0.  # used for rainbow domain shift
 
@@ -482,7 +420,9 @@ class PushTEnv(gym.Env):
 
         block_shift = "block" in self.domain_shift
         if "size" in self.domain_shift:
-            self.block = self.add_tee((256, 300), 0, scale=40, block_shift=block_shift)  # baseline: 30
+            m = re.search(r"size(\d+)", self.domain_shift)
+            size_num = int(m.group(1)) if m else 40  # default size:40
+            self.block = self.add_tee((256, 300), 0, scale=size_num, block_shift=block_shift)
         else:
             self.block = self.add_tee((256, 300), 0, scale=30, block_shift=block_shift)  # baseline: 30
 
@@ -634,35 +574,13 @@ class PushTEnv(gym.Env):
         canvas.blit(darkness, (0, 0))
 
     def _apply_random_lighting(self, canvas):
-        """在场景中添加随机点光源效果"""
+        """在场景中添加初始方向随机、碰壁反射的移动点光源"""
         # 光源参数
         light_radius = 180  # 光源半径, ori:180
         light_intensity = 160  # 光源强度, ori:160
         light_color = (255, 255, 200)  # 光源颜色
-        num_lights = 1  # 随机光源数量
         move_speed = 20  # ori:20
         black_intensity = 140  # ori:140
-
-        # 定时切换方向
-        self.light_direction_timer += 1
-        if self.light_direction_timer >= self.light_direction_interval:
-            self.light_dx = self.np_random.choice([-3, -2, -1, 1, 2, 3])
-            self.light_dy = self.np_random.choice([-3, -2, -1, 1, 2, 3])
-            self.light_direction_timer = 0
-
-        # 移动光源
-        self.light_x += self.light_dx * move_speed
-        self.light_y += self.light_dy * move_speed
-
-        # 碰壁反弹
-        if self.light_x <= light_radius // 2 or self.light_x >= self.window_size - light_radius // 2:
-            self.light_dx = -self.light_dx
-        if self.light_y <= light_radius // 2 or self.light_y >= self.window_size - light_radius // 2:
-            self.light_dy = -self.light_dy
-
-        # 确保光源在边界内
-        self.light_x = max(light_radius // 2, min(self.window_size - light_radius // 2, self.light_x))
-        self.light_y = max(light_radius // 2, min(self.window_size - light_radius // 2, self.light_y))
 
         # 创建遮罩层
         darkness = pygame.Surface(canvas.get_size(), pygame.SRCALPHA)
@@ -678,6 +596,24 @@ class PushTEnv(gym.Env):
         # 将遮罩层叠加到场景
         canvas.blit(darkness, (0, 0))
 
+        # 推进下一帧的光源位置，碰壁时保留越界位移并做镜面反射
+        self.light_x += self.light_dx * move_speed
+        self.light_y += self.light_dy * move_speed
+        min_position = 0
+        max_position = self.window_size
+        if self.light_x <= min_position:
+            self.light_x = 2 * min_position - self.light_x
+            self.light_dx = -self.light_dx
+        elif self.light_x >= max_position:
+            self.light_x = 2 * max_position - self.light_x
+            self.light_dx = -self.light_dx
+        if self.light_y <= min_position:
+            self.light_y = 2 * min_position - self.light_y
+            self.light_dy = -self.light_dy
+        elif self.light_y >= max_position:
+            self.light_y = 2 * max_position - self.light_y
+            self.light_dy = -self.light_dy
+
     def _create_light_surface(self, radius, color, intensity=255):
         """创建一个渐变的光源图像"""
         light_surface = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
@@ -690,4 +626,3 @@ class PushTEnv(gym.Env):
                     alpha = max(0, intensity - (distance_to_center / radius) * intensity)
                     light_surface.set_at((x, y), (*color, int(alpha)))
         return light_surface
-
