@@ -499,9 +499,17 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         pred_action_steps_only: bool = False,
         router_temperature: Optional[float] = None,
         router_condition_key: Optional[str] = None,
+        router_loss_type: str = "st",
+        paired_loss_weight: float = 1.0,
         **kwargs,
     ) -> None:
         super().__init__()
+        if router_loss_type not in {"st", "paired"}:
+            raise ValueError("router_loss_type must be 'st' or 'paired'.")
+        if paired_loss_weight <= 0.0:
+            raise ValueError("paired_loss_weight must be positive.")
+        self.router_loss_type = router_loss_type
+        self.paired_loss_weight = float(paired_loss_weight)
         if "position_encoding_type" in kwargs:
             raise ValueError(
                 "position_encoding_type was renamed to position_encoding_types; "
@@ -679,6 +687,8 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         self.cache_action = None
         self._obs_encoder_frozen = False
         self._action_path_frozen = False
+        self._downstream_finetune = False
+        self._staged_training = False
 
         if router_temperature is not None:
             self.set_router_temperature(router_temperature)
@@ -738,14 +748,49 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             image_B_T_C_H_W = image_B_T_C_H_W.float()
         return image_B_T_C_H_W
 
+    @torch.no_grad()
+    def get_foveation_outputs(
+        self, obs_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Return per-RGB routing outputs using predict_action's input convention."""
+        # Skip visual token encoding and action diffusion for offline diagnostics.
+        _, _, aux = self._route_observations(obs_dict, return_foveation_outputs=True)
+        return aux.get("foveation_outputs", {})
+
     def _encode_observations(
         self,
         obs_dict: Dict[str, torch.Tensor],
         return_foveation_outputs: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        merged_out, normalized_low_dim_by_key, aux = self._route_observations(
+            obs_dict, return_foveation_outputs=return_foveation_outputs
+        )
+        features_B_T_D = self._encode_routed_observations(
+            merged_out, normalized_low_dim_by_key
+        )
+        return features_B_T_D, aux
+
+    def _route_observations(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        return_foveation_outputs: bool = False,
+        return_routing_state: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, object]]:
+        # Keep routing registered with DDP, but build no routing graph in finetuning.
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not self._downstream_finetune):
+            return self._route_observations_impl(
+                obs_dict, return_foveation_outputs, return_routing_state
+            )
+
+    def _route_observations_impl(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        return_foveation_outputs: bool = False,
+        return_routing_state: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, object]]:
         if not obs_dict:
             raise ValueError("obs_dict cannot be empty.")
-        features: List[torch.Tensor] = []
+        merged_out = {}
         aux: Dict[str, object] = {
             "budget_loss": None,
             "num_patches_mean": None,
@@ -786,48 +831,65 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                 merged_cond_B_T_D = router_cond_B_T_D.repeat(
                     len(self.rgb_keys), 1, 1
                 )
+            routing_kwargs = {"return_routing_state": True} if return_routing_state else {}
             merged_out = self.foveation_net(
                 merged_B_C_T_H_W,
                 cond_B_T_D=merged_cond_B_T_D,
+                **routing_kwargs,
             )
             aux["budget_loss"] = merged_out["budget_loss"]
+            aux.update({key: value for key, value in merged_out.items() if key.startswith("_budget_")})
             aux["num_patches_mean"] = merged_out["num_patches_B_T"].float().mean()
             aux["random_topology_fraction"] = merged_out[
                 "random_topology_mask_B_T"
             ].float().mean()
-            route_outputs = []
-            for route_idx, key in enumerate(self.rgb_keys):
+            if return_foveation_outputs:
+                # Routing state is training-only; do not retain the full bank in logs.
+                aux["foveation_outputs"] = {
+                    key: {
+                        name: value[route_idx * batch_size : (route_idx + 1) * batch_size].detach()
+                        for name, value in merged_out.items()
+                        if torch.is_tensor(value)
+                        and value.ndim > 0
+                        and value.shape[0] == merged_B_T_C_H_W.shape[0]
+                        and name not in {"patch_bank_B_T_K_C_P_P", "split_hard_B_T_M"}
+                    }
+                    for route_idx, key in enumerate(self.rgb_keys)
+                }
+        return merged_out, normalized_low_dim_by_key, aux
+
+    def _encode_routed_observations(
+        self,
+        merged_out: Dict[str, torch.Tensor],
+        normalized_low_dim_by_key: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        features: List[torch.Tensor] = []
+        if self.rgb_keys:
+            merged_batch_size = merged_out["num_patches_B_T"].shape[0]
+            batch_size = merged_batch_size // len(self.rgb_keys)
+            for route_idx in range(len(self.rgb_keys)):
                 start = route_idx * batch_size
                 end = start + batch_size
                 route_out = {
                     name: value[start:end]
                     for name, value in merged_out.items()
-                    if (
-                        torch.is_tensor(value)
-                        and value.ndim > 0
-                        and value.shape[0] == merged_B_T_C_H_W.shape[0]
-                    )
+                    if torch.is_tensor(value)
+                    and value.ndim > 0
+                    and value.shape[0] == merged_batch_size
                 }
-                route_outputs.append(route_out)
                 features.append(self.obs_encoder(route_out))
-            if return_foveation_outputs:
-                aux["foveation_outputs"] = {
-                    key: {
-                        name: value.detach()
-                        for name, value in route_out.items()
-                    }
-                    for key, route_out in zip(self.rgb_keys, route_outputs)
-                }
-
         for key in self.low_dim_keys:
             value_B_T = normalized_low_dim_by_key[key]
             features.append(value_B_T.reshape(value_B_T.shape[0], value_B_T.shape[1], -1))
 
         if not features:
             raise ValueError("No supported observations were provided.")
-        reference = features[0]
-        features = [value.to(device=reference.device, dtype=reference.dtype) for value in features]
-        return torch.cat(features, dim=-1), aux
+        reference_B_T_D = features[0]
+        features = [
+            value_B_T_D.to(device=reference_B_T_D.device, dtype=reference_B_T_D.dtype)
+            for value_B_T_D in features
+        ]
+        return torch.cat(features, dim=-1)
 
     def _encode_obs_batch(
         self,
@@ -1000,6 +1062,13 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             )
         return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
 
+    def set_stage_b_phase(self, downstream_finetune: bool) -> None:
+        """Select the active Stage B branch without changing DDP parameter registration."""
+        self._staged_training = True
+        self._downstream_finetune = downstream_finetune
+        self._action_path_frozen = not downstream_finetune
+        self.train(self.training)
+
     def freeze_action_path(self) -> None:
         """Freeze visual/action weights while retaining input gradients for routing."""
         self._action_path_frozen = True
@@ -1024,6 +1093,10 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         if self._action_path_frozen:
             # eval disables action-path dropout without breaking the ST gradient.
             for module in (self.obs_encoder, self.model):
+                if module is not None:
+                    module.eval()
+        if self._downstream_finetune:
+            for module in (self.foveation_net, self.router_condition_projection):
                 if module is not None:
                     module.eval()
         if self._obs_encoder_frozen:
@@ -1079,6 +1152,10 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                 status = "trainable"
             else:
                 status = "partially trainable"
+            if self._staged_training and module is not self:
+                routing = name.startswith("foveation.")
+                active = routing != self._downstream_finetune
+                status += "; active" if active else "; no-grad/eval"
             statistics[name] = {
                 "total": total,
                 "trainable": trainable,
@@ -1125,6 +1202,9 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
 
     def print_training_status(self) -> None:
         self.print_parameter_statistics()
+        if self._staged_training:
+            active = "visual encoder + action policy" if self._downstream_finetune else "routing"
+            print(f"[Stage B] Registered parameters remain grad-enabled; active updates: {active}")
         print(f"[FoveationDPTransformerPolicy] obs_dim={self.obs_feature_dim}")
         if self.foveation_net is not None:
             encoder = getattr(self.foveation_net, "global_encoder", None)
@@ -1144,64 +1224,195 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                     f"{encoder_type} ({status})"
                 )
 
+    def _diffusion_loss_per_sample(
+        self,
+        obs_features_B_T_D: torch.Tensor,
+        nactions_B_H_D: torch.Tensor,
+        *,
+        noise_B_H_D: Optional[torch.Tensor] = None,
+        timesteps_B: Optional[torch.Tensor] = None,
+        condition_mask_B_H_D: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Keep the existing masked MSE reduction while allowing paired random inputs."""
+        B = nactions_B_H_D.shape[0]
+        if self.obs_as_cond:
+            cond_B_T_D = obs_features_B_T_D
+            trajectory_B_H_D = nactions_B_H_D
+        else:
+            cond_B_T_D = None
+            trajectory_B_H_D = torch.cat(
+                [nactions_B_H_D, obs_features_B_T_D], dim=-1
+            )
+        if condition_mask_B_H_D is None:
+            condition_mask_B_H_D = (
+                torch.zeros_like(trajectory_B_H_D, dtype=torch.bool)
+                if self.pred_action_steps_only
+                else self.mask_generator(trajectory_B_H_D.shape)
+            )
+        if noise_B_H_D is None:
+            noise_B_H_D = torch.randn_like(trajectory_B_H_D)
+        if timesteps_B is None:
+            timesteps_B = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (B,),
+                device=trajectory_B_H_D.device,
+            ).long()
+        noisy_trajectory_B_H_D = self.noise_scheduler.add_noise(
+            trajectory_B_H_D, noise_B_H_D, timesteps_B
+        )
+        loss_mask_B_H_D = ~condition_mask_B_H_D
+        if self.pred_action_steps_only:
+            loss_mask_B_H_D = torch.zeros_like(trajectory_B_H_D, dtype=torch.bool)
+            start = self.n_obs_steps - 1
+            loss_mask_B_H_D[:, start : start + self.n_action_steps, : self.action_dim] = True
+        noisy_trajectory_B_H_D[condition_mask_B_H_D] = trajectory_B_H_D[
+            condition_mask_B_H_D
+        ]
+        pred_B_H_D = self.model(noisy_trajectory_B_H_D, timesteps_B, cond_B_T_D)
+
+        prediction_type = self.noise_scheduler.config.prediction_type
+        if prediction_type not in {"epsilon", "sample"}:
+            raise ValueError(f"Unsupported prediction type {prediction_type!r}.")
+        target_B_H_D = noise_B_H_D if prediction_type == "epsilon" else trajectory_B_H_D
+        loss_B_H_D = F.mse_loss(pred_B_H_D, target_B_H_D, reduction="none")
+        loss_B_H_D = loss_B_H_D * loss_mask_B_H_D.to(loss_B_H_D.dtype)
+        return loss_B_H_D.reshape(B, -1).mean(dim=1)
+
+    def _compute_paired_loss(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        nactions_B_H_D: torch.Tensor,
+        return_foveation_outputs: bool,
+    ) -> Dict[str, torch.Tensor]:
+        if not self._action_path_frozen:
+            raise ValueError("Paired loss requires freeze_action_path() before training.")
+        if self.obs_as_cond:
+            obs_dict = {key: value[:, : self.n_obs_steps] for key, value in obs_dict.items()}
+        merged_out, normalized_low_dim_by_key, aux = self._route_observations(
+            obs_dict,
+            return_foveation_outputs=return_foveation_outputs,
+            return_routing_state=True,
+        )
+        B = nactions_B_H_D.shape[0]
+        split_hard_VB_T_M = merged_out["split_hard_B_T_M"]
+        T = split_hard_VB_T_M.shape[1]
+        device = split_hard_VB_T_M.device
+        # RGB streams occupy contiguous B-sized blocks. Intervene on one frame only.
+        view_B = torch.randint(len(self.rgb_keys), (B,), device=device)
+        frame_B = torch.randint(T, (B,), device=device)
+        stream_batch_B = view_B * B + torch.arange(B, device=device)
+        base_split_B_M = split_hard_VB_T_M[stream_batch_B, frame_B]
+        selected_node_B, stop_B_M, split_B_M = (
+            self.foveation_net.sample_paired_splits(base_split_B_M)
+        )
+        selected_logits_B = merged_out["split_logits_B_T_M"][
+            stream_batch_B, frame_B, selected_node_B
+        ]
+        if self.foveation_net.split_action_value == 0:
+            selected_logits_B = -selected_logits_B
+        split_prob_B = selected_logits_B.float().sigmoid()
+
+        pair_losses = []
+        noise_B_H_D = None
+        timesteps_B = None
+        condition_mask_B_H_D = None
+        # Keep router logits above differentiable; both action-path evaluations are fixed.
+        with torch.no_grad():
+            for selected_split_B_M in (stop_B_M, split_B_M):
+                pair_split_VB_T_M = split_hard_VB_T_M.clone()
+                pair_split_VB_T_M[stream_batch_B, frame_B] = selected_split_B_M
+                pair_out = self.foveation_net.pack_topology(
+                    merged_out["patch_bank_B_T_K_C_P_P"], pair_split_VB_T_M
+                )
+                obs_features_B_T_D = self._encode_routed_observations(
+                    pair_out, normalized_low_dim_by_key
+                )
+                if noise_B_H_D is None:
+                    trajectory_B_H_D = nactions_B_H_D
+                    if not self.obs_as_cond:
+                        trajectory_B_H_D = torch.cat(
+                            [nactions_B_H_D, obs_features_B_T_D], dim=-1
+                        )
+                    condition_mask_B_H_D = (
+                        torch.zeros_like(trajectory_B_H_D, dtype=torch.bool)
+                        if self.pred_action_steps_only
+                        else self.mask_generator(trajectory_B_H_D.shape)
+                    )
+                    noise_B_H_D = torch.randn_like(trajectory_B_H_D)
+                    timesteps_B = torch.randint(
+                        0,
+                        self.noise_scheduler.config.num_train_timesteps,
+                        (B,),
+                        device=device,
+                    ).long()
+                pair_losses.append(
+                    self._diffusion_loss_per_sample(
+                        obs_features_B_T_D,
+                        nactions_B_H_D,
+                        noise_B_H_D=noise_B_H_D,
+                        timesteps_B=timesteps_B,
+                        condition_mask_B_H_D=condition_mask_B_H_D,
+                    )
+                )
+
+        stop_loss_B, split_loss_B = pair_losses
+        advantage_B = stop_loss_B - split_loss_B
+        # This is a local objective under reachable-node sampling, without reach weighting.
+        paired_loss = -(split_prob_B * advantage_B.detach()).mean()
+        # One arm equals the sampled tree because the selected node is reachable.
+        base_split_B = base_split_B_M.gather(1, selected_node_B[:, None]).squeeze(1)
+        diffusion_loss = torch.where(base_split_B, split_loss_B, stop_loss_B).mean()
+        budget_loss = aux["budget_loss"]
+        if budget_loss is None:
+            budget_loss = paired_loss * 0.0
+        total_loss = self.paired_loss_weight * paired_loss + budget_loss
+        losses = {
+            "total_loss": total_loss,
+            "diffusion_loss": diffusion_loss,
+            "budget_loss": budget_loss,
+            "num_patches_mean": aux["num_patches_mean"],
+            "random_topology_fraction": aux["random_topology_fraction"],
+            "paired_loss": paired_loss,
+            "paired_stop_diffusion_loss": stop_loss_B.mean(),
+            "paired_split_diffusion_loss": split_loss_B.mean(),
+            "paired_advantage_mean": advantage_B.mean(),
+            "paired_advantage_abs_mean": advantage_B.abs().mean(),
+            "paired_advantage_positive_fraction": (advantage_B > 0).float().mean(),
+        }
+        if return_foveation_outputs:
+            losses["_foveation_outputs"] = aux["foveation_outputs"]
+        losses.update({key: value for key, value in aux.items() if key.startswith("_budget_")})
+        return losses
+
     def compute_loss(
         self,
         batch: Dict[str, object],
         return_foveation_outputs: bool = False,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
+        """Compute paired routing, ST diffusion, or downstream-only finetuning loss."""
         if kwargs.pop("return_roi_params", False):
             return_foveation_outputs = True
         obs_dict = batch["obs"]
-        nactions = self.normalizer["action"].normalize(batch["action"])
-        B, horizon = nactions.shape[:2]
-        if horizon != self.horizon:
-            raise ValueError(f"Expected action horizon {self.horizon}, got {horizon}.")
-
-        if self.obs_as_cond:
-            nobs_features_B_To_D, aux = self._encode_obs_batch(
-                obs_dict,
-                self.n_obs_steps,
-                return_foveation_outputs,
+        nactions_B_H_D = self.normalizer["action"].normalize(batch["action"])
+        if nactions_B_H_D.shape[1] != self.horizon:
+            raise ValueError(
+                f"Expected action horizon {self.horizon}, got {nactions_B_H_D.shape[1]}."
             )
-            cond = nobs_features_B_To_D
-            trajectory = nactions
-        else:
-            nobs_features_B_T_D, aux = self._encode_obs_batch(
-                obs_dict,
-                None,
-                return_foveation_outputs,
+        if self.training and self.router_loss_type == "paired" and not self._downstream_finetune:
+            return self._compute_paired_loss(
+                obs_dict, nactions_B_H_D, return_foveation_outputs
             )
-            cond = None
-            trajectory = torch.cat([nactions, nobs_features_B_T_D], dim=-1)
 
-        condition_mask = (
-            torch.zeros_like(trajectory, dtype=torch.bool)
-            if self.pred_action_steps_only
-            else self.mask_generator(trajectory.shape)
+        obs_features_B_T_D, aux = self._encode_obs_batch(
+            obs_dict,
+            self.n_obs_steps if self.obs_as_cond else None,
+            return_foveation_outputs,
         )
-        noise = torch.randn_like(trajectory)
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (trajectory.shape[0],),
-            device=trajectory.device,
-        ).long()
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, noise, timesteps)
-        loss_mask = ~condition_mask
-        if self.pred_action_steps_only:
-            loss_mask = torch.zeros_like(trajectory, dtype=torch.bool)
-            start = self.n_obs_steps - 1
-            loss_mask[:, start : start + self.n_action_steps, : self.action_dim] = True
-        noisy_trajectory[condition_mask] = trajectory[condition_mask]
-        pred = self.model(noisy_trajectory, timesteps, cond)
-
-        prediction_type = self.noise_scheduler.config.prediction_type
-        target = noise if prediction_type == "epsilon" else trajectory
-        if prediction_type not in {"epsilon", "sample"}:
-            raise ValueError(f"Unsupported prediction type {prediction_type!r}.")
-        diffusion_loss = F.mse_loss(pred, target, reduction="none")
-        diffusion_loss = (diffusion_loss * loss_mask.to(diffusion_loss.dtype)).reshape(B, -1).mean()
+        diffusion_loss = self._diffusion_loss_per_sample(
+            obs_features_B_T_D, nactions_B_H_D
+        ).mean()
 
         budget_loss = aux["budget_loss"]
         if budget_loss is None:
@@ -1212,7 +1423,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         random_topology_fraction = aux["random_topology_fraction"]
         if random_topology_fraction is None:
             random_topology_fraction = diffusion_loss.detach() * 0.0
-        total_loss = diffusion_loss + budget_loss
+        total_loss = diffusion_loss if self._downstream_finetune else diffusion_loss + budget_loss
         losses = {
             "diffusion_loss": diffusion_loss,
             "budget_loss": budget_loss,
@@ -1222,6 +1433,8 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         }
         if return_foveation_outputs:
             losses["_foveation_outputs"] = aux.get("foveation_outputs", {})
+        if not self._downstream_finetune:
+            losses.update({key: value for key, value in aux.items() if key.startswith("_budget_")})
         return losses
 
     def forward(self, batch, return_foveation_outputs: bool = False, **kwargs):

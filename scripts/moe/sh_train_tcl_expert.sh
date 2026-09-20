@@ -3,7 +3,7 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=0,2,3,4 TRAIN_PRESET=tcl_force_light bash scripts/moe/sh_train_tcl_expert.sh
+CUDA_VISIBLE_DEVICES=0,1,3,4 TRAIN_PRESET=tcl_put_mouse bash scripts/moe/sh_train_tcl_expert.sh
 "
 
 ### Merge MoE ###
@@ -17,6 +17,9 @@ EXPERT_TRIPLETS=(
   "tcl_force_table    1201_screw_bulb_turn_off_table  6"
   "tcl_force_object   1201_screw_bulb_turn_off_object 4"
   "tcl_force_light    1201_screw_bulb_turn_off_light  2"
+  "tcl_tower_boby     0209_tower_boby_hard            6"
+  "tcl_plastic_egg    0417_plastic_egg                4"
+  "tcl_put_mouse      0417_put_mouse_hard             2"
 )
 PRETRAINED_TIME_LOG="2026.01.17-00.06.29"  # 1201_screw_bulb_turn_off, original
 
@@ -96,6 +99,7 @@ accelerate launch \
   --main_process_port=${MAIN_PORT} \
   train.py --config-dir=${CONFIG_DIR} --config-name=${CONFIG_NAME} training.seed=42 \
   training.device=${DEVICE} \
+  logging.project="moemerge" \
   hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}' \
   policy.ffn_expand_factor=${ffn_expand_factor} \
   task.dataset.data_root="${data_root}" \

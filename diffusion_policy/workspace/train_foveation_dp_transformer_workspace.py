@@ -49,15 +49,19 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
     """Train and validate a foveation diffusion policy."""
 
-    include_keys = ("global_step", "epoch")
+    include_keys = (
+        "global_step", "epoch", "next_epoch", "downstream_finetune_started", "budget_lambda"
+    )
     _GLOBAL_MARKER = "foveation_net.global_encoder."
+    _ROUTING_PREFIXES = ("foveation_net.", "router_condition_projection.")
 
     def __init__(self, cfg: OmegaConf, output_dir: Optional[str] = None):
         super().__init__(cfg, output_dir=output_dir)
         process_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(
-            kwargs_handlers=[process_kwargs, ddp_kwargs]
+            kwargs_handlers=[process_kwargs, ddp_kwargs],
+            gradient_accumulation_steps=int(self._cfg_get(cfg, "training.gradient_accumulate_every", 1)),
         )
 
         seed = int(self._cfg_get(cfg, "training.seed", 0))
@@ -70,6 +74,25 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         pretrained_ckpt = self._cfg_get(cfg, "pretrained_ckpt", None)
         if pretrained_ckpt:
             self._load_pretrained_weights(pretrained_ckpt)
+
+        self.downstream_finetune_start_epoch = self._cfg_get(
+            cfg, "training.downstream_finetune_start_epoch", None
+        )
+        self.downstream_finetune_started = False
+        self.next_epoch = 0
+        start = self.downstream_finetune_start_epoch
+        if start is not None:
+            if (
+                isinstance(start, bool)
+                or not isinstance(start, int)
+                or not 0 <= start < cfg.training.num_epochs
+            ):
+                raise ValueError("downstream_finetune_start_epoch must be an integer in [0, num_epochs).")
+            if not self._cfg_get(cfg, "training.router_only", False) or self.model.router_loss_type != "paired":
+                raise ValueError("Downstream finetuning requires paired router-only Stage B.")
+            if self._cfg_get(cfg, "training.target_num_patches_start", None) is not None:
+                if start < int(self._cfg_get(cfg, "training.target_num_patches_decay_epochs", 0)):
+                    raise ValueError("Downstream finetuning must start after the budget decay finishes.")
 
         if bool(self._cfg_get(cfg, "training.router_only", False)):
             foveation_net = self.model.foveation_net
@@ -85,7 +108,22 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     "router_only requires a learned router with freeze_global_encoder, "
                     "freeze_router and en_freeze_obs_encoder all false."
                 )
-            self.model.freeze_action_path()
+            if start is None:
+                self.model.freeze_action_path()
+            else:
+                # Register both phases before optimizer creation and DDP wrapping.
+                self.model.set_stage_b_phase(False)
+
+        if self.model.router_loss_type == "paired":
+            foveation_net = self.model.foveation_net
+            if (
+                not bool(self._cfg_get(cfg, "training.router_only", False))
+                or foveation_net.random_topology_prob != 0.0
+            ):
+                raise ValueError(
+                    "Paired routing requires router_only=true and "
+                    "random_topology_prob=0."
+                )
 
         encoder = self._global_encoder(self.model)
         self._share_global_encoder = encoder is not None and not any(
@@ -109,6 +147,65 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         self._assert_encoder_optimizer()
         self.global_step = 0
         self.epoch = 0
+        self.budget_lambda = float(self._cfg_get(cfg, "training.budget_lambda_init", 0.0))
+        self.budget_lambda_lr = float(self._cfg_get(cfg, "training.budget_lambda_lr", 0.01))
+        if self.budget_lambda < 0.0 or self.budget_lambda_lr < 0.0:
+            raise ValueError("budget_lambda_init and budget_lambda_lr must be non-negative.")
+        self._sync_budget_lambda()
+
+    def _sync_budget_lambda(self) -> None:
+        # A plain attribute avoids changing old model state dicts or averaging dual state.
+        for policy in (self.model, self.ema_model):
+            if policy is not None and self._unwrap(policy).foveation_net is not None:
+                self._unwrap(policy).foveation_net.budget_lambda = self.budget_lambda
+
+    def _update_budget_lambda(self, budget_stats_2: torch.Tensor) -> Dict[str, float]:
+        """Update the shared price from global [expected-count sum, observation count]."""
+        net = self._unwrap(self.model).foveation_net
+        expected_mean = (budget_stats_2[0] / budget_stats_2[1]).item()
+        metrics = {
+            "train/budget_lambda": self.budget_lambda,
+            "train/expected_num_patches_mean": expected_mean,
+        }
+        normalized_gap = (expected_mean - net.resolved_target_num_patches) / (
+            net.max_num_patches - net.min_num_patches
+        )
+        # LR is in relative-price units; budget_loss_weight scales the router cost only.
+        self.budget_lambda = max(0.0, self.budget_lambda + self.budget_lambda_lr * normalized_gap)
+        self._sync_budget_lambda()
+        return metrics
+
+    def _globalize_elu_budget(self, policy, losses) -> None:
+        """Replace local ELU cost with the current forward's global-mean cost."""
+        if "_budget_normalized_mean" not in losses:
+            return
+        net = self._unwrap(policy).foveation_net
+        local_mean_scalar = losses["_budget_normalized_mean"]
+        # Reduce detached sums/counts, not nonlinear per-rank losses. Keep collectives
+        # in the workspace: rollout and video routing may run on the main rank only.
+        global_sum_scalar = self.accelerator.reduce(
+            losses["_budget_expected_sum"].double(), reduction="sum"
+        )
+        global_count_scalar = self.accelerator.reduce(
+            losses["_budget_observation_count"].double(), reduction="sum"
+        )
+        budget_range = net.max_num_patches - net.min_num_patches
+        global_mean_scalar = (
+            (global_sum_scalar / global_count_scalar - net.min_num_patches) / budget_range
+        ).to(local_mean_scalar.dtype)
+        # Forward uses the global mean; backward retains the local mean gradient.
+        # Existing batch weighting/DDP normalization supplies observation weights.
+        mean_proxy_scalar = global_mean_scalar + (local_mean_scalar - local_mean_scalar.detach())
+        normalized_target = (net.resolved_target_num_patches - net.min_num_patches) / budget_range
+        budget_loss_scalar = net.upper_bound_budget_loss(
+            mean_proxy_scalar, normalized_target, net.budget_loss_type,
+            net.budget_base_cost_weight, net.budget_lambda, net.budget_elu_tau,
+        ) * net.budget_loss_weight
+        # With accumulation > 1, this averages per-forward nonlinear objectives;
+        # it is not ELU of the entire optimizer window's mean. Lambda still uses
+        # that window's mean. Current Stage B uses accumulation=1.
+        losses["total_loss"] = losses["total_loss"] - losses["budget_loss"] + budget_loss_scalar
+        losses["budget_loss"] = budget_loss_scalar
 
     def _load_pretrained_weights(self, pretrained_ckpt: str) -> None:
         """Load EMA weights, completing the shared encoder from the live state."""
@@ -238,14 +335,68 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         super()._load_state_dict_into(key, obj, state, **kwargs)
 
     def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
+        if "optimizer" in payload["state_dicts"] and "optimizer" not in (exclude_keys or ()):
+            old_start = self._cfg_get(payload["cfg"], "training.downstream_finetune_start_epoch", None)
+            if (old_start is None) != (self.downstream_finetune_start_epoch is None):
+                raise ValueError(
+                    "Cannot resume across router-only and staged optimizer layouts. "
+                    "Use pretrained_ckpt with resume=false for a new finetuning run; "
+                    "this does not restore the old optimizer or LR schedule."
+                )
         super().load_payload(
             payload,
             exclude_keys=exclude_keys,
             include_keys=include_keys,
             **kwargs,
         )
+        self.epoch = max(self.epoch, self.next_epoch)
+        self._sync_budget_lambda()
+        if self.downstream_finetune_start_epoch is not None:
+            self._unwrap(self.model).set_stage_b_phase(self.downstream_finetune_started)
+            if self.ema_model is not None:
+                self.ema_model.set_stage_b_phase(self.downstream_finetune_started)
+                self.ema_model.eval()
         self._rebind_shared_encoder()
         self._assert_encoder_state()
+
+    @torch.no_grad()
+    def _set_stage_b_phase(self, ema, base_ema_exclude_prefixes) -> None:
+        if self.downstream_finetune_start_epoch is None:
+            return
+        live = self._unwrap(self.model)
+        entering = (
+            not self.downstream_finetune_started
+            and self.epoch >= self.downstream_finetune_start_epoch
+        )
+        if entering:
+            self.accelerator.wait_for_everyone()
+            self.optimizer.zero_grad(set_to_none=True)
+            source_policy = self.ema_model if self.ema_model is not None else live
+            for name in ("foveation_net", "router_condition_projection"):
+                source_module = getattr(source_policy, name)
+                if source_module is None:
+                    continue
+                state = source_module.state_dict()
+                # Evaluation uses rank 0 EMA; BN buffers may differ across ranks.
+                if self.accelerator.num_processes > 1:
+                    for value_X in state.values():
+                        torch.distributed.broadcast(value_X, src=0)
+                getattr(live, name).load_state_dict(state)
+            self.downstream_finetune_started = True
+            if self.accelerator.is_main_process:
+                source = "EMA" if self.ema_model is not None else "live"
+                print(
+                    f"[Stage B] epoch={self.epoch}: freeze {source} routing; finetune downstream; "
+                    f"LRs={[group['lr'] for group in self.optimizer.param_groups]}"
+                )
+        live.set_stage_b_phase(self.downstream_finetune_started)
+        if self.ema_model is not None:
+            self.ema_model.set_stage_b_phase(self.downstream_finetune_started)
+            self.ema_model.eval()
+        if ema is not None:
+            # Frozen branches must not drift through EMA arithmetic either.
+            inactive = self._ROUTING_PREFIXES if self.downstream_finetune_started else ("obs_encoder.", "model.")
+            ema.exclude_prefixes = tuple(dict.fromkeys((*base_ema_exclude_prefixes, *inactive)))
 
     def _temperature_at(self, step: int) -> Optional[float]:
         start = self._cfg_get(self.cfg, "training.router_temperature_start", None)
@@ -398,7 +549,14 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 "grad/router_budget_grad_norm": 0.0,
             }
 
-        def loss_grad_vector_P(loss_scalar: torch.Tensor) -> torch.Tensor:
+        def loss_grad_vector_P(loss_scalar: Optional[torch.Tensor]) -> torch.Tensor:
+            # Paired diffusion losses are detached evaluation metrics, not objectives.
+            if loss_scalar is None or not loss_scalar.requires_grad:
+                return torch.zeros(
+                    sum(param.numel() for param in router_params),
+                    dtype=torch.float32,
+                    device=router_params[0].device,
+                )
             grads = torch.autograd.grad(
                 loss_scalar,
                 router_params,
@@ -423,14 +581,17 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             )
             return accelerator.reduce(grad_P, reduction="mean")
 
-        diffusion_grad_P = loss_grad_vector_P(losses["diffusion_loss"])
-        budget_grad_P = loss_grad_vector_P(losses["budget_loss"])
+        diffusion_grad_P = loss_grad_vector_P(losses.get("diffusion_loss"))
+        budget_grad_P = loss_grad_vector_P(losses.get("budget_loss"))
         diffusion_grad_norm = float(diffusion_grad_P.norm().item())
         budget_grad_norm = float(budget_grad_P.norm().item())
         stats = {
             "grad/router_diffusion_grad_norm": diffusion_grad_norm,
             "grad/router_budget_grad_norm": budget_grad_norm,
         }
+        if "paired_loss" in losses:
+            paired_grad_P = loss_grad_vector_P(losses["paired_loss"])
+            stats["grad/router_paired_grad_norm"] = float(paired_grad_P.norm().item())
         if diffusion_grad_norm > 0.0 and budget_grad_norm > 0.0:
             cosine_scalar = torch.dot(diffusion_grad_P, budget_grad_P) / (
                 diffusion_grad_norm * budget_grad_norm
@@ -564,6 +725,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 if max_steps is not None and batch_idx >= int(max_steps):
                     break
                 losses = policy.compute_loss(batch)
+                self._globalize_elu_budget(policy, losses)
                 for key, value in losses.items():
                     if key.startswith("_") or not torch.is_tensor(value) or value.ndim != 0:
                         continue
@@ -646,6 +808,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         self._assert_encoder_state()
 
         ema = None
+        base_ema_exclude_prefixes = ()
         if self.ema_model is not None:
             self.ema_model.to(device)
             ema_cfg = self._cfg_get(cfg, "ema", None)
@@ -660,6 +823,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     self._GLOBAL_MARKER,
                 )
             ema.optimization_step = int(self.global_step)
+            base_ema_exclude_prefixes = tuple(ema.exclude_prefixes)
 
         wandb_run, log_context = self._build_logger()
         env_runner_cfg = self._cfg_get(cfg, "task.env_runner", None)
@@ -694,7 +858,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         train_sampling_batch = None
 
         with log_context as json_logger:
-            for _ in range(num_epochs):
+            for _ in range(self.epoch, num_epochs):
+                self._set_stage_b_phase(ema, base_ema_exclude_prefixes)
                 target_num_patches = self._set_target_num_patches()
                 self.model.train()
                 if bool(self._cfg_get(cfg, "policy.en_freeze_obs_encoder", False)):
@@ -702,6 +867,9 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 epoch_losses = []
                 step_log = {"epoch": self.epoch, "global_step": self.global_step}
                 wandb_vis_log = {}
+                budget_stats_2 = torch.zeros(2, device=device, dtype=torch.float64)
+                # Each epoch starts a fresh window, including after max_train_steps truncation.
+                accelerator.step = 0
                 for batch_idx, batch in enumerate(
                     tqdm.tqdm(
                         train_loader,
@@ -713,12 +881,26 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     if train_sampling_batch is None:
                         train_sampling_batch = batch
                     router_grad_stats = None
+                    budget_metrics = {}
                     with accelerator.accumulate(self.model):
                         self._set_temperature()
                         losses = self.model(batch)
+                        self._globalize_elu_budget(self.model, losses)
                         raw_loss = losses["total_loss"]
+                        has_budget_stats = "_budget_expected_sum" in losses
+                        backward_loss_scalar = raw_loss
+                        if has_budget_stats:
+                            observation_count_scalar = losses["_budget_observation_count"]
+                            budget_stats_2[0] += losses["_budget_expected_sum"]
+                            budget_stats_2[1] += observation_count_scalar
+                            # Fixed T/views: weighting by B also weights by observation count.
+                            # Use the nominal batch size to avoid a large summed loss under AMP.
+                            batch_weight = batch["action"].shape[0] / loader_cfg["batch_size"]
+                            backward_loss_scalar = raw_loss * batch_weight
+                            reference_count_scalar = observation_count_scalar / batch_weight
                         if (
                             accelerator.sync_gradients
+                            and not self.downstream_finetune_started
                             and router_grad_norm_every > 0
                             and self.global_step % router_grad_norm_every == 0
                         ):
@@ -727,23 +909,44 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                                 losses,
                                 accelerator,
                             )
-                        accelerator.backward(raw_loss)
+                        accelerator.backward(backward_loss_scalar)
                         if accelerator.sync_gradients:
-                            if router_grad_stats is not None:
+                            if router_grad_stats is not None or has_budget_stats:
                                 accelerator.unscale_gradients(self.optimizer)
+                            if has_budget_stats:
+                                # Reduce scalars separately for older Accelerate versions.
+                                global_budget_stats_2 = torch.stack([
+                                    accelerator.reduce(value_scalar, reduction="sum")
+                                    for value_scalar in budget_stats_2
+                                ])
+                                # Undo DDP and Accelerate averaging, then normalize by the
+                                # actual global count (also handles a short final window).
+                                grad_scale_scalar = (
+                                    grad_accum * accelerator.num_processes * reference_count_scalar
+                                    / global_budget_stats_2[1]
+                                )
+                                for param in self.model.parameters():
+                                    if param.grad is not None:
+                                        param.grad.mul_(grad_scale_scalar.to(param.grad.dtype))
+                            if router_grad_stats is not None:
                                 router_grad_stats["grad/router_grad_norm"] = (
                                     self._router_grad_norm(self.model)
                                 )
                             self.optimizer.step()
                             self.lr_scheduler.step()
-                            self.optimizer.zero_grad()
-                            if ema is not None:
-                                ema.step(accelerator.unwrap_model(self.model))
+                            self.optimizer.zero_grad(set_to_none=True)
+                            if not accelerator.optimizer_step_was_skipped:
+                                if ema is not None:
+                                    ema.step(accelerator.unwrap_model(self.model))
+                                if has_budget_stats:
+                                    budget_metrics = self._update_budget_lambda(global_budget_stats_2)
+                            budget_stats_2.zero_()
                     loss_value = float(raw_loss.detach().item())
                     epoch_losses.append(loss_value)
                     train_metrics = self._scalar_losses(losses)
                     step_log = {
                         "train/lr": self.lr_scheduler.get_last_lr()[0],
+                        "train/downstream_finetune_active": int(self.downstream_finetune_started),
                         "epoch": self.epoch,
                         "global_step": self.global_step,
                         **{
@@ -755,6 +958,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                         step_log["train/target_num_patches"] = target_num_patches
                     if router_grad_stats is not None:
                         step_log.update(router_grad_stats)
+                    step_log.update(budget_metrics)
                     if accelerator.is_main_process and wandb_run is not None:
                         wandb_run.log(step_log, step=self.global_step)
                     if accelerator.is_main_process and json_logger is not None:
@@ -763,6 +967,9 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     if max_train_steps is not None and batch_idx + 1 >= int(max_train_steps):
                         break
 
+                # A truncated unsynchronized window must not leak into the next epoch.
+                # Clear the model directly: AcceleratedOptimizer skips zero_grad in no_sync.
+                self.model.zero_grad(set_to_none=True)
                 accelerator.wait_for_everyone()
                 step_log = {
                     "train/total_loss": (
@@ -830,6 +1037,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                         metric_action, target_action
                     ).item()
 
+                self.next_epoch = self.epoch + 1
                 if self.epoch % int(self._cfg_get(cfg, "training.checkpoint_every", 1)) == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process and bool(

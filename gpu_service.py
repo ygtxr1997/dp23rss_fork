@@ -24,14 +24,16 @@ from robokit.debug_utils.time_profiler import global_time_profiler as gtp
 
 """ How to use me?
 conda activate robodiff
-cd code/dp23rss_fork
+cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service:gpu_app --port 6070
+export LOG_TIME="2026.09.09-11.13.27"
+CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service:gpu_app --port 6072
 """
 gpu_app = FastAPI()
 max_cache_action = 32
 
-log_time = "2026.05.01-17.54.53"
+log_time = "2026.04.30-22.33.39"
+log_time = str(os.environ.get("LOG_TIME", log_time))
 w_idx = -1
 
 map_time_to_dataset = {
@@ -64,6 +66,10 @@ map_time_to_dataset = {
     "2026.05.01-17.54.53": "1201_screw_bulb_turn_off_light",
     "2026.05.01-01.51.17": "0417_brush",
     "2026.05.20-01.34.58": "260514_ethernet",
+    "2026.09.09-11.12.55": "0209_tower_boby_hard",
+    "2026.09.09-11.13.27": "0417_plastic_egg",
+    "2026.09.09-01.18.17": "0417_put_mouse_hard",
+    "2026.09.12-01.41.29": "0417_put_mouse_hard",
 }
 # train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"

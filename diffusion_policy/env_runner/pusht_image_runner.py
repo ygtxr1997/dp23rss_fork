@@ -8,6 +8,7 @@ import dill
 import math
 import wandb.sdk.data_types.video as wv
 import matplotlib.pyplot as plt
+import cv2
 
 from diffusion_policy.env.pusht.pusht_image_env import PushTImageEnv
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
@@ -41,10 +42,14 @@ class PushTImageRunner(BaseImageRunner):
             reset_to_state=None,
             domain_shift=None,
             save_name=None,
+            save_foveation_video=False,
+            foveation_vis_batch_size=16,
         ):
         super().__init__(output_dir)
         if n_envs is None:
             n_envs = n_train + n_test
+        if foveation_vis_batch_size <= 0:
+            raise ValueError('foveation_vis_batch_size must be positive.')
 
         steps_per_render = max(10 // fps, 1)
         def env_fn():
@@ -153,11 +158,128 @@ class PushTImageRunner(BaseImageRunner):
         self.domain_shift = domain_shift
         self.save_name = save_name
         self.cache_actions = []
+
+        self.save_foveation_video = save_foveation_video
+        self.foveation_vis_batch_size = foveation_vis_batch_size
+        self.foveation_vis_envs = [
+            n_train <= i < n_train + n_test_vis
+            for i in range(n_train + n_test)
+        ]
+
+    @staticmethod
+    def _prepare_policy_obs(np_obs_dict, device):
+        obs_dict = dict_apply(
+            np_obs_dict, lambda value_X: torch.from_numpy(value_X).to(device=device)
+        )
+        image_B_T_C_H_W = obs_dict['image']
+        if image_B_T_C_H_W.dtype == torch.uint8:
+            image_B_T_C_H_W = image_B_T_C_H_W.float() / 255
+        # Share the rollout's convention before the policy applies its normalizer.
+        obs_dict['image'] = image_B_T_C_H_W * 2. - 1.
+        obs_dict['agent_pos'] = obs_dict['agent_pos'] / 512 * 2 - 1
+        return obs_dict
+
+    @staticmethod
+    def _draw_patch_history(
+            frame_H_W_C, steps_F, counts_F, first_step, last_step, min_patches, max_patches):
+        """Overlay a fixed-axis history of the trees displayed so far in this episode."""
+        height, width = frame_H_W_C.shape[:2]
+        panel_w, panel_h = max(1, round(width * 0.30)), max(1, round(height * 0.20))
+        margin = max(1, round(min(height, width) * 0.01))
+        roi_H_W_C = frame_H_W_C[margin:margin + panel_h, margin:margin + panel_w]
+        # Draw on a larger canvas for legible antialiased text in the small inset.
+        panel_H_W_C = cv2.resize(roi_H_W_C, (300, 200))
+        panel_H_W_C = np.rint(panel_H_W_C * 0.45).astype(np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        white = (235, 235, 235)
+        color = (255, 220, 80)  # RGB, like the video frame.
+        left, right, top, bottom = 72, 288, 52, 152
+        cv2.putText(panel_H_W_C, f'patches: {int(counts_F[-1])}', (8, 27),
+                    font, 1.0, white, 2, cv2.LINE_AA)
+        cv2.line(panel_H_W_C, (left, top), (left, bottom), white, 2, cv2.LINE_AA)
+        cv2.line(panel_H_W_C, (left, bottom), (right, bottom), white, 2, cv2.LINE_AA)
+        for count, y in ((max_patches, top), (min_patches, bottom)):
+            cv2.putText(panel_H_W_C, str(count), (3, y + 7),
+                        font, 0.9, white, 2, cv2.LINE_AA)
+        cv2.putText(panel_H_W_C, str(first_step), (left - 5, 188),
+                    font, 0.9, white, 2, cv2.LINE_AA)
+        last_label = str(last_step)
+        text_width = cv2.getTextSize(last_label, font, 0.9, 2)[0][0]
+        cv2.putText(panel_H_W_C, last_label, (right - text_width, 188),
+                    font, 0.9, white, 2, cv2.LINE_AA)
+        cv2.putText(panel_H_W_C, 'step', (142, 188),
+                    font, 0.85, white, 2, cv2.LINE_AA)
+        x_F = left + (steps_F - first_step) / max(1, last_step - first_step) * (right - left)
+        if max_patches == min_patches:
+            y_F = np.full_like(x_F, (top + bottom) / 2)
+        else:
+            y_F = bottom - (counts_F - min_patches) / (max_patches - min_patches) * (bottom - top)
+        points_F_2 = np.rint(np.stack((x_F, y_F), axis=-1)).astype(np.int32)
+        cv2.polylines(panel_H_W_C, [points_F_2], False, color, 4, cv2.LINE_AA)
+        cv2.circle(panel_H_W_C, tuple(points_F_2[-1]), 4, color, -1, cv2.LINE_AA)
+        roi_H_W_C[:] = cv2.resize(panel_H_W_C, (panel_w, panel_h), interpolation=cv2.INTER_AREA)
+        return frame_H_W_C
+
+    def _save_foveation_video(self, policy, recorded_obs, indices_F, video_path):
+        if len(indices_F) == 0:
+            return None
+        path = pathlib.Path(video_path)
+        output_path = str(path.with_name(f'{path.stem}_foveation{path.suffix}'))
+        recorder = VideoRecorder.create_h264(
+            fps=self.fps, codec='h264', input_pix_fmt='rgb24', crf=self.crf,
+            thread_type='FRAME', thread_count=1,
+        )
+        # Extra routing (including random-topology baselines) must not consume
+        # the RNG stream used by subsequent rollout chunks or training steps.
+        device = torch.device(policy.device)
+        rng_devices = [device] if device.type == 'cuda' else []
+        # Episode-local history survives rendering batches, but never contains future counts.
+        counts_F = np.empty(len(indices_F), dtype=np.int64)
+        with torch.random.fork_rng(devices=rng_devices), torch.no_grad():
+            recorder.start(output_path)
+            try:
+                for start in range(0, len(indices_F), self.foveation_vis_batch_size):
+                    frame_indices_B = indices_F[start:start + self.foveation_vis_batch_size]
+                    # T = n_obs_steps; clamp repeats reset history at episode start.
+                    window_indices_B_T = np.maximum(
+                        frame_indices_B[:, None] + np.arange(1 - self.n_obs_steps, 1), 0
+                    )
+                    np_obs_dict = {
+                        key: value_S_X[window_indices_B_T]
+                        for key, value_S_X in recorded_obs.items()
+                    }
+                    obs_dict = self._prepare_policy_obs(np_obs_dict, device)
+                    foveation_out = policy.get_foveation_outputs(obs_dict)['image']
+                    # Earlier observations supply context; each video frame uses
+                    # only the final observation's tree, including between chunks.
+                    last_frame_out = {
+                        key: value_B_T_X[:, -1:]
+                        for key, value_B_T_X in foveation_out.items()
+                    }
+                    vis_B_T_H_W_C = policy.foveation_net.vis_ar_tokens(last_frame_out)
+                    counts_F[start:start + len(frame_indices_B)] = (
+                        last_frame_out['num_patches_B_T'][:, 0].cpu().numpy()
+                    )
+                    for offset, frame_H_W_C in enumerate(vis_B_T_H_W_C[:, 0]):
+                        end = start + offset + 1
+                        frame_H_W_C = self._draw_patch_history(
+                            frame_H_W_C, indices_F[:end], counts_F[:end],
+                            int(indices_F[0]), int(indices_F[-1]),
+                            policy.foveation_net.min_num_patches,
+                            policy.foveation_net.max_num_patches,
+                        )
+                        recorder.write_frame(frame_H_W_C)
+            finally:
+                recorder.stop()
+        return output_path
     
     def run(self, policy: BaseImagePolicy):
         device = policy.device
-        dtype = policy.dtype
         env = self.env
+        if self.save_foveation_video:
+            if not callable(getattr(policy, 'get_foveation_outputs', None)):
+                raise TypeError('Foveation video requires policy.get_foveation_outputs().')
+            policy.eval()
 
         # plan for rollout
         n_envs = len(self.env_fns)
@@ -166,6 +288,7 @@ class PushTImageRunner(BaseImageRunner):
 
         # allocate data
         all_video_paths = [None] * n_inits
+        all_foveation_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
         first_obs_img = None
         if self.reset_to_state is not None:
@@ -187,6 +310,11 @@ class PushTImageRunner(BaseImageRunner):
             # init envs
             env.call_each('run_dill_function', 
                 args_list=[(x,) for x in this_init_fns])
+            if self.save_foveation_video:
+                capture_envs = self.foveation_vis_envs[this_global_slice] + [False] * n_diff
+                env.call_each(
+                    'set_record_observations', args_list=[(enabled,) for enabled in capture_envs]
+                )
 
             # start rollout
             obs = env.reset()
@@ -206,22 +334,7 @@ class PushTImageRunner(BaseImageRunner):
                 if first_obs_img is None:
                     first_obs_img = env.call("get_first_obs_frame")[0]
                 
-                # device transfer
-                obs_dict = dict_apply(np_obs_dict, 
-                    lambda x: torch.from_numpy(x).to(
-                        device=device))
-                # from robokit.debug_utils.printer import print_batch
-                # print_batch("[DEBUG] PushTImageRunner obs_dict:", obs_dict)
-                '''
-                [DEBUG] PushTImageRunner obs_dict:: Dict, keys=['agent_pos', 'image']
-                --agent_pos, <class 'torch.Tensor'>, shape=torch.Size([31, 2, 2]), min=55.0000, max=441.0000, dtype=torch.float32
-                --image, <class 'torch.Tensor'>, shape=torch.Size([31, 2, 3, 256, 256]), min=0.2549, max=1.0000, dtype=torch.float32
-                '''
-
-                # NOTE: a better design is to wrap the policy with an API class to handle norm/denorm
-                # TODO: norm here
-                obs_dict["image"] = obs_dict["image"] * 2. - 1.  # from [0,1] to [-1,1]
-                obs_dict["agent_pos"] = obs_dict["agent_pos"] / 512 * 2 - 1  # from [0,512] to [-1,1]
+                obs_dict = self._prepare_policy_obs(np_obs_dict, device)
 
                 # run policy
                 with torch.no_grad():
@@ -316,7 +429,20 @@ class PushTImageRunner(BaseImageRunner):
 
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
+            if self.save_foveation_video:
+                recordings = list(env.call('pop_recorded_observations'))
+                for local_idx in range(this_n_active_envs):
+                    recorded_obs, indices_F = recordings[local_idx]
+                    global_idx = start + local_idx
+                    if capture_envs[local_idx]:
+                        all_foveation_video_paths[global_idx] = self._save_foveation_video(
+                            policy, recorded_obs, indices_F, all_video_paths[global_idx]
+                        )
+                    recordings[local_idx] = None
+                del recordings, recorded_obs, indices_F
         # clear out video buffer
+        if self.save_foveation_video:
+            env.call('set_record_observations', False)
         _ = env.reset()
 
         # log
@@ -342,6 +468,12 @@ class PushTImageRunner(BaseImageRunner):
             if video_path is not None:
                 sim_video = wandb.Video(video_path, format="mp4")
                 log_data[prefix+f'sim_video_{seed}'] = sim_video
+            foveation_video_path = all_foveation_video_paths[i]
+            if foveation_video_path is not None:
+                log_data[f'vis/test_foveation/video_{seed}'] = wandb.Video(
+                    foveation_video_path, format='mp4',
+                    caption=f'seed={seed}; recorded-observation routing; hard patch history',
+                )
 
         # log aggregate metrics
         for prefix, value in max_rewards.items():

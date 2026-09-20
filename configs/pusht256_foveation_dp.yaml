@@ -86,6 +86,9 @@ policy:
   causal_attn: true
   time_as_cond: true
   router_condition_key: agent_pos
+  # Paired training requires router_only and evaluates one reachable node per sample.
+  router_loss_type: st
+  paired_loss_weight: 1.0
   visual_dim: 256  # ori:256, reducing this will lead to performance drop
   visual_encoder_layers: 4
   visual_encoder_heads: 8  # ori:8
@@ -125,8 +128,21 @@ policy:
     # Use binary action 1 (default) or 0 (low logit) for split in this ablation.
     split_action_value: 1
     target_num_patches: 0.75  # TODO:ori:0.25
-    budget_loss_weight: 0.1
+    budget_loss_weight: 0.1  # Outer weight for every budget mode, applied once.
+    # Probability source; independent of budget_loss_type.
     budget_probability_type: clean_expected
+    # Original per-observation MSE by default; set batch_mean_mse to use the
+    # per-GPU mean over batch x observation frames x cameras in one forward.
+    # upper_bound_lagrangian uses a shared global price updated per optimizer step.
+    # upper_bound_lagrangian_elu: lambda*gap above target; only saturating reward
+    # at/below target. Uses each forward's global mean (exact with accumulation=1).
+    budget_loss_type: per_observation_mse
+    # Both upper-bound modes use alpha inside the single outer budget_loss_weight.
+    # ELU mode: alpha only controls reward at/below target; 0 disables that reward.
+    # Default weighted alpha is 0.1 * 0.01 = 0.001.
+    budget_base_cost_weight: 0.01
+    # ELU mode only: normalized width; 0.025 * (256-16) = 6 patches.
+    budget_elu_tau: 0.025
 
 image_shape: &image_shape [3, 256, 256]
 foveation_input_hw: &foveation_input_hw [256, 256]
@@ -180,6 +196,8 @@ task:
     n_obs_steps: ${n_obs_steps}
     n_test: 100  # ori:50
     n_test_vis: 4
+    save_foveation_video: false
+    foveation_vis_batch_size: 16
     n_train: 0
     n_train_vis: 0
     past_action: false
@@ -202,6 +220,14 @@ training:
   use_ema: true
   # Freeze visual/action weights in eval mode; requires an unfrozen learned router.
   router_only: false
+  # null: preserve router-only Stage B. At this zero-based epoch, freeze EMA
+  # routing (live without EMA) and finetune visual encoder + action policy.
+  # Continue the existing LR schedule without restarting warmup.
+  # Recommended: decay_epochs <= downstream_finetune_start_epoch < num_epochs.
+  # decay_epochs + finetune_epochs <= num_epochs, where
+  # finetune_epochs = num_epochs - downstream_finetune_start_epoch.
+  # Example: decay=1200, start=1600, total=2000 gives 400 finetuning epochs.
+  downstream_finetune_start_epoch: null
   val_every: 25
   rollout_every: 50
   checkpoint_every: ${training.rollout_every}
@@ -214,6 +240,11 @@ training:
   router_temperature_schedule: constant  # ori:cosine
   target_num_patches_start: 0.75  # ori:0.75
   target_num_patches_decay_epochs: 1200
+  # Both upper-bound modes. Resume restores lambda; pretrained weights reset it.
+  budget_lambda_init: 0.0
+  # Relative-price update per successful optimizer step: max(0, lambda + lr*gap).
+  # The gap is the global normalized mean minus cosine target; no extra outer weight.
+  budget_lambda_lr: 0.01
   router_grad_norm_every: 100
 
 pretrained_ckpt: null

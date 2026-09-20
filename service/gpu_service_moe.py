@@ -20,7 +20,7 @@ from robokit.debug_utils.time_profiler import global_time_profiler as gtp
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-export LOG_TIME=2026.06.25-02.36.45
+export LOG_TIME=2026.09.15-09.45.52
 export CKPT_INDEX=-2
 CUDA_VISIBLE_DEVICES=0 uvicorn service.gpu_service_moe:gpu_app --port 6070
 """

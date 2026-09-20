@@ -10,6 +10,8 @@ class VideoRecordingWrapper(gym.Wrapper):
             mode='rgb_array',
             file_path=None,
             steps_per_render=1,
+            record_observations=False,
+            rgb_obs_keys=('image',),
             **kwargs
         ):
         """
@@ -22,19 +24,60 @@ class VideoRecordingWrapper(gym.Wrapper):
         self.steps_per_render = steps_per_render
         self.file_path = file_path
         self.video_recoder = video_recoder
+        self.record_observations = record_observations
+        self.rgb_obs_keys = tuple(rgb_obs_keys)
+        self.recorded_observations = []
+        self.video_frame_indices = []
 
         self.step_count = 0
+
+    def set_record_observations(self, enabled: bool):
+        """Enable observation capture for the next episode and clear old data."""
+        self.record_observations = enabled
+        self.recorded_observations = []
+        self.video_frame_indices = []
+
+    def _record_observation(self, obs):
+        if not self.record_observations or self.file_path is None:
+            return
+        recorded_obs = {}
+        for key, value_X in obs.items():
+            # X denotes the observation's dimensions; match vector-env casting.
+            value_X = np.asarray(value_X, dtype=self.observation_space[key].dtype)
+            if key in self.rgb_obs_keys and value_X.dtype != np.uint8:
+                # Recover byte RGB from [0, 1] observations to limit episode memory.
+                value_X = np.rint(value_X * 255).clip(0, 255).astype(np.uint8)
+            recorded_obs[key] = value_X.copy()
+        self.recorded_observations.append(recorded_obs)
+
+    def pop_recorded_observations(self):
+        """Return stacked dict observations and video indices, then clear capture."""
+        obs = {}
+        if self.recorded_observations:
+            obs = {
+                key: np.stack([item[key] for item in self.recorded_observations])
+                for key in self.recorded_observations[0]
+            }
+        indices_F = np.asarray(self.video_frame_indices, dtype=np.int64)
+        self.recorded_observations = []
+        self.video_frame_indices = []
+        return obs, indices_F
 
     def reset(self, **kwargs):
         obs = super().reset(**kwargs)
         self.frames = list()
         self.step_count = 1
         self.video_recoder.stop()
+        self.recorded_observations = []
+        self.video_frame_indices = []
+        # Reset supplies window history, but is not a frame in the sim video.
+        self._record_observation(obs)
         return obs
     
     def step(self, action):
         result = super().step(action)
         self.step_count += 1
+        self._record_observation(result[0])
         if self.file_path is not None \
             and ((self.step_count % self.steps_per_render) == 0):
             if not self.video_recoder.is_ready():
@@ -44,6 +87,8 @@ class VideoRecordingWrapper(gym.Wrapper):
                 mode=self.mode, **self.render_kwargs)
             assert frame.dtype == np.uint8
             self.video_recoder.write_frame(frame)
+            if self.record_observations:
+                self.video_frame_indices.append(len(self.recorded_observations) - 1)
         return result
     
     def render(self, mode='rgb_array', **kwargs):

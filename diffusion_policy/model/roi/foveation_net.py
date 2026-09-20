@@ -407,6 +407,9 @@ class FoveationNet(nn.Module):
         fix_split_mode: Optional[str] = None,
         router_type: str = "pooled_global",
         random_topology_prob: float = 0.0,
+        budget_loss_type: str = "per_observation_mse",
+        budget_base_cost_weight: float = 0.01,
+        budget_elu_tau: float = 0.025,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -430,6 +433,11 @@ class FoveationNet(nn.Module):
         self.target_num_patches = target_num_patches
         self.budget_loss_weight = float(budget_loss_weight)
         self.budget_probability_type = str(budget_probability_type)
+        self.budget_loss_type = str(budget_loss_type)
+        self.budget_base_cost_weight = float(budget_base_cost_weight)
+        self.budget_elu_tau = float(budget_elu_tau)
+        # Workspace-owned dual state, not a network parameter or EMA buffer.
+        self.budget_lambda = 0.0
         self.fix_split_mode = fix_split_mode
         (
             self.random_split_ratios,
@@ -695,6 +703,18 @@ class FoveationNet(nn.Module):
                 "budget_probability_type must be 'sampled_relaxed' or "
                 "'clean_expected'."
             )
+        if self.budget_base_cost_weight < 0.0:
+            raise ValueError("budget_base_cost_weight must be non-negative.")
+        if self.budget_loss_type not in (
+            "per_observation_mse", "batch_mean_mse", "upper_bound_lagrangian",
+            "upper_bound_lagrangian_elu",
+        ):
+            raise ValueError(
+                "Unknown budget_loss_type; use per_observation_mse, "
+                "batch_mean_mse, upper_bound_lagrangian or upper_bound_lagrangian_elu."
+            )
+        if self.budget_loss_type == "upper_bound_lagrangian_elu" and not self.budget_elu_tau > 0.0:
+            raise ValueError("budget_elu_tau must be positive.")
         if self.router_type not in (
             "pooled_global",
             "node_aligned_fpn",
@@ -1293,6 +1313,59 @@ class FoveationNet(nn.Module):
             "patch_bank_indices_B_T_N": patch_bank_indices_B_T_N,
         }
 
+    def pack_topology(
+        self,
+        patch_bank_B_T_K_C_P_P: torch.Tensor,
+        split_hard_B_T_M: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Pack a specified hard tree without running the router or using ST gates."""
+        _, hard_leaf_mask_B_T_K, _ = self._build_soft_and_hard_leaf_masks(
+            split_hard_B_T_M.to(dtype=patch_bank_B_T_K_C_P_P.dtype),
+            split_hard_B_T_M,
+        )
+        out = self._pack_selected_patches(
+            patch_bank_B_T_K_C_P_P,
+            hard_leaf_mask_B_T_K,
+            hard_leaf_mask_B_T_K.to(dtype=patch_bank_B_T_K_C_P_P.dtype),
+        )
+        out.update(
+            self._build_patch_metadata(
+                out["patch_bank_indices_B_T_N"].clamp_min(0),
+                out["token_valid_mask_B_T_N"],
+            )
+        )
+        return out
+
+    @torch.no_grad()
+    def sample_paired_splits(
+        self,
+        split_hard_B_M: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select one reachable internal node per frame and return stop/split trees."""
+        B = split_hard_B_M.shape[0]
+        root_h, root_w = self.level_grid_hw[0]
+        reachable_B_H_W = torch.ones(
+            (B, root_h, root_w), dtype=torch.bool, device=split_hard_B_M.device
+        )
+        reachable_levels = []
+        for level in range(self.num_levels - 1):
+            reachable_levels.append(reachable_B_H_W.flatten(start_dim=1))
+            start, end = self.internal_level_offsets[level : level + 2]
+            split_B_H_W = split_hard_B_M[:, start:end].reshape_as(reachable_B_H_W)
+            reachable_B_H_W = self._replicate_to_children(
+                (reachable_B_H_W & split_B_H_W).unsqueeze(1)
+            ).squeeze(1)
+
+        # Reachability depends on ancestors, so both stopped and split nodes qualify.
+        reachable_B_M = torch.cat(reachable_levels, dim=1)
+        scores_B_M = torch.rand(reachable_B_M.shape, device=split_hard_B_M.device)
+        selected_node_B = scores_B_M.masked_fill(~reachable_B_M, -1.0).argmax(dim=1)
+        stop_B_M = split_hard_B_M.clone()
+        split_B_M = split_hard_B_M.clone()
+        stop_B_M.scatter_(1, selected_node_B[:, None], False)
+        split_B_M.scatter_(1, selected_node_B[:, None], True)
+        return selected_node_B, stop_B_M, split_B_M
+
     def _build_patch_metadata(
         self,
         selected_indices_B_T_N: torch.Tensor,
@@ -1321,13 +1394,41 @@ class FoveationNet(nn.Module):
         }
 
     @staticmethod
+    def upper_bound_budget_loss(
+        normalized_expected_scalar: torch.Tensor,
+        normalized_target_scalar: Union[float, torch.Tensor],
+        budget_loss_type: str,
+        budget_base_cost_weight: float,
+        budget_lambda: float,
+        budget_elu_tau: float = 0.025,
+    ) -> torch.Tensor:
+        """Compute linear cost or switch between excess cost and saturating reward."""
+        gap_scalar = normalized_expected_scalar - normalized_target_scalar
+        if budget_loss_type == "upper_bound_lagrangian_elu":
+            # Only the dual price acts above target; at/below target, use reward
+            # alone so an accumulated lambda cannot prevent gradient saturation.
+            reward_scalar = budget_base_cost_weight * budget_elu_tau * F.elu(
+                gap_scalar / budget_elu_tau
+            )
+            # Equality selects the reward slope alpha; slopes need not match lambda.
+            return torch.where(gap_scalar > 0.0, budget_lambda * gap_scalar, reward_scalar)
+        # Preserve the original linear mode, including its dual price below target.
+        return budget_base_cost_weight * normalized_expected_scalar + budget_lambda * gap_scalar
+
+    @staticmethod
     def budget_loss(
         soft_leaf_probs_B_T_K: torch.Tensor,
         target_num_patches: Union[int, float],
         min_num_patches: Union[int, float],
         max_num_patches: Union[int, float],
+        budget_loss_type: str = "per_observation_mse",
+        budget_base_cost_weight: float = 0.01,
+        budget_lambda: float = 0.0,
+        budget_elu_tau: float = 0.025,
     ) -> torch.Tensor:
-        """Penalize leaf-count error after normalizing by its legal range."""
+        """Compute local count MSE or upper-bound cost; workspace globalizes ELU."""
+        if budget_loss_type in ("upper_bound_lagrangian", "upper_bound_lagrangian_elu"):
+            soft_leaf_probs_B_T_K = soft_leaf_probs_B_T_K.float()
         expected_num_patches_B_T = soft_leaf_probs_B_T_K.sum(dim=-1)
         min_patches = float(min_num_patches)
         max_patches = float(max_num_patches)
@@ -1343,6 +1444,17 @@ class FoveationNet(nn.Module):
         normalized_target = expected_num_patches_B_T.new_tensor(
             (float(target_num_patches) - min_patches) / budget_range
         )
+        if budget_loss_type in ("upper_bound_lagrangian", "upper_bound_lagrangian_elu"):
+            # Workspace weights local gradients and recomputes ELU at the global mean.
+            return FoveationNet.upper_bound_budget_loss(
+                normalized_expected_B_T.mean(), normalized_target, budget_loss_type,
+                budget_base_cost_weight, budget_lambda, budget_elu_tau,
+            )
+        if budget_loss_type == "batch_mean_mse":
+            # Average before squaring so observations can compensate each other.
+            # This forward only: local batch x frames x cameras (folded into B),
+            # without aggregation across GPUs or gradient accumulation steps.
+            return F.mse_loss(normalized_expected_B_T.mean(), normalized_target)
         return F.mse_loss(
             normalized_expected_B_T,
             normalized_target.expand_as(normalized_expected_B_T),
@@ -1352,7 +1464,10 @@ class FoveationNet(nn.Module):
         self,
         x_B_C_T_H_W: torch.Tensor,
         cond_B_T_D: Optional[torch.Tensor] = None,
+        *,
+        return_routing_state: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        """Route images, optionally exposing the bank and decisions for paired evaluation."""
         ## 1. Validate and normalize the high-resolution input.
         if x_B_C_T_H_W.ndim != 5:
             raise ValueError("Expected x_B_C_T_H_W with shape (B, C, T, H, W).")
@@ -1537,10 +1652,12 @@ class FoveationNet(nn.Module):
         )
 
         ## 6. Compute the differentiable expected token-budget penalty.
+        budget_stats = {}
         if (
             self.fix_split_mode is not None
             or self.resolved_target_num_patches is None
             or self.budget_loss_weight == 0.0
+            or self.min_num_patches == self.max_num_patches
         ):
             budget_loss = soft_leaf_probs_B_T_K.sum() * 0.0
         else:
@@ -1572,13 +1689,34 @@ class FoveationNet(nn.Module):
                 self.resolved_target_num_patches,
                 self.min_num_patches,
                 self.max_num_patches,
+                budget_loss_type=self.budget_loss_type,
+                budget_base_cost_weight=self.budget_base_cost_weight,
+                budget_lambda=self.budget_lambda,
+                budget_elu_tau=self.budget_elu_tau,
             ) * self.budget_loss_weight
+            if self.budget_loss_type in ("upper_bound_lagrangian", "upper_bound_lagrangian_elu"):
+                expected_num_patches_B_T = budget_leaf_probs_B_T_K.detach().float().sum(-1)
+                budget_stats = {
+                    "_budget_expected_sum": expected_num_patches_B_T.sum(),
+                    "_budget_observation_count": expected_num_patches_B_T.new_tensor(
+                        expected_num_patches_B_T.numel()
+                    ),
+                }
+                if self.budget_loss_type == "upper_bound_lagrangian_elu":
+                    # Scalar survives policy passthrough without per-frame slicing.
+                    budget_stats["_budget_normalized_mean"] = (
+                        budget_leaf_probs_B_T_K.float().sum(-1).mean() - self.min_num_patches
+                    ) / (self.max_num_patches - self.min_num_patches)
 
         out = dict(packed)
         out.update(metadata)
         out["split_logits_B_T_M"] = split_logits_B_T_M
         out["random_topology_mask_B_T"] = random_topology_mask_B_T
         out["budget_loss"] = budget_loss
+        out.update(budget_stats)
+        if return_routing_state:
+            out["patch_bank_B_T_K_C_P_P"] = patch_bank_B_T_K_C_P_P
+            out["split_hard_B_T_M"] = split_hard_B_T_M
         return out
 
     def vis_ar_tokens(

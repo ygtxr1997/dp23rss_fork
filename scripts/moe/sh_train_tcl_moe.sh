@@ -3,7 +3,7 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=0,2,3,4 bash scripts/moe/sh_train_tcl_moe.sh
+CUDA_VISIBLE_DEVICES=3,4,5,6 bash scripts/moe/sh_train_tcl_moe.sh
 "
 
 ### Merge MoE ###
@@ -11,15 +11,21 @@ CONFIG_DIR="configs/"
 CONFIG_NAME="tcl_force_moe.yaml"
 
 task_names=(
-  "1201_screw_bulb_turn_off_table"
-  "1201_screw_bulb_turn_off_object"
-  "1201_screw_bulb_turn_off_light"
+#  "1201_screw_bulb_turn_off_table"
+#  "1201_screw_bulb_turn_off_object"
+#  "1201_screw_bulb_turn_off_light"
+  "0209_tower_boby_hard"
+  "0417_plastic_egg"
+  "0417_put_mouse_hard"
 )
 ffn_expand_factor=(6 4 2)
 teacher_ckpts=(
-  "data/outputs/2026.04.28/21.28.06_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
-  "data/outputs/2026.04.30/22.33.39_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
-  "data/outputs/2026.05.01/17.54.53_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+#  "data/outputs/2026.04.28/21.28.06_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+#  "data/outputs/2026.04.30/22.33.39_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+#  "data/outputs/2026.05.01/17.54.53_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+  "data/outputs/2026.09.09/11.12.55_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+  "data/outputs/2026.09.09/11.13.27_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+  "data/outputs/2026.09.12/01.41.29_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
 )
 
 DATASET_ROOT="${DATASET_ROOT:-/home/geyuan/datasets/TCL}"
@@ -81,6 +87,7 @@ accelerate launch \
   --main_process_port=${MAIN_PORT} \
   train.py --config-dir=${CONFIG_DIR} --config-name=${CONFIG_NAME} training.seed=42 \
   training.device=${DEVICE} \
+  logging.project="moemerge" \
   hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}' \
   task.dataset.data_root="${master_data_root}" \
   task.dataset.h5_path="${master_h5_path}" \
