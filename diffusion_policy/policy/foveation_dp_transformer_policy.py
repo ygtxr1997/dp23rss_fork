@@ -42,8 +42,13 @@ class FoveationObsEncoder(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        visual_encoder_init: str = "copy",
     ) -> None:
+        """Configure patch encoding and optional independent Transformer initialization."""
         super().__init__()
+        if visual_encoder_init not in {"copy", "trunc_normal"}:
+            raise ValueError("visual_encoder_init must be 'copy' or 'trunc_normal'.")
+        self.visual_encoder_init = visual_encoder_init
         self.in_channels = int(in_channels)
         self.input_hw = (int(input_hw[0]), int(input_hw[1]))
         self.patch_size = int(patch_size)
@@ -213,6 +218,23 @@ class FoveationObsEncoder(nn.Module):
         )
         self.final_norm = nn.LayerNorm(self.visual_dim)
         self.output_dim = self.visual_dim
+        if self.visual_encoder_init == "trunc_normal":
+            # Construction is on CPU; preserve the RNG stream used by the action model.
+            with torch.random.fork_rng(devices=[]):
+                self._init_transformer_weights()
+
+    def _init_transformer_weights(self) -> None:
+        """Independently initialize cloned layers without changing patch embeddings."""
+        for layer in self.token_encoder.layers:
+            # Q/K/V share a (3D, D) parameter, which an nn.Linear traversal misses.
+            nn.init.trunc_normal_(layer.self_attn.in_proj_weight, std=0.02)
+            nn.init.zeros_(layer.self_attn.in_proj_bias)
+            for projection in (layer.self_attn.out_proj, layer.linear1, layer.linear2):
+                nn.init.trunc_normal_(projection.weight, std=0.02)
+                nn.init.zeros_(projection.bias)
+            for norm in (layer.norm1, layer.norm2):
+                nn.init.ones_(norm.weight)
+                nn.init.zeros_(norm.bias)
 
     def _build_multiscale_position_bank(self) -> torch.Tensor:
         """Interpolate one learned fine-grid map to every quadtree level."""
@@ -498,11 +520,17 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         obs_as_cond: bool = True,
         pred_action_steps_only: bool = False,
         router_temperature: Optional[float] = None,
-        router_condition_key: Optional[str] = None,
+        router_condition_key: Optional[Union[str, Sequence[str]]] = None,
         router_loss_type: str = "st",
         paired_loss_weight: float = 1.0,
+        temporal_adaptive: bool = False,
+        temporal_loss_weight: float = 1.0,
+        paired_node_sampling: str = "reachable",
+        mask_policy_state: bool = False,
+        visual_encoder_init: str = "copy",
         **kwargs,
     ) -> None:
+        """Configure routing losses and optional low-dimensional action-input masking."""
         super().__init__()
         if router_loss_type not in {"st", "paired"}:
             raise ValueError("router_loss_type must be 'st' or 'paired'.")
@@ -510,6 +538,18 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             raise ValueError("paired_loss_weight must be positive.")
         self.router_loss_type = router_loss_type
         self.paired_loss_weight = float(paired_loss_weight)
+        if paired_node_sampling != "reachable":
+            raise ValueError(
+                "paired_node_sampling only accepts 'reachable'; 'single_level' was removed. "
+                "Override old checkpoint configs with paired_node_sampling=reachable."
+            )
+        if not temporal_loss_weight >= 0.0:
+            raise ValueError("temporal_loss_weight must be non-negative.")
+        if temporal_adaptive and router_loss_type != "paired":
+            raise ValueError("temporal_adaptive requires router_loss_type=paired.")
+        self.temporal_adaptive = bool(temporal_adaptive)
+        self.temporal_loss_weight = float(temporal_loss_weight)
+        self.paired_node_sampling = paired_node_sampling
         if "position_encoding_type" in kwargs:
             raise ValueError(
                 "position_encoding_type was renamed to position_encoding_types; "
@@ -545,18 +585,22 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                 raise ValueError(f"Unsupported observation type {obs_type!r} for {key!r}.")
 
         self.router_condition_key = router_condition_key
+        self.router_condition_keys = (
+            [] if router_condition_key is None else
+            [router_condition_key] if isinstance(router_condition_key, str) else list(router_condition_key)
+        )
         router_condition_input_dim = None
-        if self.router_condition_key is not None:
-            if self.router_condition_key not in obs_shape_meta:
-                raise ValueError(
-                    f"Router condition {self.router_condition_key!r} is missing from shape_meta.obs."
-                )
-            condition_meta = obs_shape_meta[self.router_condition_key]
-            if condition_meta.get("type", "low_dim") != "low_dim":
-                raise ValueError("router_condition_key must refer to a low-dim observation.")
+        if self.router_condition_keys:
             if not self.rgb_keys:
                 raise ValueError("router_condition_key requires at least one RGB observation.")
-            router_condition_input_dim = math.prod(condition_meta["shape"])
+            router_condition_input_dim = 0
+            for key in self.router_condition_keys:
+                if key not in obs_shape_meta:
+                    raise ValueError(f"Router condition {key!r} is missing from shape_meta.obs.")
+                condition_meta = obs_shape_meta[key]
+                if condition_meta.get("type", "low_dim") != "low_dim":
+                    raise ValueError("router_condition_key must refer to low-dim observations.")
+                router_condition_input_dim += math.prod(condition_meta["shape"])
 
         self.foveation_net: Optional[FoveationNet] = None
         self.obs_encoder: Optional[FoveationObsEncoder] = None
@@ -602,6 +646,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                 num_heads=visual_encoder_heads,
                 mlp_ratio=visual_encoder_mlp_ratio,
                 dropout=visual_encoder_dropout,
+                visual_encoder_init=visual_encoder_init,
             )
             foveation_grids = tuple(
                 tuple(grid_hw) for grid_hw in self.foveation_net.level_grid_hw
@@ -646,6 +691,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         if self.n_obs_steps > self.horizon or self.n_action_steps > self.horizon:
             raise ValueError("n_obs_steps and n_action_steps cannot exceed horizon.")
         self.obs_as_cond = bool(obs_as_cond)
+        self.mask_policy_state = bool(mask_policy_state)
         self.pred_action_steps_only = bool(pred_action_steps_only)
         self.noise_scheduler = noise_scheduler
         self.num_inference_steps = (
@@ -802,10 +848,12 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         }
         router_cond_B_T_D = None
         if self.router_condition_projection is not None:
-            condition_B_T = normalized_low_dim_by_key[self.router_condition_key]
-            condition_B_T_D = condition_B_T.reshape(
-                condition_B_T.shape[0], condition_B_T.shape[1], -1
-            )
+            # Ordered concatenation preserves legacy single-condition weight shapes.
+            conditions = []
+            for key in self.router_condition_keys:
+                value_B_T = normalized_low_dim_by_key[key]
+                conditions.append(value_B_T.reshape(*value_B_T.shape[:2], -1))
+            condition_B_T_D = torch.cat(conditions, dim=-1)
             router_cond_B_T_D = self.router_condition_projection(condition_B_T_D)
 
         if self.rgb_keys:
@@ -835,6 +883,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             merged_out = self.foveation_net(
                 merged_B_C_T_H_W,
                 cond_B_T_D=merged_cond_B_T_D,
+                num_views=len(self.rgb_keys),
                 **routing_kwargs,
             )
             aux["budget_loss"] = merged_out["budget_loss"]
@@ -880,7 +929,11 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                 features.append(self.obs_encoder(route_out))
         for key in self.low_dim_keys:
             value_B_T = normalized_low_dim_by_key[key]
-            features.append(value_B_T.reshape(value_B_T.shape[0], value_B_T.shape[1], -1))
+            value_B_T_D = value_B_T.reshape(value_B_T.shape[0], value_B_T.shape[1], -1)
+            if self.mask_policy_state and key != "task_id":
+                # Mask robot state only; task identity and router inputs stay available.
+                value_B_T_D = torch.zeros_like(value_B_T_D)
+            features.append(value_B_T_D)
 
         if not features:
             raise ValueError("No supported observations were provided.")
@@ -1205,7 +1258,10 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         if self._staged_training:
             active = "visual encoder + action policy" if self._downstream_finetune else "routing"
             print(f"[Stage B] Registered parameters remain grad-enabled; active updates: {active}")
-        print(f"[FoveationDPTransformerPolicy] obs_dim={self.obs_feature_dim}")
+        print(
+            f"[FoveationDPTransformerPolicy] obs_dim={self.obs_feature_dim}, "
+            f"mask_policy_state={self.mask_policy_state}"
+        )
         if self.foveation_net is not None:
             encoder = getattr(self.foveation_net, "global_encoder", None)
             if encoder is not None:
@@ -1279,11 +1335,77 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         loss_B_H_D = loss_B_H_D * loss_mask_B_H_D.to(loss_B_H_D.dtype)
         return loss_B_H_D.reshape(B, -1).mean(dim=1)
 
+    @torch.no_grad()
+    def compute_resolution_diagnostics(
+        self, batch: Dict[str, object], *, seed: int
+    ) -> Dict[str, object]:
+        """Return paired per-level action losses and the original routing outputs."""
+        if not self.obs_as_cond:
+            raise ValueError("Resolution diagnostics require obs_as_cond=true.")
+        if self.training:
+            raise ValueError("Resolution diagnostics require eval mode.")
+        if self.foveation_net is None or not self.rgb_keys:
+            raise ValueError("Resolution diagnostics require RGB foveation inputs.")
+        obs_dict = {
+            key: value_B_T_D[:, :self.n_obs_steps]
+            for key, value_B_T_D in batch["obs"].items()
+        }
+        nactions_B_H_D = self.normalizer["action"].normalize(batch["action"])
+        if nactions_B_H_D.shape[1] != self.horizon:
+            raise ValueError(
+                f"Expected action horizon {self.horizon}, got {nactions_B_H_D.shape[1]}."
+            )
+        device = nactions_B_H_D.device
+        rng_devices = [device] if device.type == "cuda" else []
+        # Preserve training RNG, including the randomness used by the original topology.
+        with torch.random.fork_rng(devices=rng_devices):
+            torch.random.default_generator.manual_seed(seed)
+            if device.type == "cuda":
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(seed)
+            merged_out, normalized_low_dim_by_key, aux = self._route_observations(
+                obs_dict, return_foveation_outputs=True, return_routing_state=True
+            )
+            # A separate generator decouples diffusion inputs from random-tree draws.
+            generator = torch.Generator(device=device).manual_seed(seed)
+            noise_B_H_D = torch.randn(
+                nactions_B_H_D.shape, device=device, dtype=nactions_B_H_D.dtype,
+                generator=generator,
+            )
+            timesteps_B = torch.randint(
+                self.noise_scheduler.config.num_train_timesteps,
+                (nactions_B_H_D.shape[0],), device=device, generator=generator,
+            )
+            condition_mask_B_H_D = (
+                torch.zeros_like(nactions_B_H_D, dtype=torch.bool)
+                if self.pred_action_steps_only
+                else self.mask_generator(nactions_B_H_D.shape, seed=seed)
+            )
+            level_losses = []
+            for level in range(self.foveation_net.num_levels):
+                # VB merges view and batch; all views/frames use the same leaf level.
+                split_hard_VB_T_M = torch.zeros_like(merged_out["split_hard_B_T_M"])
+                split_hard_VB_T_M[..., :self.foveation_net.internal_level_offsets[level]] = True
+                level_out = self.foveation_net.pack_topology(
+                    merged_out["patch_bank_B_T_K_C_P_P"], split_hard_VB_T_M
+                )
+                obs_features_B_T_D = self._encode_routed_observations(
+                    level_out, normalized_low_dim_by_key
+                )
+                level_losses.append(self._diffusion_loss_per_sample(
+                    obs_features_B_T_D, nactions_B_H_D,
+                    noise_B_H_D=noise_B_H_D, timesteps_B=timesteps_B,
+                    condition_mask_B_H_D=condition_mask_B_H_D,
+                ))
+            loss_B_L = torch.stack(level_losses, dim=-1)
+        return {"loss_B_L": loss_B_L, "foveation_outputs": aux["foveation_outputs"]}
+
     def _compute_paired_loss(
         self,
         obs_dict: Dict[str, torch.Tensor],
         nactions_B_H_D: torch.Tensor,
         return_foveation_outputs: bool,
+        temporal_pair_valid_P: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if not self._action_path_frozen:
             raise ValueError("Paired loss requires freeze_action_path() before training.")
@@ -1298,13 +1420,20 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         split_hard_VB_T_M = merged_out["split_hard_B_T_M"]
         T = split_hard_VB_T_M.shape[1]
         device = split_hard_VB_T_M.device
-        # RGB streams occupy contiguous B-sized blocks. Intervene on one frame only.
-        view_B = torch.randint(len(self.rgb_keys), (B,), device=device)
-        frame_B = torch.randint(T, (B,), device=device)
+        # B counts windows (2P for temporal pairs), ordered [all A, all B].
+        # Share view/frame within a pair so matched interventions use the same position.
+        random_batch_size = B if temporal_pair_valid_P is None else temporal_pair_valid_P.shape[0]
+        view_B = torch.randint(len(self.rgb_keys), (random_batch_size,), device=device)
+        frame_B = torch.randint(T, (random_batch_size,), device=device)
+        if temporal_pair_valid_P is not None:
+            view_B = view_B.repeat(2)
+            frame_B = frame_B.repeat(2)
         stream_batch_B = view_B * B + torch.arange(B, device=device)
         base_split_B_M = split_hard_VB_T_M[stream_batch_B, frame_B]
         selected_node_B, stop_B_M, split_B_M = (
-            self.foveation_net.sample_paired_splits(base_split_B_M)
+            self.foveation_net.sample_paired_splits(
+                base_split_B_M, temporal_pair_valid_P=temporal_pair_valid_P
+            )
         )
         selected_logits_B = merged_out["split_logits_B_T_M"][
             stream_batch_B, frame_B, selected_node_B
@@ -1314,6 +1443,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         split_prob_B = selected_logits_B.float().sigmoid()
 
         pair_losses = []
+        pair_num_patches = []
         noise_B_H_D = None
         timesteps_B = None
         condition_mask_B_H_D = None
@@ -1325,6 +1455,9 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                 pair_out = self.foveation_net.pack_topology(
                     merged_out["patch_bank_B_T_K_C_P_P"], pair_split_VB_T_M
                 )
+                if temporal_pair_valid_P is not None:
+                    # Effective leaves at the intervention, independent of token padding.
+                    pair_num_patches.append(pair_out["num_patches_B_T"][stream_batch_B, frame_B])
                 obs_features_B_T_D = self._encode_routed_observations(
                     pair_out, normalized_low_dim_by_key
                 )
@@ -1339,13 +1472,16 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                         if self.pred_action_steps_only
                         else self.mask_generator(trajectory_B_H_D.shape)
                     )
+                    # A/B get independent noise and their own targets; both arms reuse it.
                     noise_B_H_D = torch.randn_like(trajectory_B_H_D)
                     timesteps_B = torch.randint(
                         0,
                         self.noise_scheduler.config.num_train_timesteps,
-                        (B,),
+                        (random_batch_size,),
                         device=device,
                     ).long()
+                    if temporal_pair_valid_P is not None:
+                        timesteps_B = timesteps_B.repeat(2)
                 pair_losses.append(
                     self._diffusion_loss_per_sample(
                         obs_features_B_T_D,
@@ -1358,9 +1494,9 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
 
         stop_loss_B, split_loss_B = pair_losses
         advantage_B = stop_loss_B - split_loss_B
-        # This is a local objective under reachable-node sampling, without reach weighting.
+        # Spatial loss averages all input windows, including invalid-pair placeholders.
         paired_loss = -(split_prob_B * advantage_B.detach()).mean()
-        # One arm equals the sampled tree because the selected node is reachable.
+        # Descendant decisions are preserved, so one arm has the base tree's leaf set.
         base_split_B = base_split_B_M.gather(1, selected_node_B[:, None]).squeeze(1)
         diffusion_loss = torch.where(base_split_B, split_loss_B, stop_loss_B).mean()
         budget_loss = aux["budget_loss"]
@@ -1380,6 +1516,22 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             "paired_advantage_abs_mean": advantage_B.abs().mean(),
             "paired_advantage_positive_fraction": (advantage_B > 0).float().mean(),
         }
+        if temporal_pair_valid_P is not None:
+            P = temporal_pair_valid_P.shape[0]
+            stop_num_patches_B, split_num_patches_B = pair_num_patches
+            actual_delta_B = split_num_patches_B - stop_num_patches_B
+            matched_P = temporal_pair_valid_P & (actual_delta_B[:P] == actual_delta_B[P:])
+            gain_P = advantage_B[:P] - advantage_B[P:]
+            prefer_a_P = (selected_logits_B[:P].float() - selected_logits_B[P:].float()).sigmoid()
+            # Normalize by all P pairs: failed matches and placeholders contribute zero,
+            # without amplifying the rest or dividing gains by their leaf-count delta.
+            temporal_loss_scalar = -(
+                prefer_a_P * gain_P.detach() * matched_P.to(prefer_a_P.dtype)
+            ).mean()
+            losses["temporal_loss"] = temporal_loss_scalar
+            losses["_temporal_matched_pair_count"] = matched_P.sum()
+            losses["_temporal_valid_pair_count"] = temporal_pair_valid_P.sum()
+            losses["total_loss"] = total_loss + self.temporal_loss_weight * temporal_loss_scalar
         if return_foveation_outputs:
             losses["_foveation_outputs"] = aux["foveation_outputs"]
         losses.update({key: value for key, value in aux.items() if key.startswith("_budget_")})
@@ -1395,14 +1547,27 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         if kwargs.pop("return_roi_params", False):
             return_foveation_outputs = True
         obs_dict = batch["obs"]
-        nactions_B_H_D = self.normalizer["action"].normalize(batch["action"])
+        actions_B_H_D = batch["action"]
+        paired_training = self.training and self.router_loss_type == "paired" and not self._downstream_finetune
+        temporal_pair_valid_P = None
+        if paired_training and self.temporal_adaptive:
+            if "temporal_pair" not in batch or "temporal_pair_valid" not in batch:
+                raise ValueError("Temporal router training requires dataset.set_temporal_pairing(True).")
+            pair_batch = batch["temporal_pair"]
+            obs_dict = {
+                key: torch.cat([value_B_T_D, pair_batch["obs"][key]], dim=0)
+                for key, value_B_T_D in obs_dict.items()
+            }
+            actions_B_H_D = torch.cat([actions_B_H_D, pair_batch["action"]], dim=0)
+            temporal_pair_valid_P = batch["temporal_pair_valid"]
+        nactions_B_H_D = self.normalizer["action"].normalize(actions_B_H_D)
         if nactions_B_H_D.shape[1] != self.horizon:
             raise ValueError(
                 f"Expected action horizon {self.horizon}, got {nactions_B_H_D.shape[1]}."
             )
-        if self.training and self.router_loss_type == "paired" and not self._downstream_finetune:
+        if paired_training:
             return self._compute_paired_loss(
-                obs_dict, nactions_B_H_D, return_foveation_outputs
+                obs_dict, nactions_B_H_D, return_foveation_outputs, temporal_pair_valid_P
             )
 
         obs_features_B_T_D, aux = self._encode_obs_batch(

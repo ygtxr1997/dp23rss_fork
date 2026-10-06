@@ -1,7 +1,7 @@
 from typing import Dict, List, Optional
 import bisect
 import torch
-from torch.utils.data import ConcatDataset
+from torch.utils.data import ConcatDataset, default_collate
 from torchvision import transforms
 import numpy as np
 import copy
@@ -14,6 +14,22 @@ from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
 from diffusion_policy.common.pymunk_util import ImageLightingEffect
 from diffusion_policy.dataset.libero_dataset import RandomShiftsAug, VideoTransformTHWC
+
+
+def _iter_pusht_diagnostic_batches(dataset, samples_per_task: int, seed: int):
+    if samples_per_task < 2:
+        raise ValueError("topology_samples_per_task must be at least 2")
+    if len(dataset) == 0:
+        return
+    # All sources belong to one PushT task; sample uniformly over merged windows.
+    rng = np.random.RandomState(seed)
+    indices_B = rng.choice(len(dataset), min(samples_per_task, len(dataset)), replace=False)
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        batch = default_collate([dataset._get_single_window(int(idx)) for idx in indices_B])
+    # Diagnostic metadata only: do not add task identity to policy observations.
+    batch['task_id'] = torch.zeros(len(indices_B), dtype=torch.long)
+    yield 0, batch
 
 
 class PushTImageDataset(BaseImageDataset):
@@ -88,7 +104,41 @@ class PushTImageDataset(BaseImageDataset):
         )
 
         self.return_all_state = return_all_state
+        # Shared storage lets persistent workers observe epoch-boundary changes.
+        self._temporal_pairing_scalar = torch.zeros((), dtype=torch.bool).share_memory_()
+        self._temporal_indices_by_episode = None
         print(f"[PushTImageDataset] Loaded from: {zarr_path}, len={self.__len__()}.")
+
+    def set_temporal_pairing(self, enabled: bool) -> None:
+        """Toggle episode-local pairing; prepare indices before starting workers."""
+        if enabled and self._temporal_indices_by_episode is None:
+            self._prepare_temporal_indices()
+        self._temporal_pairing_scalar.fill_(enabled)
+
+    def _prepare_temporal_indices(self) -> None:
+        indices_N_4 = self.sampler.indices.reshape(-1, 4)
+        episode_ends_E = self.replay_buffer.episode_ends[:]
+        episode_starts_E = np.r_[0, episode_ends_E[:-1]]
+        self._temporal_episode_N = np.searchsorted(
+            episode_ends_E, indices_N_4[:, 0], side='right'
+        )
+        # Undo left padding to recover the actual decision time, not its clamped frame.
+        decision_time_N = indices_N_4[:, 0] - indices_N_4[:, 2] + self.n_obs_steps - 1
+        valid_N = (
+            (decision_time_N >= episode_starts_E[self._temporal_episode_N])
+            & (decision_time_N < episode_ends_E[self._temporal_episode_N])
+        )
+        valid_indices_V = np.flatnonzero(valid_N)
+        episodes_E, group_starts_E = np.unique(
+            self._temporal_episode_N[valid_indices_V], return_index=True
+        )
+        self._temporal_indices_by_episode = {}
+        self._temporal_position_N = np.full(len(indices_N_4), -1, dtype=np.int64)
+        for episode, candidates_C in zip(
+            episodes_E, np.split(valid_indices_V, group_starts_E[1:])
+        ):
+            self._temporal_indices_by_episode[int(episode)] = candidates_C
+            self._temporal_position_N[candidates_C] = np.arange(len(candidates_C))
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -104,6 +154,9 @@ class PushTImageDataset(BaseImageDataset):
             } if self.loaded_obs_steps < self.horizon else {}
             )
         val_set.train_mask = ~self.train_mask
+        # copy.copy must not share the training switch or its sampler-index mapping.
+        val_set._temporal_pairing_scalar = torch.zeros((), dtype=torch.bool).share_memory_()
+        val_set._temporal_indices_by_episode = None
         return val_set
 
     # def get_normalizer(self, mode='limits', **kwargs):
@@ -168,11 +221,35 @@ class PushTImageDataset(BaseImageDataset):
         """
         return data
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def _get_single_window(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
         dict_func = lambda x: torch.from_numpy(x) if isinstance(x, np.ndarray) else x
-        torch_data = dict_apply(data, dict_func)
+        return dict_apply(data, dict_func)
+
+    def iter_task_diagnostic_batches(self, samples_per_task: int, seed: int):
+        """Yield fixed augmented windows without Temporal pairing or RNG side effects."""
+        yield from _iter_pusht_diagnostic_batches(self, samples_per_task, seed)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Read a training window and optionally attach an episode-local pair."""
+        torch_data = self._get_single_window(idx)
+        if bool(self._temporal_pairing_scalar):
+            position = int(self._temporal_position_N[idx])
+            candidates_C = self._temporal_indices_by_episode.get(
+                int(self._temporal_episode_N[idx]), ()
+            )
+            pair_valid = position >= 0 and len(candidates_C) > 1
+            if pair_valid:
+                # Skip A's position without rejection sampling; use the worker RNG.
+                pair_position = np.random.randint(len(candidates_C) - 1)
+                pair_position += pair_position >= position
+                pair_data = self._get_single_window(int(candidates_C[pair_position]))
+            else:
+                # A shallow copy avoids recursion while reusing the augmented placeholder.
+                pair_data = dict(torch_data)
+            torch_data['temporal_pair'] = pair_data
+            torch_data['temporal_pair_valid'] = torch.tensor(pair_valid, dtype=torch.bool)
         return torch_data
 
 
@@ -245,6 +322,11 @@ class MergedPushTImageDataset(BaseImageDataset):
         self.load_future_frames = bool(load_future_frames)
         self.loaded_obs_steps = horizon if self.load_future_frames else self.n_obs_steps
 
+    def set_temporal_pairing(self, enabled: bool) -> None:
+        """Pair within each source dataset, preserving episode identity across files."""
+        for dataset in self.datasets:
+            dataset.set_temporal_pairing(enabled)
+
     def get_validation_dataset(self):
         """
         分别获取每个子数据集的验证集，然后重新组装为一个新的 Merged 实例
@@ -266,6 +348,16 @@ class MergedPushTImageDataset(BaseImageDataset):
 
     def __len__(self) -> int:
         return len(self.concat_dataset)
+
+    def _get_single_window(self, idx: int) -> Dict[str, torch.Tensor]:
+        ds_idx = bisect.bisect_right(self.concat_dataset.cumulative_sizes, idx)
+        start = 0 if ds_idx == 0 else self.concat_dataset.cumulative_sizes[ds_idx - 1]
+        # Bypass __getitem__ so diagnostics never generate Temporal pairs.
+        return self.datasets[ds_idx]._get_single_window(idx - start)
+
+    def iter_task_diagnostic_batches(self, samples_per_task: int, seed: int):
+        """Yield a fixed diagnostic batch treating all PushT sources as one task."""
+        yield from _iter_pusht_diagnostic_batches(self, samples_per_task, seed)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         # ConcatDataset 会自动帮你计算这个全局 idx 落在哪个子 dataset 上，

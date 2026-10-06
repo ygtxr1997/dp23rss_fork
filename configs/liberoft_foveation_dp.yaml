@@ -2,6 +2,7 @@ _target_: diffusion_policy.workspace.train_foveation_dp_transformer_workspace.Tr
 
 name: train_foveation_dp_transformer
 task_name: liberoft
+libero_root: /home/geyuan/code/LIBERO-FT
 horizon: 32
 n_obs_steps: 1
 n_action_steps: 8
@@ -12,13 +13,13 @@ checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
   topk:
-    format_str: epoch={epoch:04d}-val_total_loss={val_total_loss:.3f}.ckpt
+    format_str: "epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt"
     k: 3
-    mode: min
-    monitor_key: val_total_loss
+    mode: max
+    monitor_key: test_mean_score  # ori:val_total_loss
 
 dataloader:
-  batch_size: 128
+  batch_size: 64  # ori:128
   num_workers: 12
   persistent_workers: true
   pin_memory: true
@@ -40,7 +41,7 @@ ema:
 
 logging:
   mode: online
-  project: diffusion_policy_debug
+  project: diffusion_policy_libero
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
   group: null
   id: null
@@ -79,29 +80,58 @@ policy:
   p_drop_attn: 0.1
   causal_attn: true
   time_as_cond: true
-  visual_dim: 256
-  visual_encoder_layers: 2
+  visual_dim: 256  # ori:256
+  router_condition_key: [joint_state, task_id]
+  # Mask robot-state action inputs; preserve task identity and router conditions.
+  mask_policy_state: false
+  paired_loss_weight: 1.0
+  paired_node_sampling: reachable
+  router_loss_type: st
+  temporal_adaptive: false
+  temporal_loss_weight: 1.0  # 0 retains both windows and active matching for ablation.
+  pooling_type: cls_token
+  patch_level_adapter_channels: 16
+  visual_encoder_layers: 4
+  visual_encoder_init: trunc_normal  # copy (legacy) or trunc_normal (independent layers)
   visual_encoder_heads: 8
-  position_encoding_types: [apt_interpolated]
-  patch_embedding_type: linear
+  visual_encoder_dropout: 0.0
+  position_encoding_types: [apt_interpolated, level_embedding]
+  patch_embedding_type: conv
   foveation_net:
     _target_: diffusion_policy.model.roi.foveation_net.FoveationNet
     in_channels: 3
     input_hw: ${foveation_input_hw}
+    # null disables; 32 applies area downsampling to 32x32, then bilinear upsampling.
+    debug_lowpass_size: null
     num_levels: 3
     global_level: 0
-    global_encoder_type: "vjepa2_1_vit_base_384"
+    router_type: node_aligned_fpn
+    global_encoder_type: resnet10
     global_feature_dim: 768
     torch_home: "/home/geyuan/pretrained/torch"
     patch_size: 16
-    freeze_global_encoder: true
+    router_hidden_dim: 128
+    router_layers: 4
+    router_heads: 8
+    router_cond_dim: 512
+    freeze_global_encoder: false
     freeze_router: false
     router_temperature: 1.0
     target_num_patches: 0.25
-    budget_loss_weight: 0.1
+    # Random legal trees are also used during evaluation.
+    # Uniform leaves: "level:1". Weighted window sampling (also during eval):
+    # ["20%level:0", "25%level:1", "35%level:2", "20%random:0.25,0.5,0.75"]
+    # Weights sum to 100%; views/frames share the mode. Requires random_topology_prob=0.
+    fix_split_mode: "random:0.0,0.25,0.5,0.75,1.0"
+    random_topology_prob: 0.0
+    budget_loss_weight: 0.0
+    budget_probability_type: sampled_relaxed
+    budget_loss_type: per_observation_mse
+    budget_base_cost_weight: 0.01
+    budget_elu_tau: 0.025
 
-image_shape: &image_shape [3, 384, 384]
-foveation_input_hw: &foveation_input_hw [384, 384]
+image_shape: &image_shape [3, 256, 256]
+foveation_input_hw: &foveation_input_hw [256, 256]
 shape_meta: &shape_meta
   obs:
     image:
@@ -110,9 +140,12 @@ shape_meta: &shape_meta
 #    gripper:
 #      shape: *image_shape
 #      type: rgb
-#    joint_state:
-#      shape: [6]
-#      type: low_dim
+    joint_state:
+      shape: [6]
+      type: low_dim
+    task_id:
+      shape: [10]  # Fixed official LIBERO-10 identities, independent of task subsets.
+      type: low_dim
 #    force:
 #      shape: [6]
 #      type: low_dim
@@ -124,39 +157,105 @@ task:
     _target_: diffusion_policy.dataset.libero_dataset.LiberoFTDataset
     shape_meta: ${shape_meta}
     horizon: ${horizon}
-    max_train_episodes: 90
+    max_train_episodes: null  # Use all demonstrations remaining after validation split.
     pad_before: 0
     pad_after: 7
-    seed: 42
+    seed: ${training.seed}
+    split_mode: legacy  # Stage A/B scripts opt into episode-disjoint two_by_two.
+    split_stage: a
     val_ratio: 0.02
     transform_color_jitter: true
-    dataset_root: "/home/geyuan/code/LIBERO-FT/libero/datasets/"
-    dataset_subname: "libero_force_384/libero_10"
+    transform_resize_crop: true
+    random_shift_pad: 4
+    wrist_dropout_prob: 0.3
+    dataset_root: ${libero_root}/libero/datasets
+    dataset_subname: "libero_force_256/libero_10"
     hdf5_fns:
-      - KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo_wrench.hdf5
-      - KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo_wrench.hdf5
-      - KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it_demo_wrench.hdf5
-      - KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_demo_wrench.hdf5
-      - LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket_demo_wrench.hdf5
+#      - KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo_wrench.hdf5
+#      - KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo_wrench.hdf5
+#      - KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it_demo_wrench.hdf5
+      - STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_demo_wrench.hdf5
+#      - LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket_demo_wrench.hdf5
+#      - LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket_demo_wrench.hdf5
+#      - LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate_demo_wrench.hdf5
+#      - LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate_demo_wrench.hdf5
+#      - LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket_demo_wrench.hdf5
+#      - KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_demo_wrench.hdf5
     zero_force: false
+
+  env_runner:
+    # HTTP/subprocess helper only; simulator episodes run in LIBERO-FT.
+    _target_: diffusion_policy.env_runner.libero_socket_runner.LiberoSocketRunner
+    _recursive_: false
+    libero_root: ${libero_root}
+    dataset_root: ${task.dataset.dataset_root}
+    dataset_subname: ${task.dataset.dataset_subname}
+    hdf5_fns: ${task.dataset.hdf5_fns}
+    shape_meta: ${shape_meta}
+    policy_config: ${policy}
+    n_obs_steps: ${n_obs_steps}
+    n_action_steps: ${n_action_steps}
+    conda_env: libero
+    conda_executable: null
+    host: 127.0.0.1
+    port: 0  # OS-assigned HTTP port, independent of Accelerate's rendezvous port.
+    log_patch_counts: false
+    save_foveation_video: true
+    n_test_vis: 2
+    fps: 20
+    crf: 22
+    foveation_vis_batch_size: 16
+    vis_rot_image: ${vis_rot_image}
+    n_test: 50  # Episodes per task; four tasks give 200 episodes per rollout.
+    n_envs: 16
+    auto_render_device: true  # Match EGL to the policy's physical GPU unless explicitly overridden.
+    egl_device_id: null  # EGL enumeration index, not a CUDA logical device ID.
+    render_gpu_device_id: null  # Override HDF5/robosuite only when explicitly configured.
+    # Optional manual override: supply BOTH mappings in local-rank order for DDP.
+    # Leave all four device fields null for automatic matching (Linux/NVIDIA, non-MIG).
+    egl_device_ids: null
+    render_gpu_device_ids: null
+    max_steps: 400
+    seed: ${training.seed}
+    test_start_seed: 130000
+    image_format: PNG
+    startup_timeout: 60
+    request_timeout: 120
+    eval_timeout: 7200
+    shutdown_timeout: 30
 
 training:
   seed: 42
   device: cuda:0
-  num_epochs: 3000
+  num_epochs: 901  # ori:3000
   gradient_accumulate_every: 1
   lr_scheduler: cosine
   lr_warmup_steps: 1000
   resume: false
   use_ema: true
-  val_every: 10
-  checkpoint_every: 10
-  sample_every: 10
+  router_only: false
+  downstream_finetune_start_epoch: null
+  target_num_patches_start: null
+  target_num_patches_decay_epochs: 400
+  budget_lambda_init: 0.0
+  budget_lambda_lr: 0.01
+  rollout_every: 100
+  distributed_rollout: true  # Rendering automatically follows each rank's policy GPU.
+  ddp_timeout_seconds: 10800
+  val_every: 9
+  checkpoint_every: 100
+  sample_every: 9
+  sample_resample: true  # Resample task diagnostic windows/augmentation; keep model diagnostic seeds fixed.
+  sample_resolution_advantage: true  # Share task batches with topology diagnostics.
+  topology_samples_per_task: 64  # Per task, independent of the training batch size.
   max_train_steps: null
   max_val_steps: null
   router_temperature_start: 1.0
-  router_temperature_end: 0.2
+  router_temperature_end: 1.0
   router_temperature_steps: 100000
-  router_temperature_schedule: cosine
+  router_temperature_schedule: constant
 
 pretrained_ckpt: null
+pretrained_ckpt_mode: null  # null: exact file; best/latest: select from a run directory or a checkpoint's run.
+reuse_pretrained_dataset_config: false  # Replace task.dataset from the pretrained run's .hydra/config.yaml.
+data_seed_from_ckpt: false  # Stage B inherits the saved split seed independently of training.seed.

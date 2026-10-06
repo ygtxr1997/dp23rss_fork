@@ -10,11 +10,13 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import copy
+import json
+import inspect
 import math
 import os
 import pathlib
 import random
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from typing import Dict, Optional
 
@@ -33,7 +35,9 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
+from diffusion_policy.common.checkpoint_selection import select_pretrained_checkpoint
 from diffusion_policy.common.json_logger import JsonLogger
+from diffusion_policy.common.libero_task_util import LIBERO_TASK_NAMES
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
@@ -50,14 +54,46 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
     """Train and validate a foveation diffusion policy."""
 
     include_keys = (
-        "global_step", "epoch", "next_epoch", "downstream_finetune_started", "budget_lambda"
+        "global_step", "epoch", "next_epoch", "downstream_finetune_started", "budget_lambda",
+        "dataset_metadata"
     )
     _GLOBAL_MARKER = "foveation_net.global_encoder."
     _ROUTING_PREFIXES = ("foveation_net.", "router_condition_projection.")
 
+    @classmethod
+    def prepare_config(cls, cfg: OmegaConf):
+        """Select pretrained weights and inherit data before resolving configuration."""
+        mode = cfg.get("pretrained_ckpt_mode")
+        reuse_dataset = cfg.get("reuse_pretrained_dataset_config", False)
+        pretrained_ckpt = cfg.get("pretrained_ckpt")
+        if not pretrained_ckpt:
+            if mode is not None or reuse_dataset:
+                raise ValueError(
+                    "pretrained_ckpt_mode and reuse_pretrained_dataset_config require pretrained_ckpt"
+                )
+            return cfg
+
+        # Hydra may change cwd; source paths remain relative to the launch directory.
+        source = hydra.utils.to_absolute_path(str(pathlib.Path(pretrained_ckpt).expanduser()))
+        checkpoint_path = select_pretrained_checkpoint(source, mode)
+        cfg.pretrained_ckpt = str(checkpoint_path)
+        if reuse_dataset:
+            source_path = checkpoint_path.parent.parent / ".hydra" / "config.yaml"
+            source_cfg = OmegaConf.load(source_path)
+            source_dataset = OmegaConf.select(source_cfg, "task.dataset")
+            if source_dataset is None:
+                raise ValueError(f"{source_path} lacks task.dataset")
+            # Resolve in the source context, then replace before evaluation interpolations resolve.
+            cfg.task.dataset = OmegaConf.create(
+                OmegaConf.to_container(source_dataset, resolve=True)
+            )
+            print(f"[Dataset config] Inherited task.dataset from {source_path}")
+        return cfg
+
     def __init__(self, cfg: OmegaConf, output_dir: Optional[str] = None):
         super().__init__(cfg, output_dir=output_dir)
-        process_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
+        ddp_timeout = int(self._cfg_get(cfg, "training.ddp_timeout_seconds", 7200))
+        process_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=ddp_timeout))
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(
             kwargs_handlers=[process_kwargs, ddp_kwargs],
@@ -71,6 +107,12 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         self.vis_rot_image = bool(self._cfg_get(cfg, "vis_rot_image", False))
 
         self.model: FoveationDPTransformerPolicy = hydra.utils.instantiate(cfg.policy)
+        if self.model.temporal_adaptive and (
+            not bool(self._cfg_get(cfg, "training.router_only", False))
+            or not self.model.obs_as_cond
+        ):
+            raise ValueError("Temporal routing requires paired router-only Stage B with obs_as_cond=true.")
+        self.dataset_metadata = None
         pretrained_ckpt = self._cfg_get(cfg, "pretrained_ckpt", None)
         if pretrained_ckpt:
             self._load_pretrained_weights(pretrained_ckpt)
@@ -210,6 +252,11 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
     def _load_pretrained_weights(self, pretrained_ckpt: str) -> None:
         """Load EMA weights, completing the shared encoder from the live state."""
         payload = torch.load(pretrained_ckpt, map_location="cpu", pickle_module=dill)
+        if (str(self.cfg.task.dataset._target_).endswith((".LiberoFTDataset", ".TCLFoveationDataset"))
+                and self._cfg_get(self.cfg, "training.router_only", False)):
+            self._check_pretrained_config(payload["cfg"])
+        if "dataset_metadata" in payload["pickles"]:
+            self.dataset_metadata = dill.loads(payload["pickles"]["dataset_metadata"])
         state = payload["state_dicts"]["ema_model"].copy()
         live_state = payload["state_dicts"]["model"]
         # Stage A stores its shared, frozen encoder only in the live model.
@@ -220,6 +267,81 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         self.model.load_state_dict(state, strict=True)
         if self.accelerator.is_main_process:
             print(f"[FoveationWorkspace] Loaded pretrained EMA weights: {pretrained_ckpt}")
+
+    def _check_pretrained_config(self, stage_a):
+        # Constructor defaults make omitted legacy options comparable without
+        # constructing a second network or downloading pretrained encoders.
+        stage_b = self.cfg
+        differences = []
+
+        def canonical(value):
+            if OmegaConf.is_config(value):
+                value = OmegaConf.to_container(value, resolve=True)
+            if isinstance(value, (list, tuple)):
+                return [canonical(item) for item in value]
+            if isinstance(value, dict):
+                return {key: canonical(item) for key, item in value.items()}
+            return value
+
+        def compare(path, default=None):
+            a = canonical(self._cfg_get(stage_a, path, default))
+            b = canonical(self._cfg_get(stage_b, path, default))
+            if a != b:
+                differences.append(f"  {path}: A={a!r}, B={b!r}")
+
+        allowed = {
+            "router_loss_type", "paired_loss_weight", "paired_node_sampling",
+            "temporal_adaptive", "temporal_loss_weight", "router_temperature",
+            "freeze_global_encoder", "freeze_router", "en_freeze_obs_encoder",
+            "fix_split_mode", "random_topology_prob", "torch_home",
+            "target_num_patches", "budget_loss_weight", "budget_probability_type",
+            "budget_loss_type", "budget_base_cost_weight", "budget_elu_tau",
+            # Stage A weights replace initialization when loaded with strict=True.
+            "visual_encoder_init",
+        }
+        for path in ("policy", "policy.foveation_net", "policy.noise_scheduler"):
+            compare(path + "._target_")
+            config_a = self._cfg_get(stage_a, path, {})
+            config_b = self._cfg_get(stage_b, path, {})
+            component = hydra.utils.get_class(config_b["_target_"])
+            params = inspect.signature(component.__init__).parameters
+            keys = set(config_a) | set(config_b) | set(params)
+            for key in sorted(keys - allowed - {"self", "args", "kwargs", "foveation_net", "noise_scheduler"}):
+                if key.startswith("_"):
+                    continue
+                param = params.get(key)
+                default = None if param is None or param.default is inspect.Parameter.empty else param.default
+                # None means all scheduler training timesteps in the policy API.
+                if key == "num_inference_steps":
+                    a = self._cfg_get(stage_a, path + "." + key,
+                                      self._cfg_get(stage_a, "policy.noise_scheduler.num_train_timesteps", 1000))
+                    b = self._cfg_get(stage_b, path + "." + key,
+                                      self._cfg_get(stage_b, "policy.noise_scheduler.num_train_timesteps", 1000))
+                    if a != b:
+                        differences.append(f"  {path}.{key}: A={a!r}, B={b!r}")
+                else:
+                    compare(path + "." + key, default)
+        for key, default in {
+            "_target_": None, "dataset_subname": None, "hdf5_fns": None,
+            "shape_meta": None, "horizon": None, "pad_before": 0, "pad_after": 0,
+            "zero_force": False, "norm_force_type": "quantile",
+            "load_future_obs": False, "max_len": None,
+        }.items():
+            compare("task.dataset." + key, default)
+        if str(stage_b.task.dataset._target_).endswith(".TCLFoveationDataset"):
+            # Dataset metadata validates canonical paths and ordered observation keys.
+            for key, default in {"use_h5": False, "default_success_label": None}.items():
+                compare("task.dataset." + key, default)
+        if differences:
+            raise ValueError("Stage A/B configuration mismatch:\n" + "\n".join(differences)
+                             + "\nStage B requires matching Stage A architecture, observations and diffusion settings.")
+        mode = self._cfg_get(stage_a, "policy.foveation_net.fix_split_mode", None)
+        if self.accelerator.is_main_process:
+            print(f"[Stage B] Stage A fix_split_mode={mode!r}")
+            if isinstance(canonical(mode), list):
+                print("[Stage B] Stage A used weighted level/random sampling.")
+            elif mode is not None and not str(mode).startswith("random:"):
+                print("[Stage B] Fixed-tree checkpoint: no joint multi-resolution training.")
 
     @staticmethod
     def _cfg_get(cfg, path: str, default=None):
@@ -335,7 +457,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         super()._load_state_dict_into(key, obj, state, **kwargs)
 
     def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
-        if "optimizer" in payload["state_dicts"] and "optimizer" not in (exclude_keys or ()):
+        restore_optimizer = "optimizer" in payload["state_dicts"] and "optimizer" not in (exclude_keys or ())
+        if restore_optimizer:
             old_start = self._cfg_get(payload["cfg"], "training.downstream_finetune_start_epoch", None)
             if (old_start is None) != (self.downstream_finetune_start_epoch is None):
                 raise ValueError(
@@ -356,8 +479,23 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             if self.ema_model is not None:
                 self.ema_model.set_stage_b_phase(self.downstream_finetune_started)
                 self.ema_model.eval()
+            if restore_optimizer and self.downstream_finetune_started:
+                self._clear_router_optimizer_state()
         self._rebind_shared_encoder()
         self._assert_encoder_state()
+
+    def _clear_router_optimizer_state(self) -> None:
+        """Discard inactive routing moments after the permanent downstream switch."""
+        live = self._unwrap(self.model)
+        optimizer = getattr(self.optimizer, "optimizer", self.optimizer)
+        # Keep parameter groups intact for DDP, the scheduler and checkpoint loading.
+        for name in ("foveation_net", "router_condition_projection"):
+            module = getattr(live, name, None)
+            if module is None:
+                continue
+            for param in module.parameters():
+                optimizer.state.pop(param, None)
+                param.grad = None
 
     @torch.no_grad()
     def _set_stage_b_phase(self, ema, base_ema_exclude_prefixes) -> None:
@@ -383,6 +521,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                         torch.distributed.broadcast(value_X, src=0)
                 getattr(live, name).load_state_dict(state)
             self.downstream_finetune_started = True
+            self._clear_router_optimizer_state()
             if self.accelerator.is_main_process:
                 source = "EMA" if self.ema_model is not None else "live"
                 print(
@@ -660,6 +799,62 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             return 0.0
         return float((distance_sum_scalar / num_distances).item())
 
+    def _task_sample_diagnostics(self, policy, dataset) -> Dict[str, float]:
+        device = self.accelerator.device
+        samples_per_task = int(self._cfg_get(self.cfg, "training.topology_samples_per_task", 64))
+        diagnostic_seed = int(self._cfg_get(self.cfg, "training.seed", 0))
+        sample_resample = bool(self._cfg_get(self.cfg, "training.sample_resample", False))
+        # Change input windows/augmentation while keeping model diagnostic randomness fixed.
+        sampling_seed = diagnostic_seed + self.epoch if sample_resample else diagnostic_seed
+        is_libero = str(self.cfg.task.dataset._target_).endswith(".LiberoFTDataset")
+        resolution_enabled = bool(self._cfg_get(self.cfg, "training.sample_resolution_advantage", False))
+        metrics = {}
+        task_distances = []
+        task_losses = []
+        rng_devices = [device] if device.type == "cuda" else []
+        for task_id, batch in dataset.iter_task_diagnostic_batches(samples_per_task, sampling_seed):
+            batch_size = batch["task_id"].shape[0]
+            if batch_size == 0 or (batch_size < 2 and not resolution_enabled):
+                continue
+            batch = self._move_to_device(batch, device)
+            # Diagnostic sampling must not advance the training or diffusion RNG.
+            with torch.random.fork_rng(devices=rng_devices), torch.no_grad():
+                torch.random.default_generator.manual_seed(diagnostic_seed + task_id)
+                if device.type == "cuda":
+                    with torch.cuda.device(device):
+                        torch.cuda.manual_seed(diagnostic_seed + task_id)
+                if resolution_enabled:
+                    diagnostics = policy.compute_resolution_diagnostics(batch, seed=diagnostic_seed + task_id)
+                    outputs = diagnostics["foveation_outputs"]
+                    task_losses.append(diagnostics["loss_B_L"].mean(dim=0))
+                    del diagnostics
+                else:
+                    obs = {
+                        key: value_B_T_D[:, :policy.n_obs_steps]
+                        for key, value_B_T_D in batch["obs"].items()
+                    }
+                    outputs = policy.get_foveation_outputs(obs)
+                    del obs
+                if outputs and batch_size >= 2:
+                    distance = self._topology_diversity(outputs, policy.foveation_net.num_bank_patches)
+                    task_distances.append(distance)
+                    if is_libero and 0 <= task_id < len(LIBERO_TASK_NAMES):
+                        metrics[f"sample/topology_div_{LIBERO_TASK_NAMES[task_id]}"] = distance
+            del outputs, batch
+        if task_distances:
+            metrics["sample/topology_div"] = float(np.mean(task_distances))
+        else:
+            print("[topology_div] No task has at least two diagnostic windows; skipping metric")
+        if task_losses:
+            # Equal task weights, regardless of how many windows each task provides.
+            loss_L = torch.stack(task_losses).mean(dim=0)
+            advantage_L = loss_L[:-1] - loss_L[1:]
+            metrics.update({
+                f"sample/resolution_advantage_{level}_to_{level + 1}": advantage
+                for level, advantage in enumerate(advantage_L.tolist())
+            })
+        return metrics
+
     @staticmethod
     def _make_foveation_vis_log(
         policy,
@@ -716,6 +911,107 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         log_path = os.path.join(self.output_dir, "logs.json.txt")
         return wandb_run, JsonLogger(log_path)
 
+    def _uses_distributed_rollout(self):
+        return (
+            bool(self._cfg_get(self.cfg, "training.distributed_rollout", False))
+            and str(self._cfg_get(self.cfg, "task.env_runner._target_", "")).endswith(".LiberoSocketRunner")
+        )
+
+    @contextmanager
+    def _rollout_sync_group(self, enabled):
+        # Long evaluator queues wait on CPU/Gloo, never an outstanding NCCL call.
+        if not enabled or self.accelerator.num_processes == 1:
+            yield None
+            return
+        if not torch.distributed.is_gloo_available():
+            raise RuntimeError("Distributed rollout requires a PyTorch build with Gloo support")
+        timeout = int(self._cfg_get(self.cfg, "training.ddp_timeout_seconds", 7200))
+        if self._cfg_get(self.cfg, "task.env_runner.eval_timeout", None) is not None:
+            runner_cfg = self.cfg.task.env_runner
+            workers = self.accelerator.num_processes if self._uses_distributed_rollout() else 1
+            queue_size = math.ceil(len(runner_cfg.hdf5_fns) / workers)
+            timeout += queue_size * (
+                runner_cfg.startup_timeout + runner_cfg.eval_timeout + 3 * runner_cfg.shutdown_timeout)
+        group = torch.distributed.new_group(backend="gloo", timeout=timedelta(seconds=timeout))
+        try:
+            if self.accelerator.is_main_process:
+                print(f"[Rollout] CPU/Gloo synchronization timeout={timeout}s")
+            yield group
+        finally:
+            torch.distributed.destroy_process_group(group)
+
+    def _gather_rollout_objects(self, value, group):
+        if self.accelerator.num_processes == 1:
+            return [value]
+        gathered = [None] * self.accelerator.num_processes
+        torch.distributed.all_gather_object(gathered, value, group=group)
+        return gathered
+
+    def _distributed_libero_rollout(self, env_runner, runner_cfg, group):
+        accelerator = self.accelerator
+        rank, world_size = accelerator.process_index, accelerator.num_processes
+        local_error = None
+        try:
+            if rank != accelerator.local_process_index:
+                raise ValueError("Distributed LIBERO rollout currently supports single-node DDP only")
+            if self.ema_model is None:
+                raise ValueError("Distributed LIBERO rollout requires training.use_ema=true")
+            if env_runner is None:
+                env_runner = hydra.utils.instantiate(runner_cfg, output_dir=self.output_dir)
+            env_runner.configure_distributed(rank, accelerator.local_process_index, world_size)
+            env_runner.set_context(self.dataset_metadata, self.epoch, self.global_step)
+            if accelerator.is_main_process:
+                env_runner.prepare_run()
+        except BaseException as error:
+            local_error = f"rank {rank}: {type(error).__name__}: {error}"
+        readiness = self._gather_rollout_objects(
+            dict(error=local_error, output_dir=os.path.realpath(self.output_dir)), group)
+        errors = [item["error"] for item in readiness if item["error"] is not None]
+        if errors:
+            raise RuntimeError("LIBERO rollout setup failed: " + "; ".join(errors))
+        if len({item["output_dir"] for item in readiness}) != 1:
+            raise ValueError("Distributed LIBERO rollout requires a shared output directory")
+
+        policy = self.ema_model
+        # EMA buffers (e.g. BatchNorm) can differ despite synchronized DDP gradients.
+        # Finish all model collectives before ranks start unequal evaluator queues.
+        if world_size > 1:
+            with torch.no_grad():
+                for value_X in (*policy.parameters(), *policy.buffers()):
+                    if value_X.numel() == 0:
+                        continue
+                    synced_X = value_X.detach().contiguous()
+                    torch.distributed.broadcast(
+                        synced_X, src=0, group=None if synced_X.is_cuda else group)
+                    value_X.copy_(synced_X)
+            if policy.device.type == "cuda":
+                torch.cuda.synchronize(policy.device)
+        task_indices = list(range(rank, len(env_runner.tasks), world_size))
+        print(f"[Rollout] rank={rank}, policy_device={policy.device}, tasks={task_indices}")
+        payloads, local_error = [], None
+        try:
+            payloads = env_runner.run_tasks(policy, task_indices)
+        except BaseException as error:
+            local_error = f"rank {rank}: {type(error).__name__}: {error}"
+        gathered = self._gather_rollout_objects(dict(error=local_error, tasks=payloads), group)
+        errors = [item["error"] for item in gathered if item["error"] is not None]
+        if errors:
+            raise RuntimeError("LIBERO rollout failed: " + "; ".join(errors))
+
+        log, status = {}, [None]
+        if accelerator.is_main_process:
+            try:
+                log = env_runner.summarize_results([
+                    task for item in gathered for task in item["tasks"]])
+            except BaseException as error:
+                status[0] = f"{type(error).__name__}: {error}"
+        # No rank enters validation/training while rank zero assembles media/summary.
+        if world_size > 1:
+            torch.distributed.broadcast_object_list(status, src=0, group=group)
+        if status[0] is not None:
+            raise RuntimeError("LIBERO rollout aggregation failed: " + status[0])
+        return env_runner, log
+
     def _validation(self, policy, val_dataloader, max_steps: Optional[int]):
         sums: Dict[str, torch.Tensor] = {}
         count = torch.tensor(0.0, device=self.accelerator.device)
@@ -753,9 +1049,80 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         device = accelerator.device
         resume_payload = None
 
-        dataset: BaseImageDataset = hydra.utils.instantiate(cfg.task.dataset)
+        if bool(self._cfg_get(cfg, "training.resume", False)):
+            path = self.get_checkpoint_path()
+            if path.is_file():
+                # The scheduler is created below after the loader length is known.
+                resume_payload = self.load_checkpoint(
+                    path=path,
+                    exclude_keys=("lr_scheduler",),
+                )
+
+        dataset_kwargs = {}
+        if str(cfg.task.dataset._target_).endswith((".LiberoFTDataset", ".TCLFoveationDataset")):
+            if (resume_payload is not None or self._cfg_get(cfg, "pretrained_ckpt", None)) and self.dataset_metadata is None:
+                raise ValueError("Checkpoint lacks dataset_metadata; cannot recover splits and statistics")
+            if (str(cfg.task.dataset._target_).endswith(".LiberoFTDataset")
+                    and self._cfg_get(cfg, "task.dataset.split_mode", "legacy") == "two_by_two"
+                    and self._cfg_get(cfg, "task.dataset.split_stage", "a") == "b"
+                    and resume_payload is None):
+                metadata = copy.deepcopy(self.dataset_metadata)
+                if (metadata is None or metadata.get("split_mode") != "two_by_two"
+                        or metadata.get("split_stage") != "a"):
+                    raise ValueError("New two_by_two Stage B requires a two_by_two Stage A checkpoint")
+                # Switch only episode membership; the frozen policy keeps Stage A scaling.
+                metadata["split_stage"] = "b"
+                metadata["train"] = metadata["partitions"]["b_train"]
+                metadata["val"] = metadata["partitions"]["a_val"]
+                self.dataset_metadata = metadata
+            data_seed_from_ckpt = bool(self._cfg_get(cfg, "data_seed_from_ckpt", False))
+            if data_seed_from_ckpt:
+                if self.dataset_metadata is None or "seed" not in self.dataset_metadata:
+                    raise ValueError("data_seed_from_ckpt requires a checkpoint with dataset_metadata.seed")
+                # Resume metadata takes precedence over the Stage A initialization checkpoint.
+                # Persist the effective data seed without changing training randomness.
+                restored_keys = ["seed"]
+                if str(cfg.task.dataset._target_).endswith(".TCLFoveationDataset"):
+                    restored_keys += ["val_ratio", "max_train_episodes"]
+                for key in restored_keys:
+                    cfg.task.dataset[key] = self.dataset_metadata[key]
+                    self.cfg.task.dataset[key] = cfg.task.dataset[key]
+            if accelerator.is_main_process:
+                seed_source = ("resume checkpoint" if resume_payload is not None else "pretrained checkpoint")
+                if not data_seed_from_ckpt:
+                    seed_source = "config"
+                print(f"[Dataset] training.seed={cfg.training.seed}, "
+                      f"dataset.seed={cfg.task.dataset.seed}, data seed source={seed_source}")
+            dataset_kwargs["dataset_metadata"] = self.dataset_metadata
+        if accelerator.is_main_process and (
+            self._cfg_get(cfg, "reuse_pretrained_dataset_config", False)
+            or self._cfg_get(cfg, "pretrained_ckpt_mode", None) is not None
+            or self._cfg_get(cfg, "data_seed_from_ckpt", False)
+        ):
+            # Hydra saved before preparation; persist the selected file, dataset and effective seed.
+            config_path = pathlib.Path(self.output_dir) / ".hydra" / "config.yaml"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            OmegaConf.save(self.cfg, config_path, resolve=True)
+        dataset: BaseImageDataset = hydra.utils.instantiate(cfg.task.dataset, **dataset_kwargs)
+        if hasattr(dataset, "get_dataset_metadata"):
+            self.dataset_metadata = dataset.get_dataset_metadata()
+            if self.dataset_metadata["contract"]["n_obs_steps"] != self.model.n_obs_steps:
+                raise ValueError("Dataset pad_before+1 must match policy.n_obs_steps")
+            if accelerator.is_main_process:
+                metadata_path = pathlib.Path(self.output_dir) / "dataset_metadata.json"
+                metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                metadata_path.write_text(json.dumps(self.dataset_metadata, indent=2))
         if not isinstance(dataset, BaseImageDataset):
             raise TypeError("The foveation workspace requires a BaseImageDataset.")
+        if self.model.temporal_adaptive:
+            from diffusion_policy.dataset.libero_dataset import LiberoFTDataset
+            from diffusion_policy.dataset.pusht_image_dataset import PushTImageDataset, MergedPushTImageDataset
+
+            is_tcl = str(cfg.task.dataset._target_).endswith(".TCLFoveationDataset")
+            if not is_tcl and not isinstance(dataset, (PushTImageDataset, MergedPushTImageDataset, LiberoFTDataset)):
+                raise ValueError("Temporal routing requires a PushT, LIBERO or TCL foveation dataset.")
+            if dataset.n_obs_steps != self.model.n_obs_steps:
+                raise ValueError("Temporal pairing requires dataset and policy n_obs_steps to match.")
         loader_cfg = self._cfg_get(cfg, "dataloader", {})
         val_loader_cfg = self._cfg_get(cfg, "val_dataloader", {})
         if not isinstance(loader_cfg, dict):
@@ -769,14 +1136,13 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             drop_last=False,
             **val_loader_cfg,
         )
-        if bool(self._cfg_get(cfg, "training.resume", False)):
-            path = self.get_checkpoint_path()
-            if path.is_file():
-                # The scheduler is created below after the loader length is known.
-                resume_payload = self.load_checkpoint(
-                    path=path,
-                    exclude_keys=("lr_scheduler",),
-                )
+        if self.model.temporal_adaptive:
+            # Initialize before workers start, including resumes at the phase boundary.
+            downstream = self.downstream_finetune_started or (
+                self.downstream_finetune_start_epoch is not None
+                and self.epoch >= self.downstream_finetune_start_epoch
+            )
+            dataset.set_temporal_pairing(not downstream)
         # A frozen action path must keep the normalization used by its checkpoint.
         if resume_payload is None and not self._cfg_get(cfg, "pretrained_ckpt", None):
             normalizer = dataset.get_normalizer()
@@ -828,12 +1194,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         wandb_run, log_context = self._build_logger()
         env_runner_cfg = self._cfg_get(cfg, "task.env_runner", None)
         env_runner = None
-        if accelerator.is_main_process and env_runner_cfg is not None:
-            # Simulation rollout is a main-process-only side effect.
-            env_runner = hydra.utils.instantiate(
-                env_runner_cfg,
-                output_dir=self.output_dir,
-            )
+        # Instantiate lazily inside the synchronized rollout block so evaluator
+        # configuration/startup failures are reported to every training rank.
         topk_manager = None
         if accelerator.is_main_process and self._cfg_get(cfg, "checkpoint.topk", None) is not None:
             topk_cfg = self._cfg_get(cfg, "checkpoint.topk", {})
@@ -857,9 +1219,12 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             raise ValueError("router_grad_norm_every must be positive, null, or -1.")
         train_sampling_batch = None
 
-        with log_context as json_logger:
+        rollout_enabled = env_runner_cfg is not None and int(self._cfg_get(cfg, "training.rollout_every", -1)) != -1
+        with self._rollout_sync_group(rollout_enabled) as rollout_group, log_context as json_logger:
             for _ in range(self.epoch, num_epochs):
                 self._set_stage_b_phase(ema, base_ema_exclude_prefixes)
+                if self._unwrap(self.model).temporal_adaptive:
+                    dataset.set_temporal_pairing(not self.downstream_finetune_started)
                 target_num_patches = self._set_target_num_patches()
                 self.model.train()
                 if bool(self._cfg_get(cfg, "policy.en_freeze_obs_encoder", False)):
@@ -879,7 +1244,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     )
                 ):
                     if train_sampling_batch is None:
-                        train_sampling_batch = batch
+                        # Rollout/visualization retains only the original single window.
+                        train_sampling_batch = {"obs": batch["obs"], "action": batch["action"]}
                     router_grad_stats = None
                     budget_metrics = {}
                     with accelerator.accumulate(self.model):
@@ -893,7 +1259,10 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                             observation_count_scalar = losses["_budget_observation_count"]
                             budget_stats_2[0] += losses["_budget_expected_sum"]
                             budget_stats_2[1] += observation_count_scalar
-                            # Fixed T/views: weighting by B also weights by observation count.
+                            # Fixed T/views and windows per sample: weighting by the original
+                            # B also weights observations (2B for temporal). The doubled count
+                            # cancels in reference_count/global_count below, including for
+                            # the pair-mean temporal objective. Count only free routing here.
                             # Use the nominal batch size to avoid a large summed loss under AMP.
                             batch_weight = batch["action"].shape[0] / loader_cfg["batch_size"]
                             backward_loss_scalar = raw_loss * batch_weight
@@ -944,6 +1313,29 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     loss_value = float(raw_loss.detach().item())
                     epoch_losses.append(loss_value)
                     train_metrics = self._scalar_losses(losses)
+                    if "temporal_loss" in losses:
+                        # Log this forward's unweighted global pair mean, including invalid
+                        # pairs in the denominator. Reduce scalars for older Accelerate.
+                        pair_count_scalar = losses["temporal_loss"].new_tensor(
+                            batch["action"].shape[0], dtype=torch.float64
+                        )
+                        temporal_sum_scalar = accelerator.reduce(
+                            losses["temporal_loss"].detach().double() * pair_count_scalar,
+                            reduction="sum",
+                        )
+                        global_pair_count_scalar = accelerator.reduce(pair_count_scalar, reduction="sum")
+                        train_metrics["temporal_loss"] = (temporal_sum_scalar / global_pair_count_scalar).item()
+                        # Match rate excludes placeholder windows. Sum counts across ranks
+                        # before dividing, since each rank can have a different valid count.
+                        global_matched_count_scalar = accelerator.reduce(
+                            losses["_temporal_matched_pair_count"].double(), reduction="sum"
+                        )
+                        global_valid_count_scalar = accelerator.reduce(
+                            losses["_temporal_valid_pair_count"].double(), reduction="sum"
+                        )
+                        train_metrics["temporal_match_fraction"] = (
+                            global_matched_count_scalar / global_valid_count_scalar.clamp_min(1.0)
+                        ).item()
                     step_log = {
                         "train/lr": self.lr_scheduler.get_last_lr()[0],
                         "train/downstream_finetune_active": int(self.downstream_finetune_started),
@@ -987,16 +1379,40 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     and self.epoch % rollout_every == 0
                 )
                 if rollout_due:
-                    if accelerator.is_main_process:
-                        policy_rollout = (
-                            self.ema_model
-                            if self.ema_model is not None
-                            else self._unwrap(self.model)
-                        )
-                        policy_rollout.eval()
-                        step_log.update(env_runner.run(policy_rollout))
-                    # Keep other ranks out of validation collectives during rollout.
-                    accelerator.wait_for_everyone()
+                    if device.type == "cuda":
+                        # Drain this rank's training work before entering the CPU wait.
+                        torch.cuda.synchronize(device)
+                    if self._uses_distributed_rollout():
+                        env_runner, rollout_log = self._distributed_libero_rollout(
+                            env_runner, env_runner_cfg, rollout_group)
+                        step_log.update(rollout_log)
+                    else:
+                        rollout_error = None
+                        rollout_status = [None]
+                        if accelerator.is_main_process:
+                            try:
+                                if env_runner is None:
+                                    runner_kwargs = {}
+                                    if str(env_runner_cfg._target_).endswith(".TCLFoveationVideoRunner"):
+                                        runner_kwargs["dataset"] = val_dataset
+                                    env_runner = hydra.utils.instantiate(
+                                        env_runner_cfg, output_dir=self.output_dir, **runner_kwargs)
+                                if hasattr(env_runner, "set_context"):
+                                    if (str(env_runner_cfg._target_).endswith(".LiberoSocketRunner")
+                                            and self.ema_model is None):
+                                        raise ValueError("LIBERO training evaluation requires training.use_ema=true")
+                                    env_runner.set_context(self.dataset_metadata, self.epoch, self.global_step)
+                                policy_rollout = self.ema_model if self.ema_model is not None else self._unwrap(self.model)
+                                policy_rollout.eval()
+                                step_log.update(env_runner.run(policy_rollout))
+                            except BaseException as error:
+                                rollout_error = error
+                                rollout_status[0] = f"{type(error).__name__}: {error}"
+                        # Gloo keeps this long wait off peer GPUs until rank-0 cleanup finishes.
+                        if accelerator.num_processes > 1:
+                            torch.distributed.broadcast_object_list(rollout_status, src=0, group=rollout_group)
+                        if rollout_status[0] is not None:
+                            raise RuntimeError(f"Rollout failed on rank 0: {rollout_status[0]}") from rollout_error
                 if self.epoch % int(self._cfg_get(cfg, "training.val_every", 1)) == 0:
                     self._set_temperature()
                     policy_val = self.ema_model if self.ema_model is not None else self._unwrap(self.model)
@@ -1017,10 +1433,13 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                         )
                     foveation_outputs = result.get("_foveation_outputs", {})
                     if foveation_outputs and policy_sample.foveation_net is not None:
-                        step_log["sample/topology_div"] = self._topology_diversity(
-                            foveation_outputs,
-                            policy_sample.foveation_net.num_bank_patches,
-                        )
+                        if hasattr(dataset, "iter_task_diagnostic_batches"):
+                            step_log.update(self._task_sample_diagnostics(policy_sample, dataset))
+                        else:
+                            if bool(self._cfg_get(cfg, "training.sample_resolution_advantage", False)):
+                                raise ValueError("Resolution diagnostics require iter_task_diagnostic_batches().")
+                            step_log["sample/topology_div"] = self._topology_diversity(
+                                foveation_outputs, policy_sample.foveation_net.num_bank_patches)
                     if wandb_run is not None:
                         wandb_vis_log = self._make_foveation_vis_log(
                             policy_sample,
@@ -1087,6 +1506,8 @@ TrainDiffusionTransformerFoveationWorkspace = TrainFoveationDPTransformerWorkspa
     config_name=pathlib.Path(__file__).stem,
 )
 def main(cfg):
+    cfg = TrainFoveationDPTransformerWorkspace.prepare_config(cfg)
+    OmegaConf.resolve(cfg)
     TrainFoveationDPTransformerWorkspace(cfg).run()
 
 

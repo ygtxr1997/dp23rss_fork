@@ -23,11 +23,14 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
         'diffusion_policy','config'))
 )
 def main(cfg: OmegaConf):
+    """Resolve the training configuration and run its workspace."""
+    cls = hydra.utils.get_class(cfg._target_)
+    cfg = cls.prepare_config(cfg)
+
     # resolve immediately so all the ${now:} resolvers
     # will use the same time.
     OmegaConf.resolve(cfg)
 
-    cls = hydra.utils.get_class(cfg._target_)
     workspace: BaseWorkspace = cls(cfg)
     workspace.run()
 

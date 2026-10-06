@@ -117,6 +117,57 @@ paired_loss = -mean(p_split * detach(Delta_resolution))
 的无需训练部署，本文需要 selector 训练和多尺度下游准备。这是设计取舍，不宣称
 无条件替代即插即用方案。推理时不需要历史 action-attention 作为评分输入。
 
+### 2.6 Token 减少比例与实测加速：原文核对（2026-09-28）
+
+**这些代表工作的实用配置通常减少约 50%–80% 的视觉 token，报告约 1.3–1.8×
+速度；更激进配置可减少约 87.5%–98% 的最终层 token，接近或超过 2×，但性能代价
+依赖模型、任务和训练方式。** 这是下列代表配置的概括，不是整个领域的统计均值，
+更不是相同 token 减少比例能得到相同加速的保证。
+
+| 方法／配置 | Token 数量口径与减少比例 | 实测速度，相对各自 baseline | 计算量与性能代价 | 原文位置 |
+|---|---|---|---|---|
+| DynamicViT，三阶段 `rho=0.7` | 最后阶段保留约 `0.7^3=34.3%`，减少约 **66%**；前面层保留更多 | **1.43–1.54×** 吞吐量 | FLOPs 减少 31%–37%；ImageNet top-1 下降 0.2–0.5 个百分点 | [Table 1 / §4.1](https://arxiv.org/pdf/2106.02034) |
+| EViT，DeiT-S，三阶段 keep rate 0.7，含 token fusion | 按三次保留率估算减少约 **65%**；融合 token 与取整使实际长度不严格等于 `0.7^3` | **1.50×** 吞吐量，2923 → 4385 images/s | MACs 减少 35%；top-1 79.8% → 79.5% | [Table 2](https://arxiv.org/pdf/2202.07800) |
+| EViT，DeiT-S，keep rate 0.5，含 token fusion | 近似减少 **87%**，同样需要计入融合 token | **1.85×** 吞吐量 | MACs 减少 50%；top-1 79.8% → 78.5%，下降 1.3 个百分点 | 同上 |
+| ToMe，DeiT-S，12 层，每层合并 `r=13` | 196 个 patch tokens 最终剩 40，减少 **79.6%**；逐层合并，另有特殊 token | **1.70×** 吞吐量 | GFLOPs 4.61 → 2.71，减少 41.2%；从头训练后 top-1 79.96% → 79.42% | [Table 11(a)](https://arxiv.org/pdf/2210.09461) |
+| ToMe，DeiT-S，`r=16` | 196 → 4 个最终 patch tokens，减少 **98.0%**；不代表所有层只处理 4 个 | **2.00×** 吞吐量 | GFLOPs 4.61 → 2.30；从头训练后 top-1 79.96% → 79.13% | 同上 |
+| VLA-Pruner，保留 50% | 剪枝位置之后视觉 token 减少 **50%** | OpenVLA **1.33×**；OFT **1.46×**；π0 **1.505×** | 三种模型的 LIBERO 平均成功率均略高于各自 baseline | [v5 Table 1 / Table 4](https://arxiv.org/html/2511.16449v5) |
+| VLA-Pruner，保留 25% | 视觉 token 减少 **75%** | OpenVLA **1.63×**；OFT **1.80×**；π0 **1.731×** | FLOPs 减少约 60%–64%；平均成功率分别下降约 1.23、1.60、1.47 个百分点 | 同上 |
+| VLA-Pruner，保留 12.5% | 视觉 token 减少 **87.5%** | OpenVLA **1.83×**；OFT **1.99×**；π0 **1.954×** | 平均成功率分别下降约 **8.15、13.03、10.95 个百分点**，不能称为无损 | 同上 |
+
+VLA-Pruner 的最高 1.99× 不能与“几乎不降性能”不加限定地组合：v5 Table 1 中
+OpenVLA-OFT 在该配置的四套件平均成功率从 95.38% 降至 82.35%。保留 25% 的
+配置更适合作为较小性能损失下的效率参照。表中成功率差是绝对百分点；论文的
+`Acc.(%)` 列使用相对 baseline 的比例，二者不同。
+
+测速条件也不同：DynamicViT 使用 RTX 3090、batch 32；EViT 使用 A100、batch 128；
+ToMe 使用 V100、fp32 和优化后的 batch size。它们测的是分类模型吞吐量，不能直接
+当作机器人 batch=1 的 policy latency。VLA-Pruner 使用 RTX 4090，Table 1 的
+OpenVLA 延迟按 action 计，OpenVLA-OFT 按 action chunk 计；π0 的 Table 4 使用
+10 个 flow-matching steps。这里引用主表 inference latency，未混用附录 CUDA time。
+
+速度倍数与延迟降幅应分开写：
+
+```text
+token_reduction = 1 - N_kept / N_original
+speedup = latency_baseline / latency_method
+latency_reduction = 1 - 1 / speedup
+```
+
+例如 1.5× 表示速度提升 50%，相同工作量的延迟减少 33.3%；2× 表示速度提升
+100%、延迟减少 50%。批量吞吐量提升本身不证明单样本延迟有同样的降幅。
+
+**对当前 16–256 patch 配置的映射：** `target_num_patches` 的比例是区间插值，
+不是 token 保留率。预算 0.25 对应 76 patches，保留 29.69%、减少 **70.31%**；
+预算 0.1 对应 40 patches，保留 15.63%、减少 **84.38%**；83 patches 保留
+32.42%、减少 **67.58%**（对应区间预算约 0.27917）。这些是目标值，论文仍应
+报告实际 leaves 分布。
+
+因此，40 patches 属于较激进预算，但不能仅凭 84.38% 的数量下降主张超过现有
+pruning/merging。本文在下游视觉 token encoder 之前选择表示，层内方法则逐步
+减少长度；相同最终数量意味着不同计算路径。应比较匹配性能下的实际端到端延迟，
+包含 router/global encoder/FPN、padding 与动作预测开销，并保留各层 token 长度信息。
+
 ## 3. 核心卖点、Novelty 与行文
 
 ### 3.1 审稿人最可能的质疑

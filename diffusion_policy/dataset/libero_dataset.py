@@ -1,15 +1,15 @@
 import os
 import copy
-from typing import List, Tuple, Optional, Dict, Any, Union, Callable
-from collections.abc import Sequence
+from omegaconf import OmegaConf
 import numpy as np
 import torch
+from torch.utils.data import default_collate
 from torchvision.transforms import transforms
 import torch.nn.functional as F
 
 from robokit.datasets.libero.libero_force import LiberoH5FrameDataset, MergeDataset
-from robokit.debug_utils.printer import print_batch
 
+from diffusion_policy.common.libero_task_util import LIBERO_TASK_NAMES, libero_task_id
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
 
@@ -89,6 +89,7 @@ class VideoTransformTHWC:
                 scale=(0.8, 1.0),  # 12/16=0.75
                 ratio=(0.95, 1.0)
             ))
+        self.stochastic = resize_crop or color_jitter is not None or bool(random_shift_pad)
         self.random_shift_pad = random_shift_pad
         if random_shift_pad is not None:
             self.random_shift_aug = RandomShiftsAug(pad=random_shift_pad)
@@ -99,352 +100,351 @@ class VideoTransformTHWC:
         tfs.append(transforms.ToTensor())           # -> (C,H,W), float in [0,1]
         self.frame_tf = transforms.Compose(tfs)
 
-    def __call__(self, video_thwc: np.ndarray, consistent: bool = True, seed: int = None) -> torch.Tensor:
-        assert isinstance(video_thwc, np.ndarray), type(video_thwc)
-        assert video_thwc.ndim == 4, f"expected (T,H,W,C), got {video_thwc.shape}"
-        T, H, W, C = video_thwc.shape
-        assert C in (1, 3, 4), f"unexpected channel C={C}"
-
-        # choose a seed per video-call (so each sample differs, but frames inside sample一致)
+    def __call__(self, video_T_H_W_C: np.ndarray, consistent=True, seed=None):
+        """Transform a clip without resetting the caller's global RNG state."""
+        assert video_T_H_W_C.ndim == 4 and video_T_H_W_C.shape[-1] == 3
+        if not self.stochastic:
+            return torch.stack([self.frame_tf(frame_H_W_C) for frame_H_W_C in video_T_H_W_C])
         if seed is None:
-            seed = int(torch.randint(0, 10_000_000, (1,)).item())
-
+            seed = int(torch.randint(0, 10_000_000, ()).item())
         frames = []
-        for t in range(T):
-            frame = video_thwc[t]  # (H,W,C) np
-            if consistent:
-                torch.manual_seed(seed)  # reset so random jitter is identical per frame
-            frames.append(self.frame_tf(frame))
-        aug_result = torch.stack(frames, dim=0)  # (T,C,H,W)
-
-        aug_result = self.random_shift_aug(aug_result)
-        return aug_result
+        # Keep augmentation randomness local; frames share the same transform.
+        with torch.random.fork_rng(devices=[]):
+            for frame_H_W_C in video_T_H_W_C:
+                if consistent:
+                    torch.random.default_generator.manual_seed(seed)
+                frames.append(self.frame_tf(frame_H_W_C))
+            video_T_C_H_W = torch.stack(frames)
+            return self.random_shift_aug(video_T_C_H_W)
 
 
 class LiberoFTDataset(BaseImageDataset):
+    """Episode-disjoint LIBERO replay windows with checkpointed training statistics."""
+
     def __init__(
-            self,
-            # RoboKit Dataset
-            dataset_root: str,
-            dataset_subname: Union[List[str], str],
-            hdf5_fns: List[str],
-            # Data sequence
-            horizon: int,
-            pad_before: int,
-            pad_after: int,
-            # Data format
-            shape_meta: dict,
-            norm_force_type: str = "quantile",
-            # Others
-            seed: int = 42,
-            val_ratio: float = 0.02,
-            max_train_episodes: int = 90,
-            max_len: Optional[int] = None,
-            transform_color_jitter: bool = True,
-            load_future_obs: bool = False,
-            zero_force: bool = False,
+        self, dataset_root, dataset_subname, hdf5_fns, horizon, pad_before,
+        pad_after, shape_meta, norm_force_type="quantile", seed=42,
+        val_ratio=0.02, max_train_episodes=90, max_len=None,
+        transform_color_jitter=True, load_future_obs=False, zero_force=False,
+        transform_resize_crop=True, random_shift_pad=4, wrist_dropout_prob=0.3,
+        dataset_metadata=None, split="train", split_mode="legacy", split_stage="a",
     ):
         super().__init__()
-        # RoboKit Dataset
-        self.dataset_root = dataset_root
-        self.dataset_subname = dataset_subname
-        self.norm_force_type = norm_force_type
-        self.hdf5_fns = hdf5_fns
-        if isinstance(dataset_subname, str):
-            dataset_subnames = [dataset_subname] * len(hdf5_fns)
-        else:
-            assert isinstance(dataset_subname, Sequence) and not isinstance(dataset_subname, (str, bytes)), \
-                f"dataset_subname should be str or sequence of str, but got {type(dataset_subname)}"
-            assert len(dataset_subname) == len(hdf5_fns), \
-                f"len(dataset_subname)={len(dataset_subname)} must equal len(hdf5_fns)={len(hdf5_fns)}"
-            dataset_subnames = list(dataset_subname)
-        self.dataset_subnames = dataset_subnames
-        self.resolved_dataset_roots = []
-        self.resolved_dataset_subnames = []
-        self.hdf5_paths = []
-        self.libero_h5_datasets = []
-        for subname, fn in zip(dataset_subnames, hdf5_fns):
-            current_root = dataset_root
-            current_subname = subname
-            hdf5_path = os.path.join(current_root, current_subname, fn)
-            if not os.path.exists(hdf5_path):
-                current_root = os.path.join(current_root, current_subname)
-                current_subname = "libero_90"
-                hdf5_path = os.path.join(current_root, current_subname, fn)
-            assert os.path.exists(hdf5_path), f"HDF5 file not found: {hdf5_path}"
-            self.resolved_dataset_roots.append(current_root)
-            self.resolved_dataset_subnames.append(current_subname)
-            self.hdf5_paths.append(hdf5_path)
-            self.libero_h5_datasets.append(
-                LiberoH5FrameDataset(
-                    hdf5_path,
-                )
-            )
-        obs_meta = shape_meta["obs"]
-        merge_obs_keys = ["agentview_rgb"]
-        if "gripper" in obs_meta:
-            merge_obs_keys.append("eye_in_hand_rgb")
-        if "joint_state" in obs_meta:
-            merge_obs_keys.append("ee_states")
-        if "force" in obs_meta or "force_torque" in obs_meta:
-            merge_obs_keys.append("wrenches")
-        self.merge_dataset = MergeDataset(
-            self.libero_h5_datasets,
-            n_obs=pad_before + 1,
-            chunk_size=horizon,
-            obs_keys=merge_obs_keys,
-            max_len=max_len,
-            load_future_obs=load_future_obs,
-        )
-        stats_obs_keys = []
-        if "joint_state" in obs_meta:
-            stats_obs_keys.append("ee_states")
-        if "force" in obs_meta or "force_torque" in obs_meta:
-            stats_obs_keys.append("wrenches")
-        self.dataset_stats = self.merge_dataset.compute_statistics(
-            keys={
-                "obs": stats_obs_keys,
-                "state": [],
-                "action": ["actions"],
-            }
-        )
-        '''
-        Libero Dataset Statistics: Dict, keys=['obs.wrenches', 'obs.ee_states', 'action.actions']
-        --obs.wrenches: Dict, keys=['count', 'mean', 'std', 'min', 'max', 'p01', 'p99']
-        ----count: <class 'int'>, value=35169
-        ----mean: List, len=6, elem_type=<class 'float'>
-        ------[0]: <class 'float'>, value=1.8430029145885263
-        ----std: List, len=6, elem_type=<class 'float'>
-        ------[0]: <class 'float'>, value=13.76074675401503
-        ----min: List, len=6, elem_type=<class 'float'>
-        ------[0]: <class 'float'>, value=-129.31649780273438
-        ----max: List, len=6, elem_type=<class 'float'>
-        ------[0]: <class 'float'>, value=358.5761413574219
-        ----p01: List, len=6, elem_type=<class 'float'>
-        ------[0]: <class 'float'>, value=-32.60213851928711
-        ----p99: List, len=6, elem_type=<class 'float'>
-        ------[0]: <class 'float'>, value=49.68210983276367
-        '''
-        for k, stat_dict in self.dataset_stats.items():
-            self.dataset_stats[k] = {sub_k: np.array(sub_v) for sub_k, sub_v in stat_dict.items()}
-
-        # Others
-        self.seed = seed
-        self.val_ratio = val_ratio
-        self.max_train_episodes = max_train_episodes
-        self.max_len = max_len
-        self.zero_force = zero_force
-
-        # Sampling a data sequence
-        self.horizon = horizon
-        self.pad_before = pad_before
-        self.pad_after = pad_after
-
-        # Data format and preprocessing
+        shape_meta = (OmegaConf.to_container(shape_meta, resolve=True)
+                      if OmegaConf.is_config(shape_meta) else copy.deepcopy(shape_meta))
         self.shape_meta = shape_meta
-        self.obs_image_shape = shape_meta["obs"]["image"]["shape"]  # [3, H, W]
-        self.obs_gripper_shape = shape_meta["obs"]["gripper"]["shape"] if "gripper" in shape_meta["obs"] else None
-        self.joint_state_shape = (
-            obs_meta["joint_state"]["shape"] if "joint_state" in obs_meta else None
+        self.use_task_id = "task_id" in shape_meta["obs"]
+        if self.use_task_id:
+            assert shape_meta["obs"]["task_id"] == {"shape": [10], "type": "low_dim"}
+        self.split = split
+        self.norm_force_type = norm_force_type
+        self.zero_force = zero_force
+        self.wrist_dropout_prob = wrist_dropout_prob if split == "train" else 0.0
+        self.horizon, self.pad_before, self.pad_after = horizon, pad_before, pad_after
+        self.n_obs_steps = pad_before + 1
+        # Persistent workers observe phase changes without rebuilding the loader.
+        self._temporal_pairing_scalar = torch.zeros((), dtype=torch.bool).share_memory_()
+        self._temporal_ranges_E_2 = None
+        self._init_kwargs = dict(
+            dataset_root=dataset_root, dataset_subname=dataset_subname,
+            hdf5_fns=list(hdf5_fns), horizon=horizon, pad_before=pad_before,
+            pad_after=pad_after, shape_meta=shape_meta, norm_force_type=norm_force_type,
+            seed=seed, val_ratio=val_ratio, max_train_episodes=max_train_episodes,
+            split_mode=split_mode, split_stage=split_stage,
+            max_len=max_len, load_future_obs=load_future_obs, zero_force=zero_force,
+            transform_color_jitter=transform_color_jitter,
+            transform_resize_crop=transform_resize_crop, random_shift_pad=random_shift_pad,
+            wrist_dropout_prob=wrist_dropout_prob,
         )
-        self.force_torque_shape = (
-            obs_meta["force"]["shape"]
-            if "force" in obs_meta
-            else obs_meta["force_torque"]["shape"]
-            if "force_torque" in obs_meta
-            else None
+        subnames = ([dataset_subname] * len(hdf5_fns)
+                    if isinstance(dataset_subname, str) else list(dataset_subname))
+        assert len(subnames) == len(hdf5_fns)
+        assert split in ("train", "val")
+        assert split_mode in ("legacy", "two_by_two")
+        assert split_stage in ("a", "b")
+        if split_mode == "two_by_two" and max_train_episodes is not None:
+            raise ValueError("two_by_two requires max_train_episodes=null")
+        self.hdf5_paths = []
+        sources = []
+        for subname, filename in zip(subnames, hdf5_fns):
+            if filename.endswith("_failed.hdf5"):
+                raise ValueError(f"Failed replay file is not a training source: {filename}")
+            path = os.path.join(dataset_root, subname, filename)
+            if not os.path.isfile(path):
+                path = os.path.join(dataset_root, subname, "libero_90", filename)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(path)
+            self.hdf5_paths.append(os.path.abspath(path))
+            sources.append(os.path.relpath(path, dataset_root))
+        assert len(set(sources)) == len(sources), "Duplicate HDF5 sources"
+        contract = dict(shape_meta=shape_meta, horizon=horizon, n_obs_steps=pad_before + 1,
+                        norm_force_type=norm_force_type, zero_force=zero_force,
+                        image_scaling="uint8/127.5-1", state_scaling="mean_std",
+                        action_scaling="minmax", constant_epsilon=1e-6)
+        if self.use_task_id:
+            contract["task_id_names"] = list(LIBERO_TASK_NAMES)
+        metadata = (OmegaConf.to_container(dataset_metadata, resolve=True)
+                    if OmegaConf.is_config(dataset_metadata) else copy.deepcopy(dataset_metadata))
+        if metadata is None and split_mode == "two_by_two":
+            if split_stage != "a":
+                raise ValueError("Stage B requires a two_by_two Stage A checkpoint and its statistics")
+            if not 0 < val_ratio < 1:
+                raise ValueError("LIBERO requires 0 < val_ratio < 1")
+            # A local RNG isolates episode selection from model/augmentation randomness.
+            rng = np.random.RandomState(seed)
+            partitions = {name: [] for name in ("a_train", "a_val", "b_train", "b_val")}
+            for source, path in sorted(zip(sources, self.hdf5_paths)):
+                reader = LiberoH5FrameDataset(path)
+                demo_keys = sorted(reader.demo_keys)
+                reader.close()
+                if not demo_keys:
+                    raise ValueError(f"LIBERO task requires at least one episode: {source}")
+                order_N = rng.permutation(len(demo_keys))
+                episodes = [[source, demo_keys[i]] for i in order_N]
+                midpoint = len(episodes) // 2
+                for half, subset in (("a", episodes[:midpoint]), ("b", episodes[midpoint:])):
+                    n_val = (min(len(subset) - 1, max(1, round(len(subset) * val_ratio)))
+                             if len(subset) >= 2 else 0)
+                    partitions[half + "_val"].extend(subset[:n_val])
+                    partitions[half + "_train"].extend(subset[n_val:])
+            metadata = dict(version=2, sources=sources, contract=contract, seed=seed,
+                            val_ratio=val_ratio, split_mode=split_mode, split_stage=split_stage,
+                            partitions=partitions, train=partitions["a_train"], val=partitions["b_val"])
+        elif metadata is None:
+            episodes = []
+            for source, path in zip(sources, self.hdf5_paths):
+                reader = LiberoH5FrameDataset(path)
+                episodes.extend((source, key) for key in reader.demo_keys)
+            episodes.sort()
+            if len(episodes) < 2 or not 0 < val_ratio < 1:
+                raise ValueError("LIBERO train/val requires >=2 episodes and 0 < val_ratio < 1")
+            order_N = np.random.RandomState(seed).permutation(len(episodes))
+            n_val = min(len(episodes) - 1, max(1, round(len(episodes) * val_ratio)))
+            val_episodes = [episodes[i] for i in order_N[:n_val]]
+            train_episodes = [episodes[i] for i in order_N[n_val:]]
+            if max_train_episodes is not None:
+                assert max_train_episodes > 0
+                train_episodes = train_episodes[:max_train_episodes]
+            metadata = dict(version=1, sources=sources, contract=contract, seed=seed,
+                            train=[list(item) for item in train_episodes],
+                            val=[list(item) for item in val_episodes])
+        elif metadata["sources"] != sources or metadata["contract"] != contract:
+            raise ValueError("LIBERO data sources/observation contract differ from checkpoint")
+        if metadata.get("split_mode", "legacy") != split_mode:
+            raise ValueError("LIBERO split mode differs from checkpoint; retrain Stage A for two_by_two")
+        if split_mode == "two_by_two":
+            for key, value in (("seed", seed), ("val_ratio", val_ratio), ("split_stage", split_stage)):
+                if metadata[key] != value:
+                    raise ValueError(f"LIBERO {key} differs from checkpoint: {value!r} != {metadata[key]!r}")
+            partitions = metadata["partitions"]
+            all_episodes = [tuple(item) for subset in partitions.values() for item in subset]
+            assert len(all_episodes) == len(set(all_episodes)), "Overlapping LIBERO partitions"
+            assert metadata["train"] == partitions[split_stage + "_train"]
+            assert metadata["val"] == partitions[("b" if split_stage == "a" else "a") + "_val"]
+            if split_stage == "b" and "statistics" not in metadata:
+                raise ValueError("Stage B must reuse Stage A normalization statistics")
+            counts = {name: len(metadata[name]) for name in ("train", "val")}
+            if not all(counts.values()):
+                raise ValueError(f"Empty LIBERO Stage {split_stage.upper()} dataset: {counts}")
+            for source in sorted(sources):
+                sizes = {name: sum(origin == source for origin, _ in subset)
+                         for name, subset in partitions.items()}
+                print(f"[LiberoFTDataset] {source}: {sizes}")
+        assert not (set(map(tuple, metadata["train"])) & set(map(tuple, metadata["val"])))
+        readers = []
+        reader_task_ids = []
+        for source_index, (source, path) in enumerate(zip(sources, self.hdf5_paths)):
+            demo_keys = [key for origin, key in metadata[split] if origin == source]
+            if demo_keys:
+                readers.append(LiberoH5FrameDataset(path, demo_keys=demo_keys))
+                reader_task_ids.append(libero_task_id(
+                    source, fallback=None if self.use_task_id else 10 + source_index))
+        if not readers:
+            raise ValueError(f"Empty LIBERO {split} split")
+        obs_meta = shape_meta["obs"]
+        obs_keys = ["agentview_rgb"]
+        if "gripper" in obs_meta:
+            obs_keys.append("eye_in_hand_rgb")
+        stats_keys = []
+        if "joint_state" in obs_meta:
+            obs_keys.append("ee_states")
+            stats_keys.append("ee_states")
+        if "force" in obs_meta or "force_torque" in obs_meta:
+            obs_keys.append("wrenches")
+            stats_keys.append("wrenches")
+        self.merge_dataset = MergeDataset(
+            readers, n_obs=pad_before + 1, chunk_size=horizon, obs_keys=obs_keys,
+            state_keys=[], max_len=max_len, load_future_obs=load_future_obs,
         )
-        self.action_shape = shape_meta["action"]["shape"]  # [7,]
-        obs_image_wh_ratio = float(self.obs_image_shape[2]) / float(self.obs_image_shape[1])  # wh 4:3=16:12=12:9
-        obs_h, obs_w = self.obs_image_shape[1:]  # 你原写法: (H,W)
-        transform_list = [
-            transforms.ToPILImage(),  # wh 16:9
-            transforms.Resize(self.obs_image_shape[1:]),
-        ]
-        color_jitter = None
-        if transform_color_jitter:
-            # transforms.RandomResizedCrop(size=self.obs_image_shape[1:], scale=(0.68, 0.82),  # 12/16=0.75
-            #                              ratio=(0.9 * obs_image_wh_ratio, 1.1 * obs_image_wh_ratio)),  # not using this would be better?
-            color_jitter = transforms.ColorJitter(brightness=0.05,
-                                                  contrast=0.05,
-                                                  saturation=0.05,
-                                                  hue=0.05)
-        self.obs_image_transform = VideoTransformTHWC(
-            image_size_hw=(obs_h, obs_w),
-            color_jitter=color_jitter,
-            resize_crop=True,
-            random_shift_pad=4,
-        )
+        self._reader_task_ids_R = np.asarray(reader_task_ids, dtype=np.int64)
+        if "statistics" not in metadata:
+            assert split == "train", "Validation must reuse training statistics"
+            metadata["statistics"] = self.merge_dataset.compute_statistics(
+                keys={"obs": stats_keys, "state": [], "action": ["actions"]})
+        # Statistics open HDF5 handles; workers should lazily open their own handles.
+        for reader in readers:
+            reader.close()
+        self.dataset_metadata = metadata
+        self.dataset_stats = metadata["statistics"]
+        augment = split == "train"
+        color_jitter = (transforms.ColorJitter(0.05, 0.05, 0.05, 0.05)
+                        if augment and transform_color_jitter else None)
+        self.image_transforms = {
+            key: VideoTransformTHWC(
+                image_size_hw=value["shape"][1:], color_jitter=color_jitter,
+                resize_crop=augment and transform_resize_crop,
+                random_shift_pad=random_shift_pad if augment and random_shift_pad else None,
+            ) for key, value in obs_meta.items() if value["type"] == "rgb"
+        }
+        print(f"[LiberoFTDataset] split={split}, episodes={len(metadata[split])}, "
+              f"windows={len(self)}, sources={sources}")
 
-        print(f"[diffusion_policy.libero_dataset.LiberoFTDataset] dataset loaded, len={len(self.merge_dataset)}, "
-              f"hdf5_fns={self.hdf5_fns}, dataset_subnames={self.dataset_subnames}.")
+    def get_dataset_metadata(self):
+        """Return the exact split, preprocessing contract and training statistics."""
+        return copy.deepcopy(self.dataset_metadata)
 
     def get_validation_dataset(self):
+        """Build held-out windows without fitting statistics or applying augmentation."""
         return self.create_val_dataset(self)
 
     @classmethod
-    def create_val_dataset(cls, instance: 'LiberoFTDataset'):
-        val_set = cls(
-            dataset_root=instance.dataset_root,
-            dataset_subname=instance.dataset_subname,
-            hdf5_fns=instance.hdf5_fns,
-            horizon=instance.horizon,
-            pad_before=instance.pad_before,
-            pad_after=instance.pad_after,
-            shape_meta=instance.shape_meta,
-            norm_force_type=instance.norm_force_type,
-            seed=instance.seed,
-            val_ratio=instance.val_ratio,
-            max_train_episodes=instance.max_train_episodes,
-            transform_color_jitter=False,  # no color jitter for val
-            max_len=instance.max_len,
-        )
-        return val_set
+    def create_val_dataset(cls, instance):
+        """Reuse a training dataset's saved split and statistics."""
+        return cls(**instance._init_kwargs, dataset_metadata=instance.dataset_metadata, split="val")
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
+        """Dataset and socket adapter own scaling; the policy normalizer is identity."""
         normalizer = LinearNormalizer()
-        obs_keys = self.shape_meta["obs"].keys()
-        for obs_key in obs_keys:
-            normalizer[obs_key] = EmptyNormalizer.create_identity()
-        # normalizer['image'] = EmptyNormalizer.create_identity()
-        # normalizer['joint_state'] = EmptyNormalizer.create_identity()
-        normalizer['action'] = EmptyNormalizer.create_identity()
+        for key in (*self.shape_meta["obs"], "action"):
+            normalizer[key] = EmptyNormalizer.create_identity()
         return normalizer
 
-    def _consistent_augmentations(self, frame):
-        video_seed = torch.randint(0, 10000, (1,)).item()
-        # Set the random seed for each frame to ensure consistent augmentation
-        torch.manual_seed(video_seed)
-        augmentation = transforms.Compose(
-            [
-                transforms.ColorJitter(
-                    brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
-                ),  # Color jitter
-            ]
-        )
-        return augmentation(frame)
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.merge_dataset)
 
-    def __getitem__(self, idx: int) -> dict:
-        sample_dict = self.merge_dataset[idx]
-        '''
-        MergeDataset[0]: Dict, keys=['demo_key', 't', 'text_instruction', 'history', 'future', 'action']
-        --demo_key: <class 'str'>, len=6, value='demo_0'
-        --t: <class 'int'>, value=0
-        --text_instruction: <class 'str'>, len=77, value='KITCHEN SCENE4 close the bottom drawer of the cabinet and open the top drawer'
-        --history: Dict, keys=['obs', 'state']
-        ----obs: Dict, keys=['agentview_rgb', 'eye_in_hand_rgb', 'ee_states', 'gripper_states', 'wrenches']
-        ------agentview_rgb, <class 'numpy.ndarray'>, shape=(2, 128, 128, 3), min=0.0000, max=255.0000, dtype=uint8
-        ------eye_in_hand_rgb, <class 'numpy.ndarray'>, shape=(2, 128, 128, 3), min=0.0000, max=237.0000, dtype=uint8
-        ------ee_states, <class 'numpy.ndarray'>, shape=(2, 6), min=-0.2018, max=3.1760, dtype=float64
-        ------gripper_states, <class 'numpy.ndarray'>, shape=(2, 2), min=-0.0340, max=0.0341, dtype=float64
-        ------wrenches, <class 'numpy.ndarray'>, shape=(2, 6), min=-3.3128, max=1.0444, dtype=float32
-        --future: Dict, keys=['obs', 'state']
-        ----obs: Dict, keys=['agentview_rgb', 'eye_in_hand_rgb', 'ee_states', 'gripper_states', 'wrenches']
-        ------agentview_rgb, <class 'numpy.ndarray'>, shape=(32, 128, 128, 3), min=0.0000, max=255.0000, dtype=uint8
-        ------eye_in_hand_rgb, <class 'numpy.ndarray'>, shape=(32, 128, 128, 3), min=0.0000, max=238.0000, dtype=uint8
-        ------ee_states, <class 'numpy.ndarray'>, shape=(32, 6), min=-0.2036, max=3.3343, dtype=float64
-        ------gripper_states, <class 'numpy.ndarray'>, shape=(32, 2), min=-0.0395, max=0.0396, dtype=float64
-        ------wrenches, <class 'numpy.ndarray'>, shape=(32, 6), min=-5.2036, max=1.1171, dtype=float32
-        --action, <class 'numpy.ndarray'>, shape=(32, 7), min=-1.0000, max=0.9375, dtype=float64
-        '''
+    def set_temporal_pairing(self, enabled: bool) -> None:
+        """Toggle episode-local pairing; prepare ranges before starting workers."""
+        if enabled and self._temporal_ranges_E_2 is None:
+            ranges = []
+            for offset, reader in zip(self.merge_dataset.prefix, self.merge_dataset.datasets):
+                for start, length in zip(reader.prefix, reader.demo_lengths):
+                    start = offset + start
+                    end = min(start + length, len(self))
+                    if start < end:
+                        ranges.append((start, end))
+            # File-local demo ranges remain distinct; max_len limits both A and B.
+            self._temporal_ranges_E_2 = np.asarray(ranges, dtype=np.int64).reshape(-1, 2)
+        self._temporal_pairing_scalar.fill_(enabled)
 
-        obs_keys = self.shape_meta["obs"].keys()
-        obs_data = {k: [] for k in obs_keys}
+    def __getitem__(self, idx):
+        data = self._get_single_window(idx)
+        if bool(self._temporal_pairing_scalar):
+            episode = int(np.searchsorted(self._temporal_ranges_E_2[:, 1], idx, side="right"))
+            start, end = map(int, self._temporal_ranges_E_2[episode])
+            pair_valid = end - start > 1
+            if pair_valid:
+                # Uniformly skip A without rejection sampling or resetting worker RNG.
+                pair_idx = start + np.random.randint(end - start - 1)
+                pair_idx += pair_idx >= idx
+                pair_data = self._get_single_window(pair_idx)
+            else:
+                # Reuse augmented A as a placeholder, before adding nested pair fields.
+                pair_data = dict(data)
+            data["temporal_pair"] = pair_data
+            data["temporal_pair_valid"] = torch.tensor(pair_valid, dtype=torch.bool)
+        return data
 
-        history_primary_rgb = sample_dict["history"]["obs"]["agentview_rgb"]  # (T,H,W,C)
-        actions = sample_dict["action"]  # (T,D)
+    def _get_single_window(self, idx):
+        data = self._sample_to_data(self.merge_dataset[idx])
+        reader = int(np.searchsorted(self.merge_dataset.prefix, idx, side="right")) - 1
+        task_id = int(self._reader_task_ids_R[reader])
+        data["task_id"] = torch.tensor(task_id, dtype=torch.long)
+        if self.use_task_id:
+            task_T_C = torch.zeros((self.n_obs_steps, 10), dtype=torch.float32)
+            task_T_C[:, task_id] = 1.0
+            data["obs"]["task_id"] = task_T_C
+        return data
 
-        # Preprocess
-        history_primary_rgb = self.obs_image_transform(history_primary_rgb)  # (T,C,H,W)
-        history_primary_rgb = history_primary_rgb * 2. - 1.  # in [-1,1]
+    def iter_task_diagnostic_batches(self, samples_per_task: int, seed: int):
+        """Yield fixed task-local batches without Temporal pairing or RNG side effects."""
+        if samples_per_task < 2:
+            raise ValueError("topology_samples_per_task must be at least 2")
+        # Merge sources sharing an official task identity before sampling.
+        ranges_by_task = {}
+        for start, reader, task_id in zip(
+            self.merge_dataset.prefix, self.merge_dataset.datasets, self._reader_task_ids_R
+        ):
+            end = min(start + len(reader), len(self))
+            if start < end:
+                ranges_by_task.setdefault(int(task_id), []).append((start, end))
+        for task_id, ranges in sorted(ranges_by_task.items()):
+            lengths_R = np.asarray([end - start for start, end in ranges], dtype=np.int64)
+            ends_R = lengths_R.cumsum()
+            rng = np.random.RandomState(seed + task_id)
+            local_indices_B = rng.choice(int(ends_R[-1]), min(samples_per_task, int(ends_R[-1])), replace=False)
+            readers_B = np.searchsorted(ends_R, local_indices_B, side="right")
+            offsets_R = np.asarray([start for start, _ in ranges]) - (ends_R - lengths_R)
+            indices_B = local_indices_B + offsets_R[readers_B]
+            # Restore CPU augmentation RNG before yielding control to the workspace.
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(seed + task_id)
+                batch = default_collate([self._get_single_window(int(idx)) for idx in indices_B])
+            yield task_id, batch
 
-        obs_data["image"] = history_primary_rgb  # (T,C,H,W)
-        if "gripper" in obs_data:
-            history_gripper_rgb = self.obs_image_transform(
-                sample_dict["history"]["obs"]["eye_in_hand_rgb"]
-            )
-            history_gripper_rgb = history_gripper_rgb * 2. - 1.  # in [-1,1]
-            # NOTE: Randomly zero out gripper image with 0.3 probability
-            if torch.rand(1).item() < 0.3:
-                history_gripper_rgb = torch.zeros_like(history_gripper_rgb)
-            obs_data["gripper"] = history_gripper_rgb  # (T,C,H,W)
-        if "joint_state" in obs_data:
-            tcp_pose = self.norm_state_or_force(
-                sample_dict["history"]["obs"]["ee_states"],
-                norm_type="mean",
-                meta_data=self.dataset_stats["obs.ee_states"],
-            )
-            obs_data["joint_state"] = tcp_pose  # (T,D)
-        if "force" in obs_data:
-            force_torque = self.norm_state_or_force(
-                sample_dict["history"]["obs"]["wrenches"],
-                norm_type=self.norm_force_type,
-                meta_data=self.dataset_stats["obs.wrenches"],
-            )
-            obs_data["force"] = force_torque  # (T,D)
-        if "force_torque" in obs_data:
-            force_torque = self.norm_state_or_force(
-                sample_dict["history"]["obs"]["wrenches"],
-                norm_type=self.norm_force_type,
-                meta_data=self.dataset_stats["obs.wrenches"],
-            )
-            obs_data["force_torque"] = force_torque  # (T,D)
-        for k in obs_data.keys():
-            assert obs_data[k] != [], f"obs_data[{k}] is empty!"
-
-        if self.zero_force and "force" in obs_data:
-            obs_data["force"] *= 0.0
-        if self.zero_force and "force_torque" in obs_data:
-            obs_data["force_torque"] *= 0.0
-
-        # act_data = (actions - self.dataset_stats["action.actions"]["min"]) / (
-        #         self.dataset_stats["action.actions"]["max"] - self.dataset_stats["action.actions"]["min"] + 1e-8
-        # )  # in [0,1]
-        mins = self.dataset_stats["action.actions"]["min"]
-        maxs = self.dataset_stats["action.actions"]["max"]
-        rng = maxs - mins
-        eps_range = 1e-6
-        safe_rng = np.where(rng < eps_range, 1.0, rng)
-        act_data = (actions - mins) / safe_rng
-
-        # 常数维设为中值 -> 最终是 0
-        mask_const = (rng < eps_range)
-        act_data[..., mask_const] = 0.5
-        act_data = act_data * 2. - 1.  # in [-1,1]
-
-        item_data = {
-            "obs": obs_data,
-            "action": act_data,
-        }
-        return item_data
+    def _sample_to_data(self, sample):
+        history = sample["history"]["obs"]
+        obs = {}
+        for key, source in (("image", "agentview_rgb"), ("gripper", "eye_in_hand_rgb")):
+            if key in self.shape_meta["obs"]:
+                image_T_C_H_W = self.image_transforms[key](history[source]) * 2.0 - 1.0
+                if key == "gripper" and self.wrist_dropout_prob > 0:
+                    if torch.rand(()).item() < self.wrist_dropout_prob:
+                        image_T_C_H_W = torch.zeros_like(image_T_C_H_W)
+                obs[key] = image_T_C_H_W
+        for key, source in (("joint_state", "ee_states"), ("force", "wrenches"),
+                            ("force_torque", "wrenches")):
+            if key in self.shape_meta["obs"]:
+                obs[key] = self.norm_state_or_force(
+                    history[source], "mean" if key == "joint_state" else self.norm_force_type,
+                    self.dataset_stats[f"obs.{source}"],
+                ).astype(np.float32)
+                if self.zero_force and key in ("force", "force_torque"):
+                    obs[key] *= 0
+        action_T_D = self.normalize_action(sample["action"], self.dataset_stats["action.actions"])
+        return {"obs": obs, "action": action_T_D.astype(np.float32)}
 
     @staticmethod
-    def norm_state_or_force(in_data: np.ndarray, norm_type: str, meta_data: dict):
-        """
-        `robot_obs`: (...,14)
-            tcp pos (3), tcp ori (3), gripper width (1), joint_states (6) in rad, gripper_action (1)
-        `force_torque`: (...,6)
-        """
-        D = in_data.shape[-1]
+    def normalize_action(action_T_D, statistics):
+        """Map raw actions to [-1,1], placing constant dimensions at zero."""
+        min_D = np.asarray(statistics["min"])
+        range_D = np.asarray(statistics["max"]) - min_D
+        constant_D = range_D < 1e-6
+        action_T_D = 2 * (action_T_D - min_D) / np.where(constant_D, 1.0, range_D) - 1
+        return np.where(constant_D, 0.0, action_T_D)
+
+    @staticmethod
+    def unnormalize_action(action_B_K_D, statistics):
+        """Restore raw control actions, including constant training dimensions."""
+        min_D = np.asarray(statistics["min"])
+        range_D = np.asarray(statistics["max"]) - min_D
+        action_B_K_D = (action_B_K_D + 1) * range_D / 2 + min_D
+        return np.where(range_D < 1e-6, min_D, action_B_K_D).astype(np.float32)
+
+    @staticmethod
+    def norm_state_or_force(in_data, norm_type, meta_data):
+        """Scale low-dimensional observations with training-only statistics."""
+        state_T_D = in_data
+        dim = state_T_D.shape[-1]
+        if norm_type == "identity":
+            return state_T_D
+        if norm_type == "mean":
+            mean_D = np.asarray(meta_data["mean"])[:dim]
+            std_D = np.asarray(meta_data["std"])[:dim]
+            return (state_T_D - mean_D) / np.maximum(std_D, 1e-6)
         if norm_type == "minmax":
-            dataset_min = np.array(meta_data['min'])[:D]
-            dataset_max = np.array(meta_data['max'])[:D]
-            out_data = (in_data - dataset_min) / (dataset_max - dataset_min)  # norm here, in [0,1]
-            out_data = out_data * 2. - 1.  # in [-1,1]
-        elif norm_type == "mean":
-            dataset_mean = np.array(meta_data['mean'])[:D]
-            dataset_std = np.array(meta_data['std'])[:D]
-            out_data = (in_data - dataset_mean) / dataset_std
-        elif norm_type == "quantile":
-            dataset_p01 = np.array(meta_data['p01'])[:D]
-            dataset_p99 = np.array(meta_data['p99'])[:D]
-            in_data = np.clip(in_data, dataset_p01, dataset_p99)  # different from minmax
-            out_data = (in_data - dataset_p01) / (dataset_p99 - dataset_p01)  # norm here, in [0,1]
-            out_data = out_data * 2. - 1.  # in [-1,1]
+            low_D, high_D = np.asarray(meta_data["min"])[:dim], np.asarray(meta_data["max"])[:dim]
         else:
-            assert norm_type == "identity"
-            out_data = in_data
-        return out_data
+            assert norm_type == "quantile"
+            low_D, high_D = np.asarray(meta_data["p01"])[:dim], np.asarray(meta_data["p99"])[:dim]
+            state_T_D = np.clip(state_T_D, low_D, high_D)
+        return 2 * (state_T_D - low_D) / np.maximum(high_D - low_D, 1e-6) - 1

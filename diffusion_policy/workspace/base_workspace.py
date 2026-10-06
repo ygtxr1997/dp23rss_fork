@@ -12,6 +12,11 @@ class BaseWorkspace:
     include_keys = tuple()
     exclude_keys = tuple()
 
+    @classmethod
+    def prepare_config(cls, cfg: OmegaConf):
+        """Prepare configuration before resolution and workspace construction."""
+        return cfg
+
     def __init__(self, cfg: OmegaConf, output_dir: Optional[str] = None):
         self.cfg = cfg
         self._output_dir = output_dir

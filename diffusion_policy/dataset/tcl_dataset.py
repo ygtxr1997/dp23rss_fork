@@ -1,11 +1,13 @@
 import os
 import copy
 import bisect
+import json
 import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import List, Optional, Union
-from torch.utils.data import ConcatDataset
+from torch.utils.data import ConcatDataset, default_collate
+from omegaconf import OmegaConf
 from torchvision.transforms import transforms
 
 from robokit.datasets.tcl_datasets import TCLDataset, TCLDatasetHDF5
@@ -46,6 +48,7 @@ class TCLImageDataset(BaseImageDataset):
                  # RoboKit Dataset
                  h5_path: str = None,
                  use_h5: bool = False,
+                 dataset_statistics: Optional[dict] = None,
                  # Not used
                  **kwargs
                  ):
@@ -73,13 +76,15 @@ class TCLImageDataset(BaseImageDataset):
         self.data_meta = self.tcl_dataset.load_meta_from_json(os.path.join(data_root, "statistics.json"))
         self.all_rel_actions = self.tcl_dataset.extracted_data["rel_actions"]
         self.all_force_torques = self.tcl_dataset.dsets["force_torque"]
-        self.dataset_stats = self.data_meta["stats"]  # key: `rel_actions`, `robot_obs`, `force_torque`
+        self.dataset_stats = copy.deepcopy(
+            self.data_meta["stats"] if dataset_statistics is None else dataset_statistics
+        )  # Keep checkpoint scaling when reopening the same dataset.
         self.dataset_total_len = self.data_meta["total_len"]
         self.dataset_action_min = np.array(self.dataset_stats["rel_actions"]["min"])
         self.dataset_action_max = np.array(self.dataset_stats["rel_actions"]["max"])
 
         # Calculate p01 and p99 for force_torque if available
-        if 'force_torque' in self.dataset_stats:
+        if dataset_statistics is None and 'force_torque' in self.dataset_stats:
             # Calculate p01 (1%) and p99 (99%) quantiles along the sample dimension (axis=0)
             p01 = np.quantile(self.all_force_torques, q=0.01, axis=0)
             p99 = np.quantile(self.all_force_torques, q=0.99, axis=0)
@@ -404,6 +409,161 @@ class TCLImageDataset(BaseImageDataset):
             assert norm_type == "identity"
             out_data = in_data
         return out_data
+
+
+class TCLFoveationDataset(TCLImageDataset):
+    """Episode-disjoint TCL windows with checkpointed splits and full video access."""
+
+    def __init__(self, *, dataset_metadata=None, split="train", **kwargs):
+        """Build deterministic episode membership or restore it from a checkpoint."""
+        metadata = (OmegaConf.to_container(dataset_metadata, resolve=True)
+                    if OmegaConf.is_config(dataset_metadata) else copy.deepcopy(dataset_metadata))
+        super().__init__(
+            **kwargs, dataset_statistics=None if metadata is None else metadata["statistics"])
+        self.n_obs_steps = self.pad_before + 1
+        shape_meta = (OmegaConf.to_container(self.shape_meta, resolve=True)
+                      if OmegaConf.is_config(self.shape_meta) else copy.deepcopy(self.shape_meta))
+        sources = dict(data_root=os.path.abspath(os.path.expanduser(self.data_root)),
+                       h5_path=os.path.abspath(os.path.expanduser(self.h5_path)) if self.use_h5 else None)
+        contract = dict(shape_meta=shape_meta, obs_keys=list(shape_meta["obs"]),
+                        horizon=self.horizon, n_obs_steps=self.n_obs_steps,
+                        pad_before=self.pad_before, pad_after=self.pad_after,
+                        norm_force_type=self.norm_force_type, zero_force=self.zero_force,
+                        default_success_label=self.default_success_label)
+        # RoboKit calls each trajectory directory a task; files inside it are frames.
+        episodes = [[name, int(length)] for name, length in zip(self.tasks, self.task_lengths)]
+        assert self.task_lengths and min(self.task_lengths) > 0
+        assert sum(self.task_lengths) == len(self.tcl_dataset) == len(self.all_rel_actions)
+        if metadata is None:
+            if len(episodes) < 2 or not 0 < self.val_ratio < 1:
+                raise ValueError("TCL train/val requires >=2 episodes and 0 < val_ratio < 1")
+            names = sorted(self.tasks)
+            order_E = np.random.RandomState(self.seed).permutation(len(names))
+            n_val = min(len(names) - 1, max(1, round(len(names) * self.val_ratio)))
+            val_names = [names[i] for i in order_E[:n_val]]
+            train_names = [names[i] for i in order_E[n_val:]]
+            if self.max_train_episodes is not None:
+                assert self.max_train_episodes > 0
+                train_names = train_names[:self.max_train_episodes]
+            # Statistics intentionally remain full-dataset CFGRL statistics.
+            statistics = json.loads(json.dumps(
+                self.dataset_stats, default=lambda value: value.tolist()))
+            metadata = dict(version=1, sources=sources, contract=contract, episodes=episodes,
+                            seed=self.seed, val_ratio=self.val_ratio,
+                            max_train_episodes=self.max_train_episodes,
+                            train=sorted(train_names), val=sorted(val_names), statistics=statistics)
+        for key, value in dict(sources=sources, contract=contract, episodes=episodes,
+                               seed=self.seed, val_ratio=self.val_ratio,
+                               max_train_episodes=self.max_train_episodes).items():
+            if metadata[key] != value:
+                raise ValueError(f"TCL {key} differs from checkpoint: {value!r} != {metadata[key]!r}")
+        assert metadata["train"] and metadata["val"]
+        assert not set(metadata["train"]) & set(metadata["val"])
+        self.dataset_metadata = metadata
+        self._temporal_pairing_scalar = torch.zeros((), dtype=torch.bool).share_memory_()
+        self._set_split(split)
+
+    def _set_split(self, split):
+        assert split in ("train", "val")
+        self.split = split
+        self._episode_ids = [self.tasks.index(name) for name in self.dataset_metadata[split]]
+        self._episode_ends_E = np.cumsum([self.task_lengths[i] for i in self._episode_ids])
+        self._episode_starts_E = np.concatenate(([0], self._episode_ends_E[:-1]))
+        if split == "val":
+            self.p_cond_drop = self.p_camera_drop = 0.0
+            self.obs_image_transform = transforms.Compose([
+                transforms.ToPILImage(), transforms.Resize(self.obs_image_shape[1:]),
+                transforms.ToTensor(),
+            ])
+
+    def get_dataset_metadata(self):
+        """Return the reproducible episode split and full-dataset scaling."""
+        return copy.deepcopy(self.dataset_metadata)
+
+    def get_validation_dataset(self):
+        """Share read-only source data, with separate validation sampling state."""
+        val = copy.copy(self)
+        val._temporal_pairing_scalar = torch.zeros((), dtype=torch.bool).share_memory_()
+        val._set_split("val")
+        return val
+
+    def __len__(self):
+        return int(self._episode_ends_E[-1])
+
+    def _local_to_absolute(self, idx):
+        assert 0 <= idx < len(self)
+        episode = int(np.searchsorted(self._episode_ends_E, idx, side="right"))
+        source_id = self._episode_ids[episode]
+        abs_idx = self.task_prefix_lengths[source_id] + idx - int(self._episode_starts_E[episode])
+        return abs_idx, episode
+
+    def _get_abs_obs_indices(self, abs_now_idx):
+        rel_idx, episode = self._abs_idx_to_rel_idx(abs_now_idx)
+        start = self.task_prefix_lengths[episode]
+        return [start + max(0, i) for i in range(rel_idx - self.pad_before, rel_idx + 1)]
+
+    def _get_abs_act_indices(self, abs_now_idx):
+        rel_idx, episode = self._abs_idx_to_rel_idx(abs_now_idx)
+        start, length = self.task_prefix_lengths[episode], self.task_lengths[episode]
+        # Diffusion action index n_obs_steps-1 corresponds to the current frame.
+        return [start + min(length - 1, max(0, i))
+                for i in range(rel_idx - self.pad_before, rel_idx - self.pad_before + self.horizon)]
+
+    def _get_single_window(self, idx):
+        abs_idx, _ = self._local_to_absolute(idx)
+        return dict(obs=self._get_obs_data(abs_idx), action=self._get_act_data(abs_idx),
+                    task_id=torch.tensor(0, dtype=torch.long))
+
+    def __getitem__(self, idx):
+        data = self._get_single_window(idx)
+        if bool(self._temporal_pairing_scalar):
+            _, episode = self._local_to_absolute(idx)
+            start, end = int(self._episode_starts_E[episode]), int(self._episode_ends_E[episode])
+            valid = end - start > 1
+            if valid:
+                pair_idx = start + np.random.randint(end - start - 1)
+                pair_idx += pair_idx >= idx
+                pair = self._get_single_window(pair_idx)
+            else:
+                pair = dict(data)
+            data["temporal_pair"] = pair
+            data["temporal_pair_valid"] = torch.tensor(valid, dtype=torch.bool)
+        return data
+
+    def set_temporal_pairing(self, enabled: bool):
+        """Toggle training-only episode-local pairs, including in persistent workers."""
+        assert not enabled or self.split == "train"
+        self._temporal_pairing_scalar.fill_(enabled)
+
+    def iter_episodes(self):
+        """Yield stable source IDs, names and lengths for the selected split."""
+        for episode_id in self._episode_ids:
+            yield episode_id, self.tasks[episode_id], self.task_lengths[episode_id]
+
+    def get_episode_task_name(self, episode_id):
+        """Return the source file stem (or data directory name) for an episode."""
+        assert episode_id in self._episode_ids
+        # All episodes in this dataset instance share one source HDF5 file.
+        if self.use_h5:
+            return os.path.splitext(os.path.basename(self.h5_path))[0]
+        return os.path.basename(os.path.normpath(self.data_root))
+
+    def get_episode_observation_batch(self, episode_id, frame_indices):
+        """Read deterministic observation windows for validation video frames."""
+        assert self.split == "val" and episode_id in self._episode_ids
+        assert all(0 <= i < self.task_lengths[episode_id] for i in frame_indices)
+        start = self.task_prefix_lengths[episode_id]
+        return default_collate([self._get_obs_data(start + int(i)) for i in frame_indices])
+
+    def iter_task_diagnostic_batches(self, samples_per_task: int, seed: int):
+        """Yield one TCL diagnostic group without advancing augmentation or pairing RNG."""
+        assert samples_per_task >= 2
+        indices_B = np.random.RandomState(seed).choice(
+            len(self), min(samples_per_task, len(self)), replace=False)
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(seed)
+            batch = default_collate([self._get_single_window(int(i)) for i in indices_B])
+        yield 0, batch
 
 
 class TCLMasterSlaveDataset(BaseImageDataset):

@@ -86,11 +86,21 @@ policy:
   causal_attn: true
   time_as_cond: true
   router_condition_key: agent_pos
-  # Paired training requires router_only and evaluates one reachable node per sample.
+  # Zero all low-dimensional action inputs; preserve router conditions and dimensions.
+  mask_policy_state: false
+  # Paired training requires router_only and evaluates one candidate per window.
   router_loss_type: st
   paired_loss_weight: 1.0
+  # Only reachable is supported: stop/split preserves every descendant decision.
+  # single_level was removed; override that field in old checkpoint configs to reachable.
+  paired_node_sampling: reachable
+  # PushT router-only Stage B: two windows, random anchor, matching leaf-count deltas.
+  # Failed matches keep Spatial/budget losses and contribute zero Temporal loss.
+  temporal_adaptive: false
+  temporal_loss_weight: 1.0  # 0 retains both windows and active matching for ablation.
   visual_dim: 256  # ori:256, reducing this will lead to performance drop
   visual_encoder_layers: 4
+  visual_encoder_init: copy  # copy (legacy) or trunc_normal (independent layers)
   visual_encoder_heads: 8  # ori:8
   position_encoding_types: [apt_interpolated, level_embedding]
   pooling_type: cls_token
@@ -121,6 +131,9 @@ policy:
     # random:<ratio>[,<ratio>...] selects a ratio per sample, then resamples one
     # topology shared by its frames; fixed:<ratio> is sampled once and saved.
     # Also supports null, coarsest, and finest.
+    # Uniform leaves: "level:1". Weighted window sampling (also during eval):
+    # ["20%level:0", "25%level:1", "35%level:2", "20%random:0.25,0.5,0.75"]
+    # Weights sum to 100%; views/frames share the mode. Requires random_topology_prob=0.
     fix_split_mode: null
     # Training-only per-frame topology dropout; preserves router patch count.
     random_topology_prob: 0.2
@@ -232,6 +245,9 @@ training:
   rollout_every: 50
   checkpoint_every: ${training.rollout_every}
   sample_every: 5
+  sample_resolution_advantage: true
+  # Topology and resolution share fixed windows; topology keeps these when disabled.
+  topology_samples_per_task: 64
   max_train_steps: null
   max_val_steps: null
   router_temperature_start: 1.0  # ori:1.0

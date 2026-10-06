@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import re
 import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -6,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from omegaconf import ListConfig
 
 from diffusion_policy.model.roi.jepa_helper import JEPAHelper
 from diffusion_policy.model.roi.resnet_helper import ResNetHelper
@@ -368,10 +370,16 @@ class FoveationNet(nn.Module):
     with a coarsest, finest, per-sample random, or persistent random topology.
     Random mode may provide multiple split ratios; each sample independently
     selects one ratio and shares the resulting topology across its frames.
+    ``random:min-max`` samples a continuous ratio per window, shared across
+    views; each view draws its own topology and shares it across its frames.
+    ``level:l`` selects a uniform leaf level. Weighted lists combine level and
+    random modes per window, sharing the selection across views and frames.
     During training, ``random_topology_prob`` can replace each frame's hard tree
     with a random legal tree that preserves its router-selected patch count.
     Router action value ``split_action_value`` determines whether high or low
     logits mean split.
+    ``debug_lowpass_size`` removes fine image detail by down/up-sampling while
+    preserving the input size and patch geometry in both training and evaluation.
     """
 
     RESNET_STAGE_CHANNELS: Dict[str, int] = {
@@ -404,16 +412,20 @@ class FoveationNet(nn.Module):
         target_num_patches: Optional[Union[int, float]] = None,
         budget_loss_weight: float = 0.0,
         budget_probability_type: str = "sampled_relaxed",
-        fix_split_mode: Optional[str] = None,
+        fix_split_mode: Optional[Union[str, List[str], ListConfig]] = None,
         router_type: str = "pooled_global",
         random_topology_prob: float = 0.0,
         budget_loss_type: str = "per_observation_mse",
         budget_base_cost_weight: float = 0.01,
         budget_elu_tau: float = 0.025,
+        debug_lowpass_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
         self.input_hw = (int(input_hw[0]), int(input_hw[1]))
+        self.debug_lowpass_size = (
+            None if debug_lowpass_size is None else int(debug_lowpass_size)
+        )
         self.num_levels = int(num_levels)
         self.global_level = int(global_level)
         self.global_encoder_type = str(global_encoder_type)
@@ -439,10 +451,23 @@ class FoveationNet(nn.Module):
         # Workspace-owned dual state, not a network parameter or EMA buffer.
         self.budget_lambda = 0.0
         self.fix_split_mode = fix_split_mode
+        self.mixed_split_modes = (
+            self._parse_weighted_split_modes(fix_split_mode)
+            if isinstance(fix_split_mode, (list, ListConfig)) else None
+        )
+        self.fixed_level = (
+            self._parse_leaf_level(fix_split_mode)
+            if isinstance(fix_split_mode, str) and fix_split_mode.startswith("level:")
+            else None
+        )
         (
             self.random_split_ratios,
             self.fixed_split_ratio,
-        ) = self._parse_split_ratios(fix_split_mode)
+            self.random_split_range,
+        ) = self._parse_split_ratios(
+            None if self.mixed_split_modes is not None or self.fixed_level is not None
+            else fix_split_mode
+        )
         self.random_topology_prob = float(random_topology_prob)
         self.router_type = str(router_type)
 
@@ -562,16 +587,57 @@ class FoveationNet(nn.Module):
             offsets.append(offsets[-1] + count)
         return tuple(offsets)
 
+    def _parse_leaf_level(self, mode: str) -> int:
+        try:
+            level = int(mode.removeprefix("level:"))
+        except ValueError:
+            raise ValueError("level:<index> requires an integer leaf level.") from None
+        if not 0 <= level < self.num_levels:
+            raise ValueError(f"Leaf level must be in [0, {self.num_levels - 1}].")
+        return level
+
+    def _parse_weighted_split_modes(self, modes):
+        # Keep configuration as Python values; no additional checkpoint state.
+        if not modes:
+            raise ValueError("Weighted fix_split_mode requires a non-empty list.")
+        parsed_modes = []
+        for item in modes:
+            if not isinstance(item, str) or item.count("%") != 1:
+                raise ValueError("Weighted entries require '<percent>%level:<index>' or '<percent>%random:<ratios>'.")
+            weight_text, mode = item.split("%")
+            mode = mode.strip()
+            try:
+                weight = float(weight_text)
+            except ValueError:
+                raise ValueError(f"Invalid percentage in fix_split_mode: {item!r}.") from None
+            if not np.isfinite(weight) or weight < 0.0:
+                raise ValueError("Split mode percentages must be finite and non-negative.")
+            if mode.startswith("level:"):
+                parsed_modes.append((weight, "level", self._parse_leaf_level(mode)))
+            elif mode.startswith("random:"):
+                ratios, _, split_range = self._parse_split_ratios(mode)
+                parsed_modes.append(
+                    (weight, "random_range", split_range) if split_range is not None
+                    else (weight, "random", ratios)
+                )
+            else:
+                raise ValueError("Weighted fix_split_mode only supports level and random entries.")
+        if abs(sum(weight for weight, _, _ in parsed_modes) - 100.0) > 1e-6:
+            raise ValueError("Split mode percentages must sum to 100%.")
+        return tuple(parsed_modes)
+
     @staticmethod
     def _parse_split_ratios(
         fix_split_mode: Optional[str],
-    ) -> Tuple[Optional[Tuple[float, ...]], Optional[float]]:
+    ) -> Tuple[
+        Optional[Tuple[float, ...]], Optional[float], Optional[Tuple[float, float]]
+    ]:
         if fix_split_mode in (None, "coarsest", "finest"):
-            return None, None
+            return None, None, None
         if not isinstance(fix_split_mode, str):
             raise ValueError(
                 "fix_split_mode must be None, 'coarsest', 'finest', or "
-                "'random:<ratio>[,<ratio>...]' or 'fixed:<ratio>'."
+                "'random:<ratio>[,<ratio>...]', 'random:<min>-<max>' or 'fixed:<ratio>'."
             )
         if fix_split_mode.startswith("random:"):
             split_mode = "random"
@@ -580,11 +646,22 @@ class FoveationNet(nn.Module):
         else:
             raise ValueError(
                 "fix_split_mode must be None, 'coarsest', 'finest', or "
-                "'random:<ratio>[,<ratio>...]' or 'fixed:<ratio>'."
+                "'random:<ratio>[,<ratio>...]', 'random:<min>-<max>' or 'fixed:<ratio>'."
             )
 
         ratio_text = fix_split_mode.removeprefix(f"{split_mode}:")
         if split_mode == "random":
+            # Match whole numeric endpoints so a negative exponent is not a separator.
+            number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+            range_match = re.fullmatch(rf"\s*({number})\s*-\s*({number})\s*", ratio_text)
+            if range_match is not None:
+                min_ratio, max_ratio = (float(item) for item in range_match.groups())
+                if not (
+                    np.isfinite(min_ratio) and np.isfinite(max_ratio)
+                    and 0.0 <= min_ratio <= max_ratio <= 1.0
+                ):
+                    raise ValueError("Random split range requires finite 0 <= min <= max <= 1.")
+                return None, None, (min_ratio, max_ratio)
             ratio_items = ratio_text.split(",")
             if not ratio_items or any(not item.strip() for item in ratio_items):
                 raise ValueError(
@@ -595,8 +672,8 @@ class FoveationNet(nn.Module):
                 split_ratios = tuple(float(item) for item in ratio_items)
             except ValueError:
                 raise ValueError(
-                    "Every ratio in fix_split_mode='random:<ratio>[,<ratio>...]' "
-                    "must be a number."
+                    "Random fix_split_mode requires numeric ratios or one '<min>-<max>' "
+                    "range; lists and ranges cannot be mixed."
                 ) from None
             if any(
                 not np.isfinite(split_ratio)
@@ -604,7 +681,7 @@ class FoveationNet(nn.Module):
                 for split_ratio in split_ratios
             ):
                 raise ValueError("Every split ratio must be in [0, 1].")
-            return split_ratios, None
+            return split_ratios, None, None
 
         try:
             split_ratio = float(ratio_text)
@@ -614,7 +691,7 @@ class FoveationNet(nn.Module):
             ) from None
         if not np.isfinite(split_ratio) or not 0.0 <= split_ratio <= 1.0:
             raise ValueError("The split ratio must be in [0, 1].")
-        return None, split_ratio
+        return None, split_ratio, None
 
     def _num_splits_from_ratio(self, split_ratio: float) -> int:
         return int(float(split_ratio) * self.num_internal_nodes + 0.5)
@@ -641,6 +718,10 @@ class FoveationNet(nn.Module):
             raise ValueError("in_channels must be positive.")
         if len(self.input_hw) != 2 or min(self.input_hw) <= 0:
             raise ValueError("input_hw must contain two positive integers.")
+        if self.debug_lowpass_size is not None and not (
+            0 < self.debug_lowpass_size <= min(self.input_hw)
+        ):
+            raise ValueError("debug_lowpass_size must be positive and no larger than input_hw.")
         if self.num_levels <= 0:
             raise ValueError("num_levels must be positive.")
         if not (0 <= self.global_level < self.num_levels):
@@ -930,6 +1011,19 @@ class FoveationNet(nn.Module):
             .contiguous()
             .reshape(B * T, C, H, W)
         )
+        if self.debug_lowpass_size is not None:
+            # Remove high-frequency content without changing the fine token grid.
+            x_low_BT_C_H_W = F.interpolate(
+                x_high_BT_C_H_W,
+                size=(self.debug_lowpass_size, self.debug_lowpass_size),
+                mode="area",
+            )
+            x_high_BT_C_H_W = F.interpolate(
+                x_low_BT_C_H_W,
+                size=(H, W),
+                mode="bilinear",
+                align_corners=False,
+            )
         pyramid_high_to_low: List[torch.Tensor] = [x_high_BT_C_H_W]
         x_level_BT_C_H_W = x_high_BT_C_H_W
         for _ in range(self.num_levels - 1):
@@ -1090,6 +1184,55 @@ class FoveationNet(nn.Module):
             dtype=reference_B_T_N_D.dtype,
         )
         return self.router.condition_projection(cond_B_T_D)
+
+    def _sample_mixed_split_mask(
+        self, merged_batch_size: int, num_views: int, device: torch.device,
+    ) -> torch.Tensor:
+        batch_size = merged_batch_size // num_views
+        weights_L = torch.tensor(
+            [weight for weight, _, _ in self.mixed_split_modes], device=device,
+            dtype=torch.float32,
+        )
+        mode_indices_B = torch.multinomial(weights_L, batch_size, replacement=True)
+        # Policy concatenates complete camera batches: [view0 B, view1 B, ...].
+        mode_indices_VB = mode_indices_B.repeat(num_views)
+        split_hard_VB_1_M = torch.zeros(
+            (merged_batch_size, 1, self.num_internal_nodes),
+            dtype=torch.bool, device=device,
+        )
+        for mode_index, (_, kind, value) in enumerate(self.mixed_split_modes):
+            selected_B = mode_indices_B == mode_index
+            selected_VB = mode_indices_VB == mode_index
+            if kind == "level":
+                split_hard_VB_1_M[selected_VB, :, :self.internal_level_offsets[value]] = True
+                continue
+            num_selected = int(selected_B.sum().item())
+            if num_selected == 0:
+                continue
+            if kind == "random_range":
+                num_splits_R_1 = self._sample_range_num_splits(value, num_selected, device)
+            else:
+                split_counts_L = torch.tensor(
+                    [self._num_splits_from_ratio(ratio) for ratio in value],
+                    dtype=torch.long, device=device,
+                )
+                ratio_indices_R = torch.randint(len(value), (num_selected,), device=device)
+                num_splits_R_1 = split_counts_L[ratio_indices_R, None]
+            # Share the ratio across cameras, but sample their spatial layouts independently.
+            split_hard_VB_1_M[selected_VB] = self._sample_random_split_mask(
+                num_splits_R_1.repeat(num_views, 1)
+            )
+        return split_hard_VB_1_M
+
+    def _sample_range_num_splits(
+        self, split_range: Tuple[float, float], batch_size: int, device: torch.device,
+    ) -> torch.Tensor:
+        min_ratio, max_ratio = split_range
+        ratios_B_1 = min_ratio + (max_ratio - min_ratio) * torch.rand(
+            (batch_size, 1), device=device,
+        )
+        # Uniform continuous ratios, then the same half-up rounding as discrete modes.
+        return torch.floor(ratios_B_1 * self.num_internal_nodes + 0.5).to(torch.long)
 
     def _sample_random_split_mask(
         self,
@@ -1340,9 +1483,18 @@ class FoveationNet(nn.Module):
     def sample_paired_splits(
         self,
         split_hard_B_M: torch.Tensor,
+        temporal_pair_valid_P: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Select one reachable internal node per frame and return stop/split trees."""
+        """Sample reachable stop/split arms, optionally matching deltas in [all A, all B]."""
+        if self.num_internal_nodes == 0:
+            raise ValueError("Paired sampling requires at least one splittable tree level.")
+        if split_hard_B_M.ndim != 2 or split_hard_B_M.shape[1] != self.num_internal_nodes:
+            raise ValueError("Expected split_hard_B_M with one decision per internal node.")
         B = split_hard_B_M.shape[0]
+        if temporal_pair_valid_P is not None and (
+            temporal_pair_valid_P.ndim != 1 or B != 2 * temporal_pair_valid_P.shape[0]
+        ):
+            raise ValueError("Temporal paired sampling expects 2P windows ordered [all A, all B].")
         root_h, root_w = self.level_grid_hw[0]
         reachable_B_H_W = torch.ones(
             (B, root_h, root_w), dtype=torch.bool, device=split_hard_B_M.device
@@ -1360,6 +1512,43 @@ class FoveationNet(nn.Module):
         reachable_B_M = torch.cat(reachable_levels, dim=1)
         scores_B_M = torch.rand(reachable_B_M.shape, device=split_hard_B_M.device)
         selected_node_B = scores_B_M.masked_fill(~reachable_B_M, -1.0).argmax(dim=1)
+
+        if temporal_pair_valid_P is not None:
+            # Count every subtree, including descendants hidden by stopped ancestors.
+            # Finest children are leaves; higher levels reuse their actual subtree counts.
+            actual_leaf_count_B_M = torch.ones_like(split_hard_B_M, dtype=torch.long)
+            delta_B_M = torch.empty_like(actual_leaf_count_B_M)
+            for level in reversed(range(self.num_levels - 1)):
+                start, end = self.internal_level_offsets[level : level + 2]
+                if level == self.num_levels - 2:
+                    split_leaf_count_B_L = torch.full_like(actual_leaf_count_B_M[:, start:end], 4)
+                else:
+                    children_L_4 = self.internal_children_M_4[start:end]
+                    split_leaf_count_B_L = actual_leaf_count_B_M[:, children_L_4].sum(dim=-1)
+                delta_B_M[:, start:end] = split_leaf_count_B_L - 1
+                actual_leaf_count_B_M[:, start:end] = torch.where(
+                    split_hard_B_M[:, start:end], split_leaf_count_B_L, 1
+                )
+
+            P = temporal_pair_valid_P.shape[0]
+            pair_P = torch.arange(P, device=split_hard_B_M.device)
+            anchor_side_P = torch.randint(2, (P,), device=split_hard_B_M.device)
+            anchor_batch_P = pair_P + anchor_side_P * P
+            other_batch_P = pair_P + (1 - anchor_side_P) * P
+            anchor_delta_P = delta_B_M[anchor_batch_P, selected_node_B[anchor_batch_P]]
+            matches_P_M = (
+                reachable_B_M[other_batch_P]
+                & (delta_B_M[other_batch_P] == anchor_delta_P[:, None])
+                & temporal_pair_valid_P[:, None]
+            )
+            matched_node_P = scores_B_M[other_batch_P].masked_fill(~matches_P_M, -1.0).argmax(dim=1)
+            # Reusing independent scores is uniform within matches. Failed/invalid pairs
+            # keep both defaults; random anchors share the changed Spatial distribution.
+            selected_node_B[other_batch_P] = torch.where(
+                matches_P_M.any(dim=1), matched_node_P, selected_node_B[other_batch_P]
+            )
+
+        # Intervene only at the parent: one arm retains the base tree's actual leaves.
         stop_B_M = split_hard_B_M.clone()
         split_B_M = split_hard_B_M.clone()
         stop_B_M.scatter_(1, selected_node_B[:, None], False)
@@ -1466,12 +1655,17 @@ class FoveationNet(nn.Module):
         cond_B_T_D: Optional[torch.Tensor] = None,
         *,
         return_routing_state: bool = False,
+        num_views: int = 1,
     ) -> Dict[str, torch.Tensor]:
-        """Route images, optionally exposing the bank and decisions for paired evaluation."""
+        """Route images; weighted/range modes share choices across camera batches."""
         ## 1. Validate and normalize the high-resolution input.
         if x_B_C_T_H_W.ndim != 5:
             raise ValueError("Expected x_B_C_T_H_W with shape (B, C, T, H, W).")
         B, C, T, H, W = x_B_C_T_H_W.shape
+        if (
+            self.mixed_split_modes is not None or self.random_split_range is not None
+        ) and (num_views < 1 or B % num_views):
+            raise ValueError("Weighted/range routing requires a batch divisible by num_views >= 1.")
         if C != self.in_channels:
             raise ValueError(f"Expected {self.in_channels} channels, got {C}.")
         if (H, W) != self.input_hw:
@@ -1507,10 +1701,28 @@ class FoveationNet(nn.Module):
             # Fixed baselines bypass the global encoder/router while preserving
             # shape expected by diagnostics and downstream policy code.
             split_shape = (B, T, self.num_internal_nodes)
-            if self.fixed_split_ratio is not None:
+            if self.mixed_split_modes is not None:
+                split_hard_B_T_M = self._sample_mixed_split_mask(
+                    B, num_views, x_B_C_T_H_W.device,
+                ).expand(split_shape)
+            elif self.fixed_level is not None:
+                split_hard_B_T_M = torch.zeros(
+                    split_shape, dtype=torch.bool, device=x_B_C_T_H_W.device,
+                )
+                split_hard_B_T_M[..., :self.internal_level_offsets[self.fixed_level]] = True
+            elif self.fixed_split_ratio is not None:
                 split_hard_B_T_M = self.fixed_split_hard_1_1_M.expand(
                     split_shape
                 )
+            elif self.random_split_range is not None:
+                num_splits_W_1 = self._sample_range_num_splits(
+                    self.random_split_range, B // num_views, x_B_C_T_H_W.device,
+                )
+                # B = views * windows, ordered [view0 W, view1 W, ...]. Share
+                # counts across views, draw independent layouts, then share across T.
+                split_hard_B_T_M = self._sample_random_split_mask(
+                    num_splits_W_1.repeat(num_views, 1)
+                ).expand(split_shape)
             elif self.random_split_ratios is None:
                 should_split = self.fix_split_mode == "finest"
                 split_hard_B_T_M = torch.full(
