@@ -20,6 +20,7 @@ from diffusion_policy.model.diffusion.transformer_for_diffusion import (
     TransformerForDiffusion,
 )
 from diffusion_policy.model.roi.foveation_net import FoveationNet
+from diffusion_policy.model.roi.multi_view_foveation_net import MultiViewFoveationNet
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 
 
@@ -528,10 +529,15 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         paired_node_sampling: str = "reachable",
         mask_policy_state: bool = False,
         visual_encoder_init: str = "copy",
+        render_image_orientation: str = "raw",
         **kwargs,
     ) -> None:
         """Configure routing losses and optional low-dimensional action-input masking."""
         super().__init__()
+        if render_image_orientation not in ("raw", "rot180"):
+            raise ValueError("render_image_orientation must be 'raw' or 'rot180'")
+        # Plain configuration only: preserve legacy checkpoint state-dict keys.
+        self._render_image_orientation = render_image_orientation
         if router_loss_type not in {"st", "paired"}:
             raise ValueError("router_loss_type must be 'st' or 'paired'.")
         if paired_loss_weight <= 0.0:
@@ -602,8 +608,8 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                     raise ValueError("router_condition_key must refer to low-dim observations.")
                 router_condition_input_dim += math.prod(condition_meta["shape"])
 
-        self.foveation_net: Optional[FoveationNet] = None
-        self.obs_encoder: Optional[FoveationObsEncoder] = None
+        routing_template = None
+        self.obs_encoders = nn.ModuleDict()
         if self.rgb_keys:
             rgb_shape = tuple(obs_shape_meta[self.rgb_keys[0]]["shape"])
             for key in self.rgb_keys[1:]:
@@ -612,18 +618,18 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                         "All RGB observations must share C/H/W and foveation geometry; "
                         f"{self.rgb_keys[0]!r} and {key!r} differ."
                     )
-            self.foveation_net = self._instantiate_foveation_net(
+            routing_template = self._instantiate_foveation_net(
                 foveation_net,
                 in_channels=rgb_shape[0],
                 input_hw=rgb_shape[1:],
             )
-            global_encoder = getattr(self.foveation_net, "global_encoder", None)
+            global_encoder = getattr(routing_template, "global_encoder", None)
             encoder_is_frozen = bool(
-                getattr(self.foveation_net, "freeze_global_encoder", True)
-                or getattr(self.foveation_net, "fix_split_mode", None) is not None
+                getattr(routing_template, "freeze_global_encoder", True)
+                or getattr(routing_template, "fix_split_mode", None) is not None
             )
             encoder_type = str(
-                getattr(self.foveation_net, "global_encoder_type", "")
+                getattr(routing_template, "global_encoder_type", "")
             )
             if encoder_type.startswith("vjepa") and not encoder_is_frozen:
                 raise ValueError("V-JEPA global encoders must remain frozen.")
@@ -631,50 +637,57 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                 if any(param.requires_grad for param in global_encoder.parameters()):
                     raise ValueError("The configured global encoder must be frozen.")
                 global_encoder.eval()
-            self.obs_encoder = FoveationObsEncoder(
-                in_channels=rgb_shape[0],
-                input_hw=rgb_shape[1:],
-                patch_size=int(self.foveation_net.patch_size),
-                num_levels=int(self.foveation_net.num_levels),
-                position_encoding_types=position_encoding_types,
-                pooling_type=pooling_type,
-                patch_embedding_type=patch_embedding_type,
-                st_gate_location=st_gate_location,
-                patch_level_adapter_channels=patch_level_adapter_channels,
-                visual_dim=visual_dim,
-                num_layers=visual_encoder_layers,
-                num_heads=visual_encoder_heads,
-                mlp_ratio=visual_encoder_mlp_ratio,
-                dropout=visual_encoder_dropout,
-                visual_encoder_init=visual_encoder_init,
-            )
-            foveation_grids = tuple(
-                tuple(grid_hw) for grid_hw in self.foveation_net.level_grid_hw
-            )
-            if self.obs_encoder.level_grid_hw != foveation_grids:
-                raise ValueError(
-                    "Observation encoder and FoveationNet patch grids differ: "
-                    f"encoder={self.obs_encoder.level_grid_hw}, "
-                    f"foveation={foveation_grids}."
+            for key in self.rgb_keys:
+                encoder = FoveationObsEncoder(
+                    in_channels=rgb_shape[0],
+                    input_hw=rgb_shape[1:],
+                    patch_size=int(routing_template.patch_size),
+                    num_levels=int(routing_template.num_levels),
+                    position_encoding_types=position_encoding_types,
+                    pooling_type=pooling_type,
+                    patch_embedding_type=patch_embedding_type,
+                    st_gate_location=st_gate_location,
+                    patch_level_adapter_channels=patch_level_adapter_channels,
+                    visual_dim=visual_dim,
+                    num_layers=visual_encoder_layers,
+                    num_heads=visual_encoder_heads,
+                    mlp_ratio=visual_encoder_mlp_ratio,
+                    dropout=visual_encoder_dropout,
+                    visual_encoder_init=visual_encoder_init,
                 )
-            if self.obs_encoder.num_bank_patches != int(
-                self.foveation_net.num_bank_patches
-            ):
-                raise ValueError(
-                    "Observation encoder and FoveationNet bank sizes differ."
+                foveation_grids = tuple(
+                    tuple(grid_hw) for grid_hw in routing_template.level_grid_hw
                 )
+                if encoder.level_grid_hw != foveation_grids:
+                    raise ValueError(
+                        "Observation encoder and FoveationNet patch grids differ: "
+                        f"encoder={encoder.level_grid_hw}, "
+                        f"foveation={foveation_grids}."
+                    )
+                if encoder.num_bank_patches != int(
+                    routing_template.num_bank_patches
+                ):
+                    raise ValueError(
+                        "Observation encoder and FoveationNet bank sizes differ."
+                    )
+                self.obs_encoders[key] = encoder
 
         self.router_condition_projection: Optional[nn.Linear] = None
         if router_condition_input_dim is not None:
             self.router_condition_projection = nn.Linear(
                 router_condition_input_dim,
-                int(self.foveation_net.router_cond_dim),
+                int(routing_template.router_cond_dim),
             )
             if (
-                getattr(self.foveation_net, "freeze_router", False)
-                or getattr(self.foveation_net, "fix_split_mode", None) is not None
+                getattr(routing_template, "freeze_router", False)
+                or getattr(routing_template, "fix_split_mode", None) is not None
             ):
                 self.router_condition_projection.requires_grad_(False)
+
+        self.foveation_net = (
+            MultiViewFoveationNet(self.rgb_keys, routing_template)
+            if routing_template is not None else None
+        )
 
         self.low_dim_dim = sum(self.low_dim_dims)
         self.obs_feature_dim = (
@@ -782,7 +795,15 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             return None
         return self.foveation_net.set_target_num_patches(target_num_patches)
 
+    @property
+    def render_image_orientation(self):
+        """Return the static-camera input orientation used by preprocessing."""
+        return self._render_image_orientation
+
     def _prepare_rgb(self, key: str, image_B_T_C_H_W: torch.Tensor) -> torch.Tensor:
+        # Rotate spatial axes before either dtype path, without mutating observations.
+        if key == "image" and self.render_image_orientation == "rot180":
+            image_B_T_C_H_W = image_B_T_C_H_W.flip((-2, -1))
         if image_B_T_C_H_W.dtype == torch.uint8:
             return image_B_T_C_H_W
         # Dataset normalizers provide the floating [-1, 1] convention expected
@@ -808,11 +829,11 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         obs_dict: Dict[str, torch.Tensor],
         return_foveation_outputs: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
-        merged_out, normalized_low_dim_by_key, aux = self._route_observations(
+        routing_by_view, normalized_low_dim_by_key, aux = self._route_observations(
             obs_dict, return_foveation_outputs=return_foveation_outputs
         )
         features_B_T_D = self._encode_routed_observations(
-            merged_out, normalized_low_dim_by_key
+            routing_by_view, normalized_low_dim_by_key
         )
         return features_B_T_D, aux
 
@@ -821,7 +842,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         obs_dict: Dict[str, torch.Tensor],
         return_foveation_outputs: bool = False,
         return_routing_state: bool = False,
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, object]]:
+    ):
         # Keep routing registered with DDP, but build no routing graph in finetuning.
         with torch.set_grad_enabled(torch.is_grad_enabled() and not self._downstream_finetune):
             return self._route_observations_impl(
@@ -833,116 +854,63 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         obs_dict: Dict[str, torch.Tensor],
         return_foveation_outputs: bool = False,
         return_routing_state: bool = False,
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, object]]:
+    ):
         if not obs_dict:
             raise ValueError("obs_dict cannot be empty.")
-        merged_out = {}
-        aux: Dict[str, object] = {
-            "budget_loss": None,
-            "num_patches_mean": None,
-            "random_topology_fraction": None,
-        }
         normalized_low_dim_by_key = {
-            key: self.normalizer[key].normalize(obs_dict[key])
-            for key in self.low_dim_keys
+            key: self.normalizer[key].normalize(obs_dict[key]) for key in self.low_dim_keys
         }
         router_cond_B_T_D = None
         if self.router_condition_projection is not None:
-            # Ordered concatenation preserves legacy single-condition weight shapes.
             conditions = []
             for key in self.router_condition_keys:
-                value_B_T = normalized_low_dim_by_key[key]
-                conditions.append(value_B_T.reshape(*value_B_T.shape[:2], -1))
-            condition_B_T_D = torch.cat(conditions, dim=-1)
-            router_cond_B_T_D = self.router_condition_projection(condition_B_T_D)
-
-        if self.rgb_keys:
-            rgb_inputs = []
-            batch_size = None
-            time_size = None
-            for key in self.rgb_keys:
-                image_B_T_C_H_W = obs_dict[key]
-                if image_B_T_C_H_W.ndim != 5:
-                    raise ValueError(f"RGB observation {key!r} must be (B,T,C,H,W).")
-                if batch_size is None:
-                    batch_size, time_size = image_B_T_C_H_W.shape[:2]
-                if image_B_T_C_H_W.shape[:2] != (batch_size, time_size):
-                    raise ValueError("All RGB observations must share B and T.")
-                rgb_inputs.append(self._prepare_rgb(key, image_B_T_C_H_W))
-
-            merged_B_T_C_H_W = torch.cat(rgb_inputs, dim=0)
-            merged_B_C_T_H_W = merged_B_T_C_H_W.permute(0, 2, 1, 3, 4).contiguous()
-            merged_cond_B_T_D = None
-            if router_cond_B_T_D is not None:
-                # RGB streams are concatenated as full batch blocks, so repeat
-                # the shared low-dim condition in the same order.
-                merged_cond_B_T_D = router_cond_B_T_D.repeat(
-                    len(self.rgb_keys), 1, 1
-                )
-            routing_kwargs = {"return_routing_state": True} if return_routing_state else {}
-            merged_out = self.foveation_net(
-                merged_B_C_T_H_W,
-                cond_B_T_D=merged_cond_B_T_D,
-                num_views=len(self.rgb_keys),
-                **routing_kwargs,
+                value_B_T_X = normalized_low_dim_by_key[key]
+                conditions.append(value_B_T_X.reshape(*value_B_T_X.shape[:2], -1))
+            # One shared state projection; each camera retains its own fusion layers.
+            router_cond_B_T_D = self.router_condition_projection(torch.cat(conditions, dim=-1))
+        routing_by_view = {}
+        aux = {"budget_loss": None, "num_patches_mean": None, "random_topology_fraction": None}
+        if self.foveation_net is not None:
+            images_by_view = {
+                key: self._prepare_rgb(key, obs_dict[key]) for key in self.rgb_keys
+            }
+            shapes = {image_B_T_C_H_W.shape[:2] for image_B_T_C_H_W in images_by_view.values()}
+            if len(shapes) != 1:
+                raise ValueError("All RGB observations must share B and T.")
+            routing_by_view, aux = self.foveation_net(
+                images_by_view, router_cond_B_T_D, return_routing_state=return_routing_state,
             )
-            aux["budget_loss"] = merged_out["budget_loss"]
-            aux.update({key: value for key, value in merged_out.items() if key.startswith("_budget_")})
-            aux["num_patches_mean"] = merged_out["num_patches_B_T"].float().mean()
-            aux["random_topology_fraction"] = merged_out[
-                "random_topology_mask_B_T"
-            ].float().mean()
             if return_foveation_outputs:
-                # Routing state is training-only; do not retain the full bank in logs.
                 aux["foveation_outputs"] = {
                     key: {
-                        name: value[route_idx * batch_size : (route_idx + 1) * batch_size].detach()
-                        for name, value in merged_out.items()
-                        if torch.is_tensor(value)
-                        and value.ndim > 0
-                        and value.shape[0] == merged_B_T_C_H_W.shape[0]
+                        name: value_B_T_X.detach()
+                        for name, value_B_T_X in out.items()
+                        if torch.is_tensor(value_B_T_X) and value_B_T_X.ndim >= 2
                         and name not in {"patch_bank_B_T_K_C_P_P", "split_hard_B_T_M"}
                     }
-                    for route_idx, key in enumerate(self.rgb_keys)
+                    for key, out in routing_by_view.items()
                 }
-        return merged_out, normalized_low_dim_by_key, aux
+        return routing_by_view, normalized_low_dim_by_key, aux
 
-    def _encode_routed_observations(
-        self,
-        merged_out: Dict[str, torch.Tensor],
-        normalized_low_dim_by_key: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        features: List[torch.Tensor] = []
-        if self.rgb_keys:
-            merged_batch_size = merged_out["num_patches_B_T"].shape[0]
-            batch_size = merged_batch_size // len(self.rgb_keys)
-            for route_idx in range(len(self.rgb_keys)):
-                start = route_idx * batch_size
-                end = start + batch_size
-                route_out = {
-                    name: value[start:end]
-                    for name, value in merged_out.items()
-                    if torch.is_tensor(value)
-                    and value.ndim > 0
-                    and value.shape[0] == merged_batch_size
-                }
-                features.append(self.obs_encoder(route_out))
+    def _encode_routed_observations(self, routing_by_view, normalized_low_dim_by_key):
+        features_by_view = {
+            key: self.obs_encoders[key](routing_by_view[key]) for key in self.rgb_keys
+        }
+        return self._fuse_observation_features(features_by_view, normalized_low_dim_by_key)
+
+    def _fuse_observation_features(self, features_by_view, normalized_low_dim_by_key):
+        features = [features_by_view[key] for key in self.rgb_keys]
         for key in self.low_dim_keys:
-            value_B_T = normalized_low_dim_by_key[key]
-            value_B_T_D = value_B_T.reshape(value_B_T.shape[0], value_B_T.shape[1], -1)
+            value_B_T_X = normalized_low_dim_by_key[key]
+            value_B_T_D = value_B_T_X.reshape(*value_B_T_X.shape[:2], -1)
             if self.mask_policy_state and key != "task_id":
-                # Mask robot state only; task identity and router inputs stay available.
                 value_B_T_D = torch.zeros_like(value_B_T_D)
             features.append(value_B_T_D)
-
-        if not features:
-            raise ValueError("No supported observations were provided.")
         reference_B_T_D = features[0]
-        features = [
+        return torch.cat([
             value_B_T_D.to(device=reference_B_T_D.device, dtype=reference_B_T_D.dtype)
             for value_B_T_D in features
-        ]
-        return torch.cat(features, dim=-1)
+        ], dim=-1)
 
     def _encode_obs_batch(
         self,
@@ -1051,33 +1019,23 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         optim_groups = [group for group in optim_groups if group["params"]]
         known_ids = {id(param) for group in optim_groups for param in group["params"]}
         no_decay_ids = set()
-        if self.obs_encoder is not None:
-            fine_pos_embed = getattr(
-                self.obs_encoder,
-                "fine_pos_embed_1_D_Hf_Wf",
-                None,
-            )
-            if fine_pos_embed is not None:
-                no_decay_ids.add(id(fine_pos_embed))
-            level_embed_L_D = getattr(self.obs_encoder, "level_embed_L_D", None)
-            if level_embed_L_D is not None:
-                no_decay_ids.add(id(level_embed_L_D))
-            cls_token_1_1_D = getattr(self.obs_encoder, "cls_token_1_1_D", None)
-            if cls_token_1_1_D is not None:
-                no_decay_ids.add(id(cls_token_1_1_D))
+        for encoder in self.obs_encoders.values():
+            for name in ("fine_pos_embed_1_D_Hf_Wf", "level_embed_L_D", "cls_token_1_1_D"):
+                param = getattr(encoder, name, None)
+                if param is not None:
+                    no_decay_ids.add(id(param))
 
         visual_decay_params = []
         visual_no_decay_params = []
-        if self.obs_encoder is not None:
-            for param in self.obs_encoder.parameters():
-                if param.requires_grad and id(param) not in known_ids:
-                    target = (
-                        visual_no_decay_params
-                        if id(param) in no_decay_ids
-                        else visual_decay_params
-                    )
-                    target.append(param)
-                    known_ids.add(id(param))
+        for param in self.obs_encoders.parameters():
+            if param.requires_grad and id(param) not in known_ids:
+                target = (
+                    visual_no_decay_params
+                    if id(param) in no_decay_ids
+                    else visual_decay_params
+                )
+                target.append(param)
+                known_ids.add(id(param))
 
         # Only FoveationObsEncoder uses the visual LR; routing stays at the base LR.
         visual_learning_rate = learning_rate * visual_encoder_lr_multiplier
@@ -1125,7 +1083,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
     def freeze_action_path(self) -> None:
         """Freeze visual/action weights while retaining input gradients for routing."""
         self._action_path_frozen = True
-        for module in (self.obs_encoder, self.model):
+        for module in (self.obs_encoders, self.model):
             if module is not None:
                 module.requires_grad_(False)
                 module.eval()
@@ -1133,7 +1091,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
     def freeze_obs_encoder(self) -> None:
         self._obs_encoder_frozen = True
         for module in (
-            self.obs_encoder,
+            self.obs_encoders,
             self.foveation_net,
             self.router_condition_projection,
         ):
@@ -1145,7 +1103,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         super().train(mode)
         if self._action_path_frozen:
             # eval disables action-path dropout without breaking the ST gradient.
-            for module in (self.obs_encoder, self.model):
+            for module in (self.obs_encoders, self.model):
                 if module is not None:
                     module.eval()
         if self._downstream_finetune:
@@ -1154,7 +1112,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
                     module.eval()
         if self._obs_encoder_frozen:
             for module in (
-                self.obs_encoder,
+                self.obs_encoders,
                 self.foveation_net,
                 self.router_condition_projection,
             ):
@@ -1168,25 +1126,14 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         """Print and return parameter counts for the policy's key modules."""
         named_modules = []
         if self.foveation_net is not None:
-            global_encoder = getattr(self.foveation_net, "global_encoder", None)
-            if global_encoder is not None:
-                encoder_type = getattr(
-                    self.foveation_net,
-                    "global_encoder_type",
-                    type(global_encoder).__name__,
-                )
-                named_modules.append(
-                    (f"foveation.global_encoder ({encoder_type})", global_encoder)
-                )
-            router = getattr(self.foveation_net, "router", None)
-            if router is not None:
-                named_modules.append(("foveation.router", router))
+            for key, net in self.foveation_net.nets.items():
+                if net.global_encoder is not None:
+                    named_modules.append((f"foveation.{key}.global_encoder", net.global_encoder))
+                if net.router is not None:
+                    named_modules.append((f"foveation.{key}.router", net.router))
         if self.router_condition_projection is not None:
-            named_modules.append(
-                ("foveation.condition_projection", self.router_condition_projection)
-            )
-        if self.obs_encoder is not None:
-            named_modules.append(("visual.obs_encoder", self.obs_encoder))
+            named_modules.append(("foveation.shared_condition_projection", self.router_condition_projection))
+        named_modules.extend((f"visual.{key}", encoder) for key, encoder in self.obs_encoders.items())
         named_modules.append(("action.diffusion_transformer", self.model))
 
         policy_total = sum(param.numel() for param in self.parameters())
@@ -1263,22 +1210,10 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             f"mask_policy_state={self.mask_policy_state}"
         )
         if self.foveation_net is not None:
-            encoder = getattr(self.foveation_net, "global_encoder", None)
-            if encoder is not None:
-                encoder_type = getattr(
-                    self.foveation_net,
-                    "global_encoder_type",
-                    type(encoder).__name__,
-                )
-                status = (
-                    "trainable"
-                    if any(param.requires_grad for param in encoder.parameters())
-                    else "frozen"
-                )
-                print(
-                    f"[FoveationDPTransformerPolicy] global_encoder="
-                    f"{encoder_type} ({status})"
-                )
+            for key, net in self.foveation_net.nets.items():
+                if net.global_encoder is not None:
+                    status = "trainable" if any(p.requires_grad for p in net.global_encoder.parameters()) else "frozen"
+                    print(f"[FoveationDPTransformerPolicy] {key}: {net.global_encoder_type} ({status})")
 
     def _diffusion_loss_per_sample(
         self,
@@ -1363,7 +1298,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             if device.type == "cuda":
                 with torch.cuda.device(device):
                     torch.cuda.manual_seed(seed)
-            merged_out, normalized_low_dim_by_key, aux = self._route_observations(
+            routing_by_view, normalized_low_dim_by_key, aux = self._route_observations(
                 obs_dict, return_foveation_outputs=True, return_routing_state=True
             )
             # A separate generator decouples diffusion inputs from random-tree draws.
@@ -1383,14 +1318,16 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             )
             level_losses = []
             for level in range(self.foveation_net.num_levels):
-                # VB merges view and batch; all views/frames use the same leaf level.
-                split_hard_VB_T_M = torch.zeros_like(merged_out["split_hard_B_T_M"])
-                split_hard_VB_T_M[..., :self.foveation_net.internal_level_offsets[level]] = True
-                level_out = self.foveation_net.pack_topology(
-                    merged_out["patch_bank_B_T_K_C_P_P"], split_hard_VB_T_M
-                )
+                level_by_view = {}
+                for key, net in self.foveation_net.nets.items():
+                    out = routing_by_view[key]
+                    split_hard_B_T_M = torch.zeros_like(out["split_hard_B_T_M"])
+                    split_hard_B_T_M[..., :net.internal_level_offsets[level]] = True
+                    level_by_view[key] = net.pack_topology(
+                        out["patch_bank_B_T_K_C_P_P"], split_hard_B_T_M,
+                    )
                 obs_features_B_T_D = self._encode_routed_observations(
-                    level_out, normalized_low_dim_by_key
+                    level_by_view, normalized_low_dim_by_key,
                 )
                 level_losses.append(self._diffusion_loss_per_sample(
                     obs_features_B_T_D, nactions_B_H_D,
@@ -1410,101 +1347,81 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         if not self._action_path_frozen:
             raise ValueError("Paired loss requires freeze_action_path() before training.")
         if self.obs_as_cond:
-            obs_dict = {key: value[:, : self.n_obs_steps] for key, value in obs_dict.items()}
-        merged_out, normalized_low_dim_by_key, aux = self._route_observations(
-            obs_dict,
-            return_foveation_outputs=return_foveation_outputs,
-            return_routing_state=True,
+            obs_dict = {key: value[:, :self.n_obs_steps] for key, value in obs_dict.items()}
+        routing_by_view, normalized_low_dim_by_key, aux = self._route_observations(
+            obs_dict, return_foveation_outputs=return_foveation_outputs, return_routing_state=True,
         )
-        B = nactions_B_H_D.shape[0]
-        split_hard_VB_T_M = merged_out["split_hard_B_T_M"]
-        T = split_hard_VB_T_M.shape[1]
-        device = split_hard_VB_T_M.device
-        # B counts windows (2P for temporal pairs), ordered [all A, all B].
-        # Share view/frame within a pair so matched interventions use the same position.
-        random_batch_size = B if temporal_pair_valid_P is None else temporal_pair_valid_P.shape[0]
-        view_B = torch.randint(len(self.rgb_keys), (random_batch_size,), device=device)
-        frame_B = torch.randint(T, (random_batch_size,), device=device)
-        if temporal_pair_valid_P is not None:
-            view_B = view_B.repeat(2)
-            frame_B = frame_B.repeat(2)
-        stream_batch_B = view_B * B + torch.arange(B, device=device)
-        base_split_B_M = split_hard_VB_T_M[stream_batch_B, frame_B]
-        selected_node_B, stop_B_M, split_B_M = (
-            self.foveation_net.sample_paired_splits(
-                base_split_B_M, temporal_pair_valid_P=temporal_pair_valid_P
-            )
-        )
-        selected_logits_B = merged_out["split_logits_B_T_M"][
-            stream_batch_B, frame_B, selected_node_B
-        ]
-        if self.foveation_net.split_action_value == 0:
-            selected_logits_B = -selected_logits_B
-        split_prob_B = selected_logits_B.float().sigmoid()
-
-        pair_losses = []
-        pair_num_patches = []
-        noise_B_H_D = None
-        timesteps_B = None
-        condition_mask_B_H_D = None
-        # Keep router logits above differentiable; both action-path evaluations are fixed.
+        intervention = self.foveation_net.sample_paired_interventions(routing_by_view, temporal_pair_valid_P)
+        selected_logits_B = intervention["selected_logits_B"].float()
+        selected_view_B = intervention["selected_view_B"]
+        base_split_B = intervention["base_split_B"]
+        B = nactions_B_H_D.shape[0]  # Temporal packs 2P windows as [all A, all B].
+        device = nactions_B_H_D.device
+        actual_delta_B = torch.zeros(B, dtype=torch.long, device=device)
         with torch.no_grad():
-            for selected_split_B_M in (stop_B_M, split_B_M):
-                pair_split_VB_T_M = split_hard_VB_T_M.clone()
-                pair_split_VB_T_M[stream_batch_B, frame_B] = selected_split_B_M
-                pair_out = self.foveation_net.pack_topology(
-                    merged_out["patch_bank_B_T_K_C_P_P"], pair_split_VB_T_M
+            base_features_by_view = {
+                key: self.obs_encoders[key](routing_by_view[key]) for key in self.rgb_keys
+            }
+            stop_features_by_view = {key: value_B_T_D.clone() for key, value_B_T_D in base_features_by_view.items()}
+            split_features_by_view = {key: value_B_T_D.clone() for key, value_B_T_D in base_features_by_view.items()}
+            for key, selected in intervention["by_view"].items():
+                batch_R = selected["batch_indices_R"]
+                frame_R = selected["frame_indices_R"]
+                out = routing_by_view[key]
+                net = self.foveation_net.nets[key]
+                base_is_split_R = base_split_B[batch_R]
+                # Only the opposite arm needs encoding. The selected subtree's
+                # descendants are unchanged, so one arm equals the base tree.
+                changed_split_R_M = torch.where(
+                    base_is_split_R[:, None], selected["stop_R_M"], selected["split_R_M"],
                 )
-                if temporal_pair_valid_P is not None:
-                    # Effective leaves at the intervention, independent of token padding.
-                    pair_num_patches.append(pair_out["num_patches_B_T"][stream_batch_B, frame_B])
-                obs_features_B_T_D = self._encode_routed_observations(
-                    pair_out, normalized_low_dim_by_key
+                bank_R_1_K_C_P_P = out["patch_bank_B_T_K_C_P_P"][batch_R, frame_R].unsqueeze(1)
+                changed_out = net.pack_topology(bank_R_1_K_C_P_P, changed_split_R_M[:, None])
+                changed_features_R_D = self.obs_encoders[key](changed_out)[:, 0]
+                stop_features_by_view[key][batch_R[base_is_split_R], frame_R[base_is_split_R]] = (
+                    changed_features_R_D[base_is_split_R]
                 )
-                if noise_B_H_D is None:
-                    trajectory_B_H_D = nactions_B_H_D
-                    if not self.obs_as_cond:
-                        trajectory_B_H_D = torch.cat(
-                            [nactions_B_H_D, obs_features_B_T_D], dim=-1
-                        )
-                    condition_mask_B_H_D = (
-                        torch.zeros_like(trajectory_B_H_D, dtype=torch.bool)
-                        if self.pred_action_steps_only
-                        else self.mask_generator(trajectory_B_H_D.shape)
-                    )
-                    # A/B get independent noise and their own targets; both arms reuse it.
-                    noise_B_H_D = torch.randn_like(trajectory_B_H_D)
-                    timesteps_B = torch.randint(
-                        0,
-                        self.noise_scheduler.config.num_train_timesteps,
-                        (random_batch_size,),
-                        device=device,
-                    ).long()
-                    if temporal_pair_valid_P is not None:
-                        timesteps_B = timesteps_B.repeat(2)
-                pair_losses.append(
-                    self._diffusion_loss_per_sample(
-                        obs_features_B_T_D,
-                        nactions_B_H_D,
-                        noise_B_H_D=noise_B_H_D,
-                        timesteps_B=timesteps_B,
-                        condition_mask_B_H_D=condition_mask_B_H_D,
-                    )
+                split_features_by_view[key][batch_R[~base_is_split_R], frame_R[~base_is_split_R]] = (
+                    changed_features_R_D[~base_is_split_R]
                 )
+                base_count_R = out["num_patches_B_T"][batch_R, frame_R]
+                changed_count_R = changed_out["num_patches_B_T"][:, 0]
+                actual_delta_B[batch_R] = torch.where(
+                    base_is_split_R, base_count_R - changed_count_R, changed_count_R - base_count_R,
+                )
+            stop_features_B_T_D = self._fuse_observation_features(stop_features_by_view, normalized_low_dim_by_key)
+            split_features_B_T_D = self._fuse_observation_features(split_features_by_view, normalized_low_dim_by_key)
+            trajectory_B_H_D = nactions_B_H_D
+            if not self.obs_as_cond:
+                trajectory_B_H_D = torch.cat([nactions_B_H_D, stop_features_B_T_D], dim=-1)
+            condition_mask_B_H_D = (
+                torch.zeros_like(trajectory_B_H_D, dtype=torch.bool)
+                if self.pred_action_steps_only else self.mask_generator(trajectory_B_H_D.shape)
+            )
+            noise_B_H_D = torch.randn_like(trajectory_B_H_D)
+            random_batch_size = B if temporal_pair_valid_P is None else temporal_pair_valid_P.shape[0]
+            timesteps_B = torch.randint(
+                self.noise_scheduler.config.num_train_timesteps, (random_batch_size,), device=device,
+            )
+            if temporal_pair_valid_P is not None:
+                timesteps_B = timesteps_B.repeat(2)
+            # Arm-major layout: each window reuses its own noise/timestep/mask.
+            loss_2B = self._diffusion_loss_per_sample(
+                torch.cat([stop_features_B_T_D, split_features_B_T_D]),
+                nactions_B_H_D.repeat(2, 1, 1),
+                noise_B_H_D=noise_B_H_D.repeat(2, 1, 1),
+                timesteps_B=timesteps_B.repeat(2),
+                condition_mask_B_H_D=condition_mask_B_H_D.repeat(2, 1, 1),
+            )
+            stop_loss_B, split_loss_B = loss_2B.chunk(2)
 
-        stop_loss_B, split_loss_B = pair_losses
         advantage_B = stop_loss_B - split_loss_B
-        # Spatial loss averages all input windows, including invalid-pair placeholders.
-        paired_loss = -(split_prob_B * advantage_B.detach()).mean()
-        # Descendant decisions are preserved, so one arm has the base tree's leaf set.
-        base_split_B = base_split_B_M.gather(1, selected_node_B[:, None]).squeeze(1)
+        spatial_terms_B = -selected_logits_B.sigmoid() * advantage_B.detach()
+        paired_loss = spatial_terms_B.mean()
         diffusion_loss = torch.where(base_split_B, split_loss_B, stop_loss_B).mean()
         budget_loss = aux["budget_loss"]
-        if budget_loss is None:
-            budget_loss = paired_loss * 0.0
-        total_loss = self.paired_loss_weight * paired_loss + budget_loss
         losses = {
-            "total_loss": total_loss,
+            "total_loss": self.paired_loss_weight * paired_loss + budget_loss,
             "diffusion_loss": diffusion_loss,
             "budget_loss": budget_loss,
             "num_patches_mean": aux["num_patches_mean"],
@@ -1516,25 +1433,46 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
             "paired_advantage_abs_mean": advantage_B.abs().mean(),
             "paired_advantage_positive_fraction": (advantage_B > 0).float().mean(),
         }
+        metric_sums = dict(aux["_view_metric_sums"])
+        metric_counts = dict(aux["_view_metric_counts"])
+
+        def add_view_metric(name, values_B, views_B, weights_B=None):
+            values_B = values_B.detach().float()
+            if weights_B is None:
+                weights_B = torch.ones_like(values_B)
+            metric_sums[name] = values_B.new_zeros(len(self.rgb_keys)).scatter_add_(0, views_B, values_B)
+            metric_counts[name] = values_B.new_zeros(len(self.rgb_keys)).scatter_add_(0, views_B, weights_B.float())
+
+        for name, values_B in (
+            ("paired_loss", spatial_terms_B), ("paired_advantage_mean", advantage_B),
+            ("paired_advantage_abs_mean", advantage_B.abs()),
+            ("paired_advantage_positive_fraction", (advantage_B > 0).float()),
+            ("paired_stop_diffusion_loss", stop_loss_B), ("paired_split_diffusion_loss", split_loss_B),
+        ):
+            add_view_metric(name, values_B, selected_view_B)
         if temporal_pair_valid_P is not None:
             P = temporal_pair_valid_P.shape[0]
-            stop_num_patches_B, split_num_patches_B = pair_num_patches
-            actual_delta_B = split_num_patches_B - stop_num_patches_B
             matched_P = temporal_pair_valid_P & (actual_delta_B[:P] == actual_delta_B[P:])
             gain_P = advantage_B[:P] - advantage_B[P:]
-            prefer_a_P = (selected_logits_B[:P].float() - selected_logits_B[P:].float()).sigmoid()
-            # Normalize by all P pairs: failed matches and placeholders contribute zero,
-            # without amplifying the rest or dividing gains by their leaf-count delta.
-            temporal_loss_scalar = -(
-                prefer_a_P * gain_P.detach() * matched_P.to(prefer_a_P.dtype)
-            ).mean()
-            losses["temporal_loss"] = temporal_loss_scalar
+            prefer_a_P = (selected_logits_B[:P] - selected_logits_B[P:]).sigmoid()
+            temporal_terms_P = -prefer_a_P * gain_P.detach() * matched_P.float()
+            losses["temporal_loss"] = temporal_terms_P.mean()
             losses["_temporal_matched_pair_count"] = matched_P.sum()
             losses["_temporal_valid_pair_count"] = temporal_pair_valid_P.sum()
-            losses["total_loss"] = total_loss + self.temporal_loss_weight * temporal_loss_scalar
+            losses["total_loss"] = losses["total_loss"] + self.temporal_loss_weight * losses["temporal_loss"]
+            add_view_metric("temporal_loss", temporal_terms_P, selected_view_B[:P])
+            add_view_metric("temporal_gain", gain_P, selected_view_B[:P])
+            add_view_metric("temporal_match_fraction", matched_P, selected_view_B[:P], temporal_pair_valid_P)
+            losses["_view_valid_count"] = metric_counts["temporal_match_fraction"]
+            losses["_view_matched_count"] = metric_sums["temporal_match_fraction"]
+        losses["_view_sample_count"] = torch.bincount(
+            selected_view_B[:random_batch_size], minlength=len(self.rgb_keys),
+        )
         if return_foveation_outputs:
             losses["_foveation_outputs"] = aux["foveation_outputs"]
-        losses.update({key: value for key, value in aux.items() if key.startswith("_budget_")})
+        losses.update({key: value for key, value in aux.items() if key.startswith(("_budget_", "views/"))})
+        losses["_view_metric_sums"] = metric_sums
+        losses["_view_metric_counts"] = metric_counts
         return losses
 
     def compute_loss(
@@ -1598,6 +1536,7 @@ class FoveationDPTransformerPolicy(BaseImagePolicy):
         }
         if return_foveation_outputs:
             losses["_foveation_outputs"] = aux.get("foveation_outputs", {})
+        losses.update({key: value for key, value in aux.items() if key.startswith(("views/", "_view_"))})
         if not self._downstream_finetune:
             losses.update({key: value for key, value in aux.items() if key.startswith("_budget_")})
         return losses

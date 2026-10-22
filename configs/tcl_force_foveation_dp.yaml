@@ -96,6 +96,7 @@ policy:
   visual_encoder_dropout: 0.0
   position_encoding_types: [apt_interpolated, level_embedding]
   patch_embedding_type: conv
+  # Single-camera template; policy creates independent routing/visual modules per RGB key.
   foveation_net:
     _target_: diffusion_policy.model.roi.foveation_net.FoveationNet
     in_channels: 3
@@ -120,7 +121,8 @@ policy:
     # Random legal trees are also used during evaluation.
     # Uniform leaves: "level:1". Weighted window sampling (also during eval):
     # ["20%level:0", "25%level:1", "35%level:2", "20%random:0.25,0.5,0.75"]
-    # Weights sum to 100%; views/frames share the mode. Requires random_topology_prob=0.
+    # Weights sum to 100%; requires random_topology_prob=0.
+    # Each view samples independently; frames within a window share its tree.
     fix_split_mode: "random:0.0,0.25,0.5,0.75,1.0"
     random_topology_prob: 0.0
     budget_loss_weight: 0.0
@@ -129,7 +131,7 @@ policy:
     budget_base_cost_weight: 0.01
     budget_elu_tau: 0.025
 
-# Resize TCL's 240x320 frames to HxW=256x320?; no policy-side random crop.
+# Match the preprocessed TCL frames at HxW=256x320; no policy-side random crop.
 # Patch16 / three levels: 20 coarsest to 320 finest leaves per camera.
 image_shape: &image_shape [3, 256, 320]
 foveation_input_hw: [256, 320]
@@ -155,6 +157,10 @@ shape_meta:
 
 task:
   dataset:
+    norm:
+      state: identity
+      action: minmax
+      force: quantile
     _target_: diffusion_policy.dataset.tcl_dataset.TCLFoveationDataset
     shape_meta: ${shape_meta}
     horizon: ${horizon}
@@ -164,10 +170,9 @@ task:
     # Independent from training.seed; Stage B restores this and the episode lists.
     seed: 42
     val_ratio: 0.02
-    data_root: /home/geyuan/datasets/reverse/0209_tower_boby_easy_reversed/
-    h5_path: /home/geyuan/datasets/reverse/0209_tower_boby_easy_reversed_240p.h5
+    data_root: /home/geyuan/local_soft/TCL/260514_ethernet/
+    h5_path: /home/geyuan/local_soft/TCL/hdf5/260514_ethernet_256x320.h5
     use_h5: true
-    norm_force_type: quantile
     zero_force: false
     default_success_label: 1.0
     # CFGRL semantics: drop image, gripper and joint_state together; keep force/success.
@@ -187,7 +192,7 @@ task:
 training:
   seed: 42
   device: cuda:0
-  num_epochs: 1500
+  num_epochs: 1001
   gradient_accumulate_every: 1
   lr_scheduler: cosine
   lr_warmup_steps: 1000
@@ -197,7 +202,7 @@ training:
   downstream_finetune_start_epoch: null
   target_num_patches_start: null
   target_num_patches_decay_epochs: 200
-  budget_lambda_init: 0.0
+  budget_lambda_init: 0.0  # Same initial price, independently updated per camera.
   budget_lambda_lr: 0.01
   rollout_every: 50  # Offline full-episode videos; -1 disables.
   distributed_rollout: false
@@ -217,5 +222,7 @@ training:
 
 pretrained_ckpt: null
 pretrained_ckpt_mode: null
+# Initialize weights with current data/statistics; requires resume=false and router_only=false.
+pretrained_weights_only: false
 reuse_pretrained_dataset_config: false
 data_seed_from_ckpt: false

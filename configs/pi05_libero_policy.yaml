@@ -1,0 +1,15 @@
+# Policy-only config: no dataset, runner or SFT workspace is connected yet.
+_target_: diffusion_policy.policy.pi05_policy.Pi05Policy
+model_path: ???
+tokenizer_path: ???
+norm_stats_path: ???
+config:
+  dtype: bfloat16
+  action_dim: 32
+  action_horizon: 10
+  max_token_len: 200
+  num_steps: 5
+  n_action_steps: 5
+  discrete_state_input: false
+  extra_delta_transform: false
+  gradient_checkpointing: false

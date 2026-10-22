@@ -1,0 +1,43 @@
+_target_: diffusion_policy.env_runner.libero_socket_runner.LiberoSocketRunner
+_recursive_: false
+policy_family: pi05
+libero_root: ${libero_root}
+dataset_root: ${libero_root}/libero/datasets
+dataset_subname: libero_force_256/libero_10
+hdf5_fns:
+  - STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_demo_wrench.hdf5
+shape_meta:
+  obs:
+    image: {shape: [3, 256, 256], type: rgb}
+    gripper: {shape: [3, 256, 256], type: rgb}
+    joint_state: {shape: [8], type: low_dim}
+  action: {shape: [7]}
+n_obs_steps: 1
+n_action_steps: 5
+conda_env: libero
+conda_executable: null
+host: 127.0.0.1
+port: 0
+n_test: 8
+n_envs: 8
+max_steps: 520
+settle_steps: 15
+settle_gripper_action: -1.0
+seed: 42
+test_start_seed: 130000
+image_format: PNG
+save_video: true
+n_test_vis: 3
+fps: 20
+crf: 22
+log_patch_counts: false
+save_foveation_video: false
+foveation_vis_batch_size: 16
+auto_render_device: true
+egl_device_id: null
+render_gpu_device_id: null
+startup_timeout: 60
+request_timeout: 120
+eval_timeout: 7200
+shutdown_timeout: 30
+collect_inference_stats: false

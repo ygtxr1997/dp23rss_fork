@@ -1,0 +1,38 @@
+defaults:
+  - runner: pi05_libero
+  - _self_
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+runner:
+  collect_inference_stats: true
+
+# Raw simulation cameras are 256x256; Pi05Policy uses model.image_size from the
+# converted asset (224 for the baseline, or 56 for the low-resolution study).
+asset_dir: ~/pretrained/pi05/converted_libero
+checkpoint: null
+# Search repository outputs recursively for a unique run directory, then load checkpoints/<type>_ema.pt.
+# Multiple matching directories are an error, even without weights; explicit checkpoint takes priority.
+log_time: null  # YYYY-MM-DD-HH-MM-SS or YYYY-MM-DD/HH-MM-SS.
+checkpoint_type: best  # best or latest EMA; only used with log_time and no explicit checkpoint.
+all_tasks: false
+libero_root: ${oc.env:HOME}/code/LIBERO-FT
+device: cuda:0
+# The launcher supplies one timestamp shared by all evaluation ranks.
+eval_time: ${oc.env:PI05_EVAL_TIME,${now:%Y%m%d_%H%M%S}}
+output_dir: ${oc.env:PI05_EVAL_OUTPUT_DIR,outputs/pi05_libero_eval/${pi05_eval_name:${log_time},${eval_time},true}}
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false
+  output_subdir: null
+
+logging:
+  mode: online
+  project: diffusion_policy_libero
+  entity: null
+  name: ${pi05_eval_name:${log_time},${eval_time}}
+  group: null
+  tags: [pi05, evaluation]

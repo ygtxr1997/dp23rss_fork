@@ -1,0 +1,19 @@
+# Shared TCL statistics: sampled quantiles and full-data extrema/moments.
+data_roots: []
+h5_paths: []
+use_h5: true
+task_mapping_path: meta/tcl_tasks_10.yaml
+asset_dir: outputs/pi05_data/tcl_foveation_seed42
+horizon: 32
+state_dim: 6
+seed: 42
+val_ratio: 0.02
+stats_seed: 42
+stats_max_frames_per_task: 50000
+# Save all six force/torque statistics without adding force to model observations.
+prepare_force_stats: true
+hydra:
+  run:
+    dir: outputs/pi05_data_prepare/${now:%Y%m%d_%H%M%S}
+  job:
+    chdir: false

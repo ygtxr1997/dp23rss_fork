@@ -217,7 +217,7 @@ class PushTImageRunner(BaseImageRunner):
                         key: value_B_T_X[:, -1:]
                         for key, value_B_T_X in foveation_out.items()
                     }
-                    vis_B_T_H_W_C = policy.foveation_net.vis_ar_tokens(last_frame_out)
+                    vis_B_T_H_W_C = policy.foveation_net.nets['image'].vis_ar_tokens(last_frame_out)
                     counts_F[start:start + len(frame_indices_B)] = (
                         last_frame_out['num_patches_B_T'][:, 0].cpu().numpy()
                     )
@@ -226,8 +226,8 @@ class PushTImageRunner(BaseImageRunner):
                         frame_H_W_C = self._draw_patch_history(
                             frame_H_W_C, indices_F[:end], counts_F[:end],
                             int(indices_F[0]), int(indices_F[-1]),
-                            policy.foveation_net.min_num_patches,
-                            policy.foveation_net.max_num_patches,
+                            policy.foveation_net.nets['image'].min_num_patches,
+                            policy.foveation_net.nets['image'].max_num_patches,
                         )
                         recorder.write_frame(frame_H_W_C)
             finally:

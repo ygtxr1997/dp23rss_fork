@@ -25,14 +25,13 @@ from omegaconf import OmegaConf
 import uvicorn
 
 from diffusion_policy.common.foveation_video_util import render_foveation_episode_video
-from diffusion_policy.common.libero_task_util import LIBERO_TASK_NAMES, libero_task_id
-from diffusion_policy.dataset.libero_dataset import LiberoFTDataset
+from diffusion_policy.common.libero_task_util import LIBERO_TASK_NAMES, libero_task_id, libero_task_language
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from robokit.connects.protocols import StepRequestEvent, StepRequestFromEvaluator, StepRequestFromPolicy
 
 
 class LiberoSocketRunner(BaseImageRunner):
-    """Serve the current EMA and manage an external evaluator, never a local simulator."""
+    """Serve a policy and manage an external evaluator, never a local simulator."""
 
     def __init__(
         self, output_dir, libero_root, dataset_root, dataset_subname, hdf5_fns,
@@ -45,8 +44,18 @@ class LiberoSocketRunner(BaseImageRunner):
         log_patch_counts=False, save_foveation_video=False, n_test_vis=4,
         fps=20, crf=22, foveation_vis_batch_size=16, vis_rot_image=False,
         egl_device_ids=None, render_gpu_device_ids=None, auto_render_device=True,
+        policy_family="dp", save_video=False, settle_steps=5, settle_gripper_action=0.0,
+        render_image_orientation=None,
+        collect_inference_stats=False,
     ):
         super().__init__(output_dir)
+        if policy_family not in ("dp", "pi05"):
+            raise ValueError(f"Unknown policy family: {policy_family}")
+        self.policy_family = policy_family
+        # Legacy display arguments remain accepted; LIBERO always displays static rot180.
+        self.settle_steps = int(settle_steps)
+        self.settle_gripper_action = float(settle_gripper_action)
+        assert self.settle_steps > 0
         self.libero_root = str(Path(libero_root).expanduser().resolve())
         subnames = ([dataset_subname] * len(hdf5_fns)
                     if isinstance(dataset_subname, str) else list(dataset_subname))
@@ -64,9 +73,12 @@ class LiberoSocketRunner(BaseImageRunner):
         assert set(obs_meta) - {"task_id"} in ({"image", "joint_state"}, {"image", "gripper", "joint_state"})
         if self.use_task_id:
             assert obs_meta["task_id"] == {"shape": [10], "type": "low_dim"}
+        # Pi05 consumes integer task IDs even without DP's one-hot observation field.
+        if self.use_task_id or self.policy_family == "pi05":
             for task in self.tasks:
                 task["task_id"] = libero_task_id(task["name"])
-        assert list(obs_meta["joint_state"]["shape"]) == [6]
+        state_dim = 8 if self.policy_family == "pi05" else 6
+        assert list(obs_meta["joint_state"]["shape"]) == [state_dim]
         assert list(self.shape_meta["action"]["shape"]) == [7]
         self.image_keys = [key for key in ("image", "gripper") if key in obs_meta]
         camera_map = {"image": "agentview_image", "gripper": "robot0_eye_in_hand_image"}
@@ -74,10 +86,14 @@ class LiberoSocketRunner(BaseImageRunner):
         assert len(image_shape) == 3 and image_shape[0] == 3
         assert all(type(size) is int and size > 0 for size in image_shape[1:])
         assert all(list(obs_meta[key]["shape"]) == image_shape for key in self.image_keys)
-        # Render at the configured policy input size, overriding HDF5 camera metadata.
+        # shape_meta sets rendering size; pi0.5 resizes 256 -> 224 inside its policy.
         self.spec = dict(camera_names=[camera_map[key] for key in self.image_keys],
                          camera_hw=image_shape[1:], n_obs_steps=int(n_obs_steps),
-                         state_dim=6, action_dim=7, max_cache_action=int(n_action_steps))
+                         state_dim=state_dim, action_dim=7, max_cache_action=int(n_action_steps))
+        if self.policy_family == "pi05":
+            assert self.image_keys == ["image", "gripper"] and not self.use_task_id
+            assert int(n_obs_steps) == 1 and int(n_action_steps) == 5
+            self.spec["state_layout"] = "eef_rotvec_gripper"
         self.conda_env, self.conda_executable = conda_env, conda_executable
         self.host, self.port = host, int(port)
         self.n_test, self.max_steps = int(n_test), int(max_steps)
@@ -101,18 +117,29 @@ class LiberoSocketRunner(BaseImageRunner):
         assert min(startup_timeout, request_timeout, eval_timeout, shutdown_timeout) > 0
         self.log_patch_counts = bool(log_patch_counts)
         self.save_foveation_video = bool(save_foveation_video)
+        self.save_video = bool(save_video)
         self.n_test_vis, self.fps, self.crf = int(n_test_vis), int(fps), int(crf)
         self.foveation_vis_batch_size = int(foveation_vis_batch_size)
-        self.vis_rot_image = bool(vis_rot_image)
+        self.collect_inference_stats = bool(collect_inference_stats)
         assert self.n_test_vis >= 0 and self.fps > 0 and self.foveation_vis_batch_size > 0
         self.dataset_metadata = None
+        self.epoch, self.global_step = 0, 0
+        self.weights = "ema"
+        self.checkpoint_metadata = {}
 
-    def set_context(self, dataset_metadata, epoch, global_step):
-        """Bind checkpointed preprocessing and identify the current EMA evaluation."""
+    def _render_rotation_keys(self, policy):
+        """Align raw and policy-rendered static frames to raw RGB rotated 180 degrees."""
+        tree_keys = ("image",) if policy.render_image_orientation == "raw" else ()
+        return ("image",), tree_keys
+
+    def set_context(self, dataset_metadata, epoch, global_step, *, weights="ema", checkpoint_metadata=None):
+        """Bind preprocessing and identify the actual weights used in evaluation."""
         if self.use_task_id and dataset_metadata["contract"].get("task_id_names") != list(LIBERO_TASK_NAMES):
             raise ValueError("LIBERO task identity mapping differs from checkpoint")
         self.dataset_metadata = copy.deepcopy(dataset_metadata)
         self.epoch, self.global_step = int(epoch), int(global_step)
+        self.weights = weights
+        self.checkpoint_metadata = copy.deepcopy(checkpoint_metadata or {})
 
     def configure_distributed(self, rank, local_rank, world_size):
         """Select automatic matching or explicit per-rank rendering devices."""
@@ -173,12 +200,36 @@ class LiberoSocketRunner(BaseImageRunner):
         assert raw["num_camera_views"] == len(self.image_keys)
         assert video_B_VT_H_W_C.shape == (batch_size, len(self.image_keys) * n_obs, height, width, 3)
         state_B_T_D = raw["tcp_state"]
-        assert state_B_T_D is not None and state_B_T_D.shape == (batch_size, n_obs, 6)
-        obs = self._prepare_policy_obs(video_B_VT_H_W_C, state_B_T_D, policy, task_id)
+        expected_shape = (batch_size, n_obs, self.spec["state_dim"])
+        actual_shape = None if state_B_T_D is None else state_B_T_D.shape
+        if actual_shape != expected_shape:
+            hint = (" pi0.5 requires xyz + rotvec + two gripper qpos; a 6D state usually means "
+                    "the evaluator still uses the DP layout. Sync libero/force/force_benchmark.py "
+                    "and eval_socket.py in the evaluator repository."
+                    if self.policy_family == "pi05" else "")
+            raise ValueError(
+                f"Evaluator tcp_state shape mismatch: received {actual_shape}, expected {expected_shape}; "
+                f"policy_family={self.policy_family}, libero_root={self.libero_root}.{hint}")
+        obs = self._prepare_policy_obs(video_B_VT_H_W_C, state_B_T_D, policy, task_id,
+                                       instruction=raw["instruction"])
+        if self.collect_inference_stats:
+            if policy.device.type != "cuda":
+                raise ValueError("Inference statistics require a CUDA policy")
+            torch.cuda.synchronize(policy.device)
+            torch.cuda.reset_peak_memory_stats(policy.device)
+            started = time.perf_counter()
         prediction = policy.predict_action(obs, return_foveation_outputs=self.log_patch_counts)
+        if self.collect_inference_stats:
+            torch.cuda.synchronize(policy.device)
+            self._inference_stats["latency_ms"].append((time.perf_counter() - started) * 1000.0)
+            self._inference_stats["memory_gib"].append(
+                torch.cuda.max_memory_allocated(policy.device) / (1024 ** 3))
         action_B_K_D = prediction["action"].detach().cpu().numpy()
-        action_B_K_D = LiberoFTDataset.unnormalize_action(
-            action_B_K_D, self.dataset_metadata["statistics"]["action.actions"])
+        if self.policy_family == "dp":
+            from diffusion_policy.dataset.libero_dataset import LiberoFTDataset
+
+            action_B_K_D = LiberoFTDataset.unnormalize_action(
+                action_B_K_D, self.dataset_metadata["statistics"]["action.actions"])
         assert action_B_K_D.shape == (batch_size, self.spec["max_cache_action"], 7)
         assert np.isfinite(action_B_K_D).all(), "Non-finite policy action"
         response = StepRequestFromPolicy.encode_from_raw(
@@ -193,7 +244,17 @@ class LiberoSocketRunner(BaseImageRunner):
             }
         return response
 
-    def _prepare_policy_obs(self, video_B_VT_H_W_C, state_B_T_D, policy, task_id):
+    def _prepare_policy_obs(self, video_B_VT_H_W_C, state_B_T_D, policy, task_id, instruction=None):
+        if self.policy_family == "pi05":
+            if not isinstance(instruction, str) or not instruction.strip():
+                raise ValueError("pi0.5 requires the benchmark task language")
+            # Keep raw uint8 RGB on CPU; the policy owns resize, orientation and normalization.
+            return dict(image=video_B_VT_H_W_C[:, 0], gripper=video_B_VT_H_W_C[:, 1],
+                        joint_state=state_B_T_D[:, 0], task_id=np.full(
+                            (len(state_B_T_D),), int(task_id), dtype=np.int64),
+                        prompt=[instruction] * len(state_B_T_D))
+        from diffusion_policy.dataset.libero_dataset import LiberoFTDataset
+
         # Online requests and recorded windows share the same normalization.
         n_obs = self.spec["n_obs_steps"]
         obs = {}
@@ -209,7 +270,33 @@ class LiberoSocketRunner(BaseImageRunner):
             obs["task_id"] = task_B_T_C
         return obs
 
-    def _render_episode(self, policy, episode, media_dir, task_id):
+    def _render_raw_episode(self, episode, media_dir):
+        from diffusion_policy.real_world.video_recorder import VideoRecorder
+
+        path = Path(episode["observation_path"])
+        video_path = media_dir / f"episode_{episode['episode']:04d}_seed_{episode['seed']}.mp4"
+        recorder = VideoRecorder.create_h264(fps=self.fps, crf=self.crf,
+                                              thread_type="FRAME", thread_count=1)
+        with np.load(path) as recording:
+            frames = [recording[name] for name in self.spec["camera_names"]]
+            assert all(len(frames_F_H_W_C) == episode["steps"] + 1 for frames_F_H_W_C in frames)
+            recorder.start(str(video_path))
+            try:
+                for index in range(episode["steps"] + 1):
+                    # Recorded frames are raw; wrist always keeps its original orientation.
+                    views = [frames_F_H_W_C[index] for frames_F_H_W_C in frames]
+                    views = [frame_H_W_C[::-1, ::-1] if key == "image" else frame_H_W_C
+                             for key, frame_H_W_C in zip(self.image_keys, views)]
+                    recorder.write_frame(np.ascontiguousarray(np.concatenate(views, axis=1)))
+            finally:
+                recorder.stop()
+        episode["video_path"] = str(video_path)
+        path.unlink()
+        episode.pop("observation_path")
+        caption = f"episode={episode['episode']}, seed={episode['seed']}, success={episode['success']}"
+        return {f"test/sim_video_{episode['seed']}": dict(path=str(video_path), format="mp4", caption=caption)}
+
+    def _render_episode(self, policy, episode, media_dir, task_id, *, instruction):
         path = Path(episode["observation_path"])
         camera_map = {"image": "agentview_image", "gripper": "robot0_eye_in_hand_image"}
         with np.load(path) as recording:
@@ -233,13 +320,15 @@ class LiberoSocketRunner(BaseImageRunner):
             video_B_VT_H_W_C = np.concatenate(
                 [frames[key][windows_B_T] for key in self.image_keys], axis=1)
             obs = self._prepare_policy_obs(
-                video_B_VT_H_W_C, states_F_D[windows_B_T], policy, task_id)
+                video_B_VT_H_W_C, states_F_D[windows_B_T], policy, task_id,
+                instruction=instruction)
             return obs, {key: frames[key][indices_B] for key in self.image_keys}
 
+        raw_rotate_keys, tree_rotate_keys = self._render_rotation_keys(policy)
         render_foveation_episode_video(
             policy, self.image_keys, frame_count, get_batch, raw_path, tree_path,
             batch_size=self.foveation_vis_batch_size, fps=self.fps, crf=self.crf,
-            rotate_keys=("image",) if self.vis_rot_image else ())
+            raw_rotate_keys=raw_rotate_keys, tree_rotate_keys=tree_rotate_keys)
         caption = f"episode={episode['episode']}, seed={seed}, success={episode['success']}"
         videos = {
             f"test/sim_video_{seed}": dict(path=str(raw_path), format="mp4", caption=caption),
@@ -297,7 +386,7 @@ class LiberoSocketRunner(BaseImageRunner):
         deadline = time.monotonic() + self.eval_timeout
         task_label = task_name if len(task_name) <= 25 else task_name[:22] + "..."
         # The HTTP thread reports episode ends; only the training thread draws tqdm.
-        with tqdm(total=self.n_test, desc=f"LIBERO EMA epoch={self.epoch} task={task_label}",
+        with tqdm(total=self.n_test, desc=f"LIBERO {self.weights} epoch={self.epoch} task={task_label}",
                   unit="episode", mininterval=1.0) as progress:
             while True:
                 returncode = process.poll()
@@ -379,7 +468,7 @@ class LiberoSocketRunner(BaseImageRunner):
         task_indices = list(task_indices)
         if not task_indices:
             return []
-        if self.dataset_metadata is None:
+        if self.policy_family == "dp" and self.dataset_metadata is None:
             raise ValueError("Set LIBERO dataset metadata before evaluation")
         conda = self.conda_executable or os.environ.get("CONDA_EXE") or shutil.which("conda")
         if not conda:
@@ -394,6 +483,7 @@ class LiberoSocketRunner(BaseImageRunner):
                 n_episodes=len(results["episodes"]),
                 n_success=sum(int(episode["success"]) for episode in results["episodes"]),
                 patch_views=results["patch_counts"]["views"] if self.log_patch_counts else {},
+                inference_stats=self._inference_stats if self.collect_inference_stats else {},
             ))
         return payloads
 
@@ -431,6 +521,19 @@ class LiberoSocketRunner(BaseImageRunner):
         n_episodes = sum(task["n_episodes"] for task in task_summaries.values())
         n_success = sum(task["n_success"] for task in task_summaries.values())
         log.update({"test/mean_score": n_success / n_episodes, "test/n_episodes": n_episodes})
+        if self.collect_inference_stats:
+            latency_ms = [value for payload in payloads
+                          for value in payload["inference_stats"]["latency_ms"]]
+            memory_gib = [value for payload in payloads
+                          for value in payload["inference_stats"]["memory_gib"]]
+            if not latency_ms:
+                raise RuntimeError("No policy inference samples were collected")
+            log.update({
+                "test/action_pred_latency_ms": float(np.mean(latency_ms)),
+                "test/action_pred_latency_p95_ms": float(np.percentile(latency_ms, 95)),
+                "test/memory_peak": float(np.mean(memory_gib)),
+                "test/memory_peak_p95": float(np.percentile(memory_gib, 95)),
+            })
         if self.log_patch_counts:
             # Weight by actual observations: tasks can have different episode lengths.
             for key, view in patch_totals.items():
@@ -441,6 +544,7 @@ class LiberoSocketRunner(BaseImageRunner):
             log["test/total_num_patches_mean"] = sum(
                 log[f"test/num_patches_mean_{key}"] for key in patch_totals)
         summary = dict(epoch=self.epoch, global_step=self.global_step, tasks=task_summaries,
+                       weights=self.weights, checkpoint=self.checkpoint_metadata,
                        n_episodes=n_episodes, n_success=n_success, mean_score=log["test/mean_score"])
         summary_path = self._eval_dir() / "summary.json"
         temporary_path = summary_path.with_suffix(".tmp.json")
@@ -460,6 +564,7 @@ class LiberoSocketRunner(BaseImageRunner):
         was_training = policy.training
         process = server = thread = listener = None
         completed_episodes = SimpleQueue()
+        self._inference_stats = {"latency_ms": [], "memory_gib": []}
         try:
             random.seed(self.seed)
             np.random.seed(self.seed)
@@ -490,13 +595,15 @@ class LiberoSocketRunner(BaseImageRunner):
                 n_test=self.n_test, n_envs=self.n_envs, max_steps=self.max_steps, seed=self.seed,
                 test_start_seed=self.test_start_seed, image_format=self.image_format,
                 request_timeout=self.request_timeout, epoch=self.epoch, rank=self.rank,
-                global_step=self.global_step, weights="ema", policy_config=self.policy_config,
+                global_step=self.global_step, weights=self.weights, policy_config=self.policy_config,
+                policy_family=self.policy_family, checkpoint=self.checkpoint_metadata,
+                settle_steps=self.settle_steps, settle_gripper_action=self.settle_gripper_action,
                 render_gpu_device_id=self.render_gpu_device_id,
                 render_device_pci_bus_id=render_identity.get("pci_bus_id"),
                 render_device_uuid=render_identity.get("gpu_uuid"),
                 log_patch_counts=self.log_patch_counts,
-                observation_dir=str(eval_dir / "observations") if self.save_foveation_video else None,
-                n_test_vis=self.n_test_vis if self.save_foveation_video else 0,
+                observation_dir=str(eval_dir / "observations") if self.save_video or self.save_foveation_video else None,
+                n_test_vis=self.n_test_vis if self.save_video or self.save_foveation_video else 0,
             )
             evaluator_env = self._evaluator_environment()
             config["render_environment"] = {
@@ -508,7 +615,7 @@ class LiberoSocketRunner(BaseImageRunner):
             config_path.write_text(json.dumps(config, indent=2))
             command = [conda, "run", "--no-capture-output", "-n", self.conda_env,
                        "python", "-u", "eval_socket.py", "--eval-config", str(config_path)]
-            print(f"[LiberoSocketRunner] rank={self.rank}, task={task['name']}, EMA epoch={self.epoch}, n_envs={self.n_envs}, API={policy_url}, log={eval_dir / 'evaluator.log'}")
+            print(f"[LiberoSocketRunner] rank={self.rank}, task={task['name']}, weights={self.weights}, epoch={self.epoch}, n_envs={self.n_envs}, API={policy_url}, log={eval_dir / 'evaluator.log'}")
             print(f"[LiberoSocketRunner] policy_device={policy.device}, target_device={render_identity}, render_environment={config['render_environment']}, render_gpu_device_id={self.render_gpu_device_id}")
             with (eval_dir / "evaluator.log").open("w") as log_file:
                 process = subprocess.Popen(
@@ -525,6 +632,7 @@ class LiberoSocketRunner(BaseImageRunner):
             assert [item["episode"] for item in episodes] == list(range(self.n_test))
             assert results["epoch"] == self.epoch and results["global_step"] == self.global_step
             assert results.get("n_envs", 1) == self.n_envs
+            assert results["weights"] == self.weights
             log = {"test/mean_score": float(np.mean([item["success"] for item in episodes])),
                    "test/n_episodes": len(episodes)}
             if self.log_patch_counts:
@@ -558,15 +666,25 @@ class LiberoSocketRunner(BaseImageRunner):
                 torch.set_rng_state(torch_rng_N)
                 if cuda_rng_N is not None:
                     torch.cuda.set_rng_state(cuda_rng_N, policy.device)
-        if self.save_foveation_video:
+        if self.save_video or self.save_foveation_video:
             media_dir = eval_dir / "media"
             media_dir.mkdir(parents=True, exist_ok=True)
+            # Recorded frames omit language; recover the same benchmark prompt used by the dataset.
+            instruction = (libero_task_language(task["name"])
+                           if self.save_foveation_video and self.policy_family == "pi05" else None)
             policy.eval()
             try:
                 for episode in episodes[:self.n_test_vis]:
-                    log.update(self._render_episode(policy, episode, media_dir, task.get("task_id")))
+                    if self.save_foveation_video:
+                        log.update(self._render_episode(
+                            policy, episode, media_dir, task.get("task_id"), instruction=instruction))
+                    else:
+                        log.update(self._render_raw_episode(episode, media_dir))
             finally:
                 policy.train(was_training)
                 random.setstate(python_state)
                 np.random.set_state(numpy_state)
+            temporary_path = result_path.with_suffix(".tmp.json")
+            temporary_path.write_text(json.dumps(results, indent=2))
+            temporary_path.replace(result_path)
         return results, log

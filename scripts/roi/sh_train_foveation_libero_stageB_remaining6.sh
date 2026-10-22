@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Requires new per-camera Stage A weights with the same ordered RGB keys.
+# Paired samples one camera per window/pair; ELU budgets and lambdas are per camera.
 # Run Stage B sequentially from Stage A log times, inheriting each task.dataset.
 # Fill LOG_TIMES below, then run: bash scripts/roi/sh_train_foveation_libero_stageB_remaining6.sh
 # Environment variables override defaults; trailing Hydra arguments reach every run.

@@ -1,0 +1,35 @@
+{
+  "rlinf_commit": "c70606f08cdca259b8dec03d4430926b5b8fac9d",
+  "openpi_reference": {
+    "distribution": "rlinf-openpi",
+    "version": "0.1.1",
+    "wheel_sha256": "e7b8e6e61d575487bce63e89dee5e7af7834904ee07152bcbbd5b58c06e4c47d",
+    "git_commit": null,
+    "git_commit_note": "The wheel does not identify its source commit; do not substitute a floating OpenPI checkout.",
+    "wheel_url": "https://files.pythonhosted.org/packages/61/68/10fe7fa94cc4469599081343acef14db5af05f2a3f40cd7aa7f319364250/rlinf_openpi-0.1.1-py3-none-any.whl",
+    "source_sha256": {
+      "models/tokenizer.py": "965be8b3c393a6811875bbc32da9e01a5d01cc2f87802de801cf7293e049748c",
+      "transforms.py": "a1b94e9e72849a18834778f229c6bb389a495eb7fbe0aa800edea728b9424ff4",
+      "shared/image_tools.py": "0f8fcb355288119e56acb56d550c1cc1f3a9edddceb0dc5b319f955943ef7767",
+      "training/config.py": "b54b77a123537bcb304ffe4ad3ed191ee065890f8d7d6a0973d13a0231b93cec"
+    }
+  },
+  "source_sha256": {
+    "siglip.py": "a5c54299435969bf200b80618a6e6a4b85b4f93792ea9c2869073782903d53b3",
+    "core.py": "76c3853aee552c8ccbc99e5e782359e993df069b083c67ef197da0e6ae7831ba",
+    "jax.py": "9ef46403f53cd84fec3222a018a51c5dcd06bcc75c34969ac767dd75491ef0aa",
+    "model.py": "21d851802c1576c6f3f4bcb1a9a58b7a3f5a08a966c43208f29f682ff0315ab2",
+    "pi0.py": "ad69c5fd5f5e65e5cc947d6be384e1354c8aa33f1d4db187d6f5da279f46523b",
+    "gemma.py": "33ffecc20b3655e1e99d39d3b20cf78c34ad529a8a8391f4c3a2a68f533ed6e6",
+    "optim.py": "ffbd3ffced30212800cdb5c510fc9f8e7d7466c36c13f94894fdc2c24fcdbb10"
+  },
+  "source_paths": {
+    "pi0.py": "rlinf/models/embodiment/openpi/pi0.py",
+    "gemma.py": "rlinf/models/embodiment/openpi/modules/gemma.py",
+    "siglip.py": "rlinf/models/embodiment/openpi/modules/siglip.py",
+    "model.py": "rlinf/models/embodiment/openpi/modules/model.py",
+    "jax.py": "rlinf/utils/ckpt_convertor/openpi/jax_to_openpi.py",
+    "core.py": "rlinf/utils/ckpt_convertor/openpi/_core.py",
+    "optim.py": "rlinf/hybrid_engines/fsdp/optim.py"
+  }
+}

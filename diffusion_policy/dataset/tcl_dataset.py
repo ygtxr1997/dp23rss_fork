@@ -2,10 +2,10 @@ import os
 import copy
 import bisect
 import json
+from pathlib import Path
 import numpy as np
 import torch
-import torch.nn.functional as F
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 from torch.utils.data import ConcatDataset, default_collate
 from omegaconf import OmegaConf
 from torchvision.transforms import transforms
@@ -16,6 +16,11 @@ from robokit.debug_utils.printer import print_batch
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
 from diffusion_policy.dataset.libero_dataset import RandomShiftsAug as LiberoRandomShiftsAug, VideoTransformTHWC
+from diffusion_policy.common.tcl_task_util import load_tcl_task_mapping
+from diffusion_policy.common.tcl_image_util import prepare_tcl_rgb, resolve_tcl_image_geometry
+from diffusion_policy.common.tcl_data_util import (
+    DP_NORM, PI05_NORM, action_bounds, require_same_bounds, make_normalization, norm_methods, transform_values,
+)
 
 
 class RandomShiftsAug(LiberoRandomShiftsAug):
@@ -295,6 +300,8 @@ class TCLImageDataset(BaseImageDataset):
             primary_rgb = self.obs_image_transform(primary_rgb)
             primary_rgb = primary_rgb * 2. - 1.
 
+            if hasattr(self, "normalization"):
+                tcp_pose = self.normalize(tcp_pose, "state")
             tcp_pose = torch.from_numpy(tcp_pose).to(torch.float32)
 
             if "gripper" in obs_keys:
@@ -303,11 +310,9 @@ class TCLImageDataset(BaseImageDataset):
 
             if "force" in obs_keys:
                 force_torque = batch["force_torque"][t]
-                force_torque = self.norm_state_or_force(
-                    force_torque,
-                    self.norm_force_type,
-                    self.dataset_stats["force_torque"],
-                )
+                force_torque = (self.normalize(force_torque, "force") if hasattr(self, "normalization")
+                                else self.norm_state_or_force(force_torque, self.norm_force_type,
+                                                              self.dataset_stats["force_torque"]))
                 force_torque = torch.from_numpy(force_torque).to(torch.float32)
 
             drop_all_cond = bool(torch.rand(1).item() < self.p_cond_drop)
@@ -376,6 +381,8 @@ class TCLImageDataset(BaseImageDataset):
         ]
 
         act_data = self.all_rel_actions[padded_indices].astype(np.float32)  # (T, action_dim)
+        if hasattr(self, "normalization"):
+            return self.normalize(act_data, "action")
 
         act_data = (act_data - self.dataset_action_min) / (
                 self.dataset_action_max - self.dataset_action_min
@@ -411,7 +418,7 @@ class TCLImageDataset(BaseImageDataset):
         return out_data
 
 
-class TCLFoveationDataset(TCLImageDataset):
+class _SingleSourceTCLFoveationDataset(TCLImageDataset):
     """Episode-disjoint TCL windows with checkpointed splits and full video access."""
 
     def __init__(self, *, dataset_metadata=None, split="train", **kwargs):
@@ -564,6 +571,438 @@ class TCLFoveationDataset(TCLImageDataset):
             torch.random.default_generator.manual_seed(seed)
             batch = default_collate([self._get_single_window(int(i)) for i in indices_B])
         yield 0, batch
+
+
+def _tcl_text(value) -> str:
+    """Convert a RoboKit scalar language field to a Python string."""
+    if isinstance(value, (bytes, np.bytes_)):
+        return value.decode("utf-8")
+    if isinstance(value, np.ndarray):
+        return _tcl_text(value.reshape(-1)[0])
+    return str(value)
+
+
+class TCLFoveationDataset(_SingleSourceTCLFoveationDataset):
+    """Canonical TCL foveation dataset for both DP and Pi0.5 raw inputs."""
+
+    def __init__(self, *, output_mode="normalized", data_roots=None, h5_paths=None,
+                 data_root=None, h5_path=None, task_mapping_path="meta/tcl_tasks_10.yaml",
+                 asset_dir=None, state_dim=6, stats_seed=42,
+                 stats_max_frames_per_task=50000, pairing_seed=42,
+                 dataset_metadata=None, split="train", temporal_pairing=False,
+                 action_min=None, action_max=None, use_h5=True, norm=None,
+                 image_resize_wh_ratio=None, **kwargs):
+        # Hydra wraps checkpoint metadata in DictConfig; keep both source paths JSON serializable.
+        if OmegaConf.is_config(dataset_metadata):
+            dataset_metadata = OmegaConf.to_container(dataset_metadata, resolve=True)
+        self.output_mode = str(output_mode)
+        if self.output_mode not in ("normalized", "raw"):
+            raise ValueError("TCLFoveationDataset output_mode must be normalized or raw")
+        self._multi_source = data_roots is not None or self.output_mode == "raw"
+        defaults = PI05_NORM if self.output_mode == 'raw' else DP_NORM
+        saved_norm = dataset_metadata.get('normalization') if dataset_metadata is not None else None
+        self.norm = norm_methods(saved_norm['methods'] if norm is None and saved_norm else norm, defaults)
+        legacy_force = kwargs.get("norm_force_type")
+        if legacy_force is not None:
+            legacy_force = 'mean_std' if legacy_force == 'mean' else legacy_force
+            if norm is not None and 'force' in norm and self.norm['force'] != legacy_force:
+                raise ValueError("norm.force conflicts with norm_force_type")
+            self.norm['force'] = legacy_force
+        checkpoint_metadata = dataset_metadata is not None
+        if dataset_metadata is None and asset_dir is not None:
+            dataset_metadata = json.loads((Path(asset_dir).expanduser() / 'dataset_metadata.json').read_text())
+        if not self._multi_source:
+            if dataset_metadata is not None and isinstance(dataset_metadata.get('sources'), list):
+                raise ValueError('Multi-source TCL assets require data_roots/h5_paths; single-source splits are episode based')
+            super().__init__(dataset_metadata=dataset_metadata, split=split,
+                             data_root=data_root, h5_path=h5_path, use_h5=use_h5, **kwargs)
+            self.state_dim, self.action_dim = 6, int(self.action_shape[0])
+            if action_min is not None or action_max is not None:
+                explicit = action_bounds(dict(action_min=action_min, action_max=action_max), self.action_dim)
+                if dataset_metadata is not None:
+                    require_same_bounds(action_bounds(self.dataset_metadata, self.action_dim), explicit,
+                                        'TCL explicit action bounds')
+                self.dataset_metadata['statistics']['rel_actions'].update(
+                    min=explicit[0].tolist(), max=explicit[1].tolist())
+                self.dataset_action_min, self.dataset_action_max = explicit
+            self._configure_normalization(legacy_single=(checkpoint_metadata and
+                                          'normalization' not in self.dataset_metadata))
+            return
+        if state_dim not in (6, 7):
+            raise ValueError("TCL TCLFoveationDataset state_dim must be 6 or 7")
+        roots = list(data_roots) if data_roots is not None else [data_root]
+        paths = list(h5_paths) if h5_paths is not None else [h5_path]
+        if len(roots) != len(paths) or not roots:
+            raise ValueError("data_roots and h5_paths must be nonempty and same length")
+        self.state_dim, self.horizon = int(state_dim), int(kwargs.get("horizon", 32))
+        self.seed, self.val_ratio = int(kwargs.get("seed", 42)), float(kwargs.get("val_ratio", 0.02))
+        self.stats_seed = int(stats_seed)
+        self.stats_max_frames_per_task = int(stats_max_frames_per_task)
+        self.split = str(split)
+        self.mapping_path = str(task_mapping_path)
+        # Multi-source TCL always emits one observation step; keep this contract
+        # available before metadata is created or validated.
+        self.n_obs_steps = 1
+        self.shape_meta = (OmegaConf.to_container(kwargs["shape_meta"], resolve=True)
+                           if OmegaConf.is_config(kwargs.get("shape_meta"))
+                           else copy.deepcopy(kwargs.get("shape_meta", {
+                               "obs": {}, "action": {"shape": [7]}})))
+        self.image_resize_hw = resolve_tcl_image_geometry(self.shape_meta, image_resize_wh_ratio)
+        action_shape = self.shape_meta.get("action", {}).get("shape", [7])
+        if len(action_shape) != 1:
+            raise ValueError("TCL action shape must be one-dimensional")
+        self.action_dim = int(action_shape[0])
+        self.zero_force = bool(kwargs.get("zero_force", False))
+        self.force_keys = [key for key in ("force", "force_torque") if key in self.shape_meta["obs"]]
+        self.contract = dict(horizon=self.horizon, n_obs_steps=self.n_obs_steps,
+                             state_dim=self.state_dim, action_dim=self.action_dim)
+        self.task_mapping = load_tcl_task_mapping(self.mapping_path)
+        self.temporal_pairing_enabled = bool(temporal_pairing and split == "train")
+        self.temporal_pairing_seed, self.temporal_pairing_epoch = int(pairing_seed), 0
+        self.sources, self.episode_records = [], []
+        self._source_frame_offsets, total_frames = [], 0
+        load_keys = ["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text"]
+        if self.force_keys:
+            load_keys.append("force_torque")
+        for source_id, (root, path) in enumerate(zip(roots, paths)):
+            root = str(os.path.abspath(os.path.expanduser(root)))
+            path = (str(os.path.abspath(os.path.expanduser(path))) if use_h5 else None)
+            task_dir = os.path.basename(os.path.normpath(root))
+            if task_dir not in self.task_mapping:
+                raise ValueError(f"TCL task_dir {task_dir!r} is missing from {self.mapping_path}")
+            loader = (TCLDatasetHDF5(root, path, use_extracted=True, load_keys=load_keys)
+                      if use_h5 else TCLDataset(root, use_extracted=True, load_keys=load_keys))
+            lengths = [int(length) for length in loader.task_lengths]
+            source = dict(root=root, h5_path=path, task_dir=task_dir,
+                          task_id=int(self.task_mapping[task_dir]), loader=loader,
+                          total_len=int(len(loader)), task_lengths=lengths)
+            self.sources.append(source)
+            self._source_frame_offsets.append(total_frames)
+            local = 0
+            for episode_id, length in enumerate(lengths):
+                self.episode_records.append(dict(source_id=source_id, episode_id=episode_id,
+                                                 global_start=total_frames + local,
+                                                 global_end=total_frames + local + length))
+                local += length
+            if local != source["total_len"]:
+                raise ValueError("TCL source episode lengths do not cover all frames")
+            total_frames += source["total_len"]
+        self.total_frames = total_frames
+        expected_sources = [dict(root=s["root"], h5_path=s["h5_path"], task_dir=s["task_dir"],
+                                 task_id=s["task_id"], total_len=s["total_len"])
+                            for s in self.sources]
+        metadata = copy.deepcopy(dataset_metadata)
+        if metadata is None and asset_dir is not None:
+            metadata_path = Path(asset_dir).expanduser() / "dataset_metadata.json"
+            metadata = json.loads(metadata_path.read_text())
+        supplied_metadata = metadata is not None
+        if metadata is None:
+            if not 0.0 < self.val_ratio < 1.0:
+                raise ValueError("TCL val_ratio must be in (0, 1)")
+            count = max(1, int(round(total_frames * self.val_ratio)))
+            val_indices = np.sort(np.random.RandomState(self.seed).choice(
+                total_frames, count, replace=False)).tolist()
+            metadata = dict(version=2, sources=expected_sources,
+                            task_mapping=self.task_mapping, state_dim=self.state_dim,
+                            horizon=self.horizon, seed=self.seed, val_ratio=self.val_ratio,
+                            stats_seed=self.stats_seed,
+                            stats_max_frames_per_task=self.stats_max_frames_per_task,
+                            contract=self.contract,
+                            val_indices=val_indices)
+        metadata_contract = metadata.get("contract")
+        if metadata_contract is None:
+            raise ValueError(
+                "TCL dataset metadata is missing the required contract. "
+                "Regenerate the asset with scripts/pi05/prepare_tcl_data.sh "
+                "using the fixed TCL dataset code."
+            )
+        for key, expected in self.contract.items():
+            if metadata_contract.get(key) != expected:
+                raise ValueError(
+                    f"TCL dataset metadata contract differs for {key}: "
+                    f"{expected!r} != {metadata_contract.get(key)!r}"
+                )
+        for key, expected in (("sources", expected_sources), ("task_mapping", self.task_mapping),
+                              ("state_dim", self.state_dim), ("horizon", self.horizon)):
+            saved = metadata.get(key)
+            if key == "sources" and saved is not None:
+                # Compare symlink targets without rewriting saved provenance or task names.
+                saved, expected = copy.deepcopy(saved), copy.deepcopy(expected)
+                for sources in (saved, expected):
+                    for source in sources:
+                        for path_key in ("root", "h5_path"):
+                            if source.get(path_key) is not None:
+                                source[path_key] = os.path.realpath(os.path.expanduser(source[path_key]))
+            if saved != expected:
+                metadata_source = ("checkpoint metadata" if checkpoint_metadata else
+                                   str(Path(asset_dir).expanduser() / "dataset_metadata.json")
+                                   if asset_dir is not None else "local data")
+                raise ValueError(
+                    f"TCL dataset metadata differs for {key} ({metadata_source}): "
+                    f"saved={saved!r}; current={expected!r}")
+        self.dataset_metadata = metadata
+        self.val_indices = np.asarray(metadata["val_indices"], dtype=np.int64)
+        self.indices = np.arange(total_frames, dtype=np.int64) if split == "train" else self.val_indices
+        bounds = action_bounds(metadata, self.action_dim, required=(
+            supplied_metadata and self.output_mode == "normalized" and self.norm["action"] == "minmax"))
+        if action_min is not None or action_max is not None:
+            explicit = action_bounds({"action_min": action_min, "action_max": action_max}, self.action_dim)
+            if bounds is not None:
+                require_same_bounds(bounds, explicit, "TCL explicit action bounds")
+            bounds = explicit
+        if bounds is None and self.output_mode == "normalized" and not supplied_metadata and self.norm["action"] == "minmax":
+            # Legacy callers without assets compute full-source bounds once.
+            for source in self.sources:
+                actions_N_D = np.asarray(source["loader"].extracted_data["rel_actions"], dtype=np.float32)
+                if actions_N_D.ndim != 2 or actions_N_D.shape[1] != self.action_dim or not np.isfinite(actions_N_D).all():
+                    raise ValueError("TCL extracted actions must be finite [N, action_dim]")
+                low_D, high_D = actions_N_D.min(axis=0), actions_N_D.max(axis=0)
+                bounds = (low_D, high_D) if bounds is None else (
+                    np.minimum(bounds[0], low_D), np.maximum(bounds[1], high_D))
+        if bounds is not None:
+            self.dataset_action_min, self.dataset_action_max = bounds
+            metadata.setdefault("statistics", {}).setdefault("actions", {}).update(
+                min=bounds[0].tolist(), max=bounds[1].tolist())
+        if self.output_mode == "normalized":
+            if checkpoint_metadata and 'normalization' not in metadata and self.norm != DP_NORM:
+                raise ValueError('Cannot change normalization when loading a legacy TCL checkpoint')
+            self._configure_normalization()
+        source = "checkpoint metadata" if checkpoint_metadata else (str(asset_dir) if asset_dir else "local data")
+        print(f"[TCL dataset] statistics={source}; output={self.output_mode}; norm={self.norm}")
+
+    def _configure_normalization(self, legacy_single=False):
+        dimensions = dict(state=6, action=self.action_dim)
+        if any(key in self.shape_meta['obs'] for key in ('force', 'force_torque')):
+            dimensions['force'] = 6
+        if legacy_single:
+            legacy_methods = dict(DP_NORM, force=self.norm_force_type)
+            if norm_methods(legacy_methods, DP_NORM) != self.norm:
+                raise ValueError('Cannot change normalization when loading a legacy TCL checkpoint')
+        self.normalization = make_normalization(
+            self.dataset_metadata, self.norm, dimensions=dimensions,
+            saved=self.dataset_metadata.get('normalization'), legacy_single=legacy_single)
+        self.dataset_metadata['normalization'] = copy.deepcopy(self.normalization)
+
+    def _normalization_field(self, key):
+        if not hasattr(self, 'normalization'):
+            self.normalization = make_normalization(
+                self.dataset_metadata, self.norm, defaults=PI05_NORM,
+                dimensions=dict(state=self.state_dim, action=self.action_dim),
+                saved=self.dataset_metadata.get('normalization'))
+        if key not in self.normalization['fields'] and key == 'force':
+            return make_normalization(self.dataset_metadata, self.norm, dimensions=dict(force=6))['fields'][key]
+        return self.normalization['fields'][key]
+
+    def normalize(self, values_N_D, key):
+        """Normalize state/action/force using the dataset's saved contract."""
+        return transform_values(values_N_D, self._normalization_field(key))
+
+    def denormalize(self, values_N_D, key):
+        """Invert dataset scaling without deployment clipping or gripper thresholding."""
+        return transform_values(values_N_D, self._normalization_field(key), inverse=True)
+
+    def _raw_locate(self, global_index):
+        for record in self.episode_records:
+            if record["global_start"] <= global_index < record["global_end"]:
+                source = self.sources[record["source_id"]]
+                local = global_index - self._source_frame_offsets[record["source_id"]]
+                return source, local, record
+        raise IndexError(global_index)
+
+    def _raw_sample(self, global_index):
+        source, local_index, record = self._raw_locate(int(global_index))
+        frame = source["loader"].get_item_by_indices([int(local_index)])
+        frame = {key: value[0] for key, value in frame.items()}
+        source_start = self._source_frame_offsets[record["source_id"]]
+        end_local = record["global_end"] - source_start - 1
+        action_indices = [min(local_index + offset, end_local) for offset in range(self.horizon)]
+        action = source["loader"].get_item_by_indices(action_indices)["rel_actions"]
+        sample = dict(obs=dict(image=np.asarray(frame["primary_rgb"], dtype=np.uint8),
+                             gripper=np.asarray(frame["gripper_rgb"], dtype=np.uint8),
+                             joint_state=np.asarray(frame["robot_obs"], dtype=np.float32)[:self.state_dim],
+                             prompt=_tcl_text(frame["language_text"])),
+                    action=np.asarray(action, dtype=np.float32),
+                    task_id=np.int64(source["task_id"]))
+        for key in self.force_keys:
+            sample['obs'][key] = np.asarray(frame['force_torque'], dtype=np.float32)
+        return sample
+
+    @staticmethod
+    def _task_one_hot(task_id):
+        task_id_10 = torch.zeros(10, dtype=torch.float32)
+        task_id_10[int(task_id)] = 1.0
+        return task_id_10
+
+    def _prepare_multisource_rgb(self, rgb_H_W_C, key):
+        content_hw = self.image_resize_hw.get(key)
+        if self.output_mode == "raw":
+            return prepare_tcl_rgb(rgb_H_W_C, content_hw, output_mode="raw")
+        image_C_H_W = prepare_tcl_rgb(rgb_H_W_C, content_hw)
+        return image_C_H_W.unsqueeze(0)
+
+    def _format_multisource(self, sample):
+        images = {key: self._prepare_multisource_rgb(sample["obs"][key], key)
+                  for key in ("image", "gripper")}
+        if self.output_mode == "raw":
+            return {**sample, "obs": {**sample["obs"], **images}}
+        action_H_D = torch.as_tensor(sample["action"], dtype=torch.float32)
+        action_H_D = self.normalize(action_H_D, "action")
+        result = dict(obs=dict(
+                    **images,
+                    joint_state=self.normalize(torch.as_tensor(sample["obs"]["joint_state"][:6], dtype=torch.float32), "state").view(1, 6),
+                    task_id=self._task_one_hot(sample["task_id"]).view(1, 10)),
+                    action=action_H_D, task_id=torch.tensor(int(sample["task_id"]), dtype=torch.long))
+        for key in self.force_keys:
+            force_D = self.normalize(torch.as_tensor(sample['obs'][key]), 'force')
+            result['obs'][key] = (torch.zeros_like(force_D) if self.zero_force else force_D).view(1, 6)
+        return result
+
+    def __len__(self):
+        if self._multi_source:
+            return int(len(self.indices))
+        return super().__len__()
+
+    def __getitem__(self, index):
+        if not self._multi_source:
+            return super().__getitem__(index)
+        global_index = int(self.indices[index % len(self.indices)])
+        result = self._format_multisource(self._raw_sample(global_index))
+        if not self.temporal_pairing_enabled:
+            return result
+        _, _, record = self._raw_locate(global_index)
+        start, end = int(record["global_start"]), int(record["global_end"])
+        valid = end - start > 1
+        if valid:
+            seed_words = [self.temporal_pairing_seed & 0xffffffff,
+                          self.temporal_pairing_epoch & 0xffffffff, global_index & 0xffffffff]
+            rng = np.random.default_rng(np.random.SeedSequence(seed_words))
+            offset = int(rng.integers(end - start - 1))
+            own_offset = global_index - start
+            pair_index = start + offset + int(offset >= own_offset)
+            pair = self._format_multisource(self._raw_sample(pair_index))
+        else:
+            pair = copy.deepcopy(result)
+        result["temporal_pair"] = pair
+        result["temporal_pair_valid"] = torch.tensor(valid, dtype=torch.bool)
+        return result
+
+    def get_dataset_metadata(self):
+        """Return the source, split and foveation preprocessing contract."""
+        if self._multi_source:
+            return copy.deepcopy(self.dataset_metadata)
+        return super().get_dataset_metadata()
+
+    def get_validation_dataset(self):
+        """Return a validation view sharing source readers and statistics."""
+        if not self._multi_source:
+            return super().get_validation_dataset()
+        result = copy.copy(self)
+        result.split = "val"
+        result.temporal_pairing_enabled = False
+        result.indices = result.val_indices
+        return result
+
+    def set_temporal_pairing(self, enabled: bool, seed=None, epoch=None):
+        """Toggle episode-local pairing for either TCL output mode."""
+        if not self._multi_source:
+            return super().set_temporal_pairing(enabled)
+        self.temporal_pairing_enabled = bool(enabled and self.split == "train")
+        if seed is not None:
+            self.temporal_pairing_seed = int(seed)
+        if epoch is not None:
+            self.temporal_pairing_epoch = int(epoch)
+
+    def set_pairing_epoch(self, epoch: int):
+        """Set the epoch component used by deterministic raw pairing."""
+        if self._multi_source:
+            self.temporal_pairing_epoch = int(epoch)
+
+    def get_pairing_state(self):
+        """Return pairing settings for a resumable training contract."""
+        if not self._multi_source:
+            return dict(enabled=bool(self._temporal_pairing_scalar), split=self.split)
+        return dict(enabled=self.temporal_pairing_enabled, seed=self.temporal_pairing_seed,
+                    epoch=self.temporal_pairing_epoch, split=self.split,
+                    episode_ranges=[dict(record) for record in self.episode_records])
+
+    def get_normalizer(self, **kwargs):
+        if not self._multi_source or self.output_mode == "normalized":
+            return super().get_normalizer(**kwargs)
+        normalizer = LinearNormalizer()
+        for key in ("image", "gripper", "joint_state", "action"):
+            normalizer[key] = EmptyNormalizer.create_identity()
+        return normalizer
+
+    def iter_task_diagnostic_batches(self, samples_per_task: int, seed: int):
+        """Yield deterministic task-local batches for foveation diagnostics."""
+        if not self._multi_source:
+            yield from super().iter_task_diagnostic_batches(samples_per_task, seed)
+            return
+        if samples_per_task < 2:
+            raise ValueError("samples_per_task must be at least two")
+        rng = np.random.RandomState(seed)
+        for task_id in sorted({int(source["task_id"]) for source in self.sources}):
+            candidates = [int(index) for index in self.indices
+                          if self._raw_locate(int(index))[0]["task_id"] == task_id]
+            if not candidates:
+                continue
+            chosen = rng.choice(candidates, min(samples_per_task, len(candidates)), replace=False)
+            yield task_id, default_collate([
+                self._format_multisource(self._raw_sample(int(index))) for index in chosen
+            ])
+
+    def close(self):
+        """Close owned RoboKit HDF5 handles, including shared validation readers."""
+        loaders = ([source["loader"] for source in self.sources] if self._multi_source
+                   else [self.tcl_dataset])
+        for loader in loaders:
+            # Train/validation views share handles; non-HDF5 readers have none.
+            handle = getattr(loader, "hf", None)
+            if handle is not None and handle.id.valid:
+                handle.close()
+
+    def iter_recorded_episodes(self, episodes_per_task=2):
+        """Yield fixed full recordings, independent of the frame-level validation split."""
+        counts = {}
+        for record_id, record in enumerate(self.episode_records):
+            source = self.sources[record["source_id"]]
+            task_name = source["task_dir"]
+            length = record["global_end"] - record["global_start"]
+            ordinal = counts.get(task_name, 0)
+            if length <= 0 or ordinal >= episodes_per_task:
+                continue
+            counts[task_name] = ordinal + 1
+            yield record_id, task_name, ordinal, length
+
+    def get_recorded_observation_batch(self, record_id, frame_indices):
+        """Read full-recording observations without action sampling or temporal pairs."""
+        record = self.episode_records[record_id]
+        source = self.sources[record["source_id"]]
+        start = record["global_start"] - self._source_frame_offsets[record["source_id"]]
+        length = record["global_end"] - record["global_start"]
+        assert all(0 <= index < length for index in frame_indices)
+        batch = source["loader"].get_item_by_indices([start + int(i) for i in frame_indices])
+        observations = []
+        for i in range(len(frame_indices)):
+            images = {key: self._prepare_multisource_rgb(batch[source_key][i], key)
+                      for key, source_key in (("image", "primary_rgb"), ("gripper", "gripper_rgb"))}
+            if self.output_mode == "raw":
+                obs = dict(**images,
+                           joint_state=np.asarray(batch["robot_obs"][i], dtype=np.float32)[:self.state_dim],
+                           prompt=_tcl_text(batch["language_text"][i]),
+                           task_id=np.int64(source["task_id"]))
+            else:
+                obs = dict(**images,
+                           joint_state=self.normalize(torch.as_tensor(batch["robot_obs"][i][:6], dtype=torch.float32), "state").view(1, 6),
+                           task_id=self._task_one_hot(source["task_id"]).view(1, 10))
+            for key in self.force_keys:
+                force_D = torch.as_tensor(batch['force_torque'][i], dtype=torch.float32)
+                if self.output_mode != 'raw':
+                    force_D = self.normalize(force_D, 'force')
+                    force_D = (torch.zeros_like(force_D) if self.zero_force else force_D).view(1, 6)
+                obs[key] = force_D
+            observations.append(obs)
+        return default_collate(observations)
 
 
 class TCLMasterSlaveDataset(BaseImageDataset):

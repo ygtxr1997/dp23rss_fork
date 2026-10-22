@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Requires new per-camera Stage A weights with the same ordered RGB keys.
+# Paired samples one camera per window/pair; ELU budgets and lambdas are per camera.
 
 # Stage A EMA -> Spatial reachable paired routing with a frozen downstream policy.
 # Match the architecture and data/diffusion settings of the Stage A checkpoint.

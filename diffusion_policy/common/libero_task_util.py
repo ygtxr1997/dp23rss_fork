@@ -1,6 +1,7 @@
 """Stable LIBERO-10 identities, independent of experiment subsets and task order."""
 
 from pathlib import Path
+import re
 
 
 # Official libero_suite_task_map.py order, before benchmark task-order permutations.
@@ -17,6 +18,16 @@ LIBERO_TASK_NAMES = (
     "KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it",
 )
 LIBERO_TASK_IDS = {name: index for index, name in enumerate(LIBERO_TASK_NAMES)}
+# Match LIBERO benchmark.grab_language_from_filename without importing the simulator.
+LIBERO_TASK_LANGUAGES = {
+    name: re.split(r"_SCENE\d+_", name, maxsplit=1)[1].replace("_", " ")
+    for name in LIBERO_TASK_NAMES
+}
+
+
+def libero_task_language(source: str) -> str:
+    """Return benchmark language for a known LIBERO-10 task or replay filename."""
+    return LIBERO_TASK_LANGUAGES[LIBERO_TASK_NAMES[libero_task_id(source)]]
 
 
 def libero_task_id(source: str, fallback=None) -> int:

@@ -3,8 +3,6 @@
 更新：2026-09-30。已接入诊断、加权 level/random 及 random 范围采样；本地仅静态检查，数值、多卡和训练效果待服务器验证。
 level0 为 coarse，level 越大越 fine；低分辨率 loss 减高分辨率 loss，正值表示高分辨率更好。
 历史接入过程见 [libero_exp.md](libero_exp.md)。
-Stage A 覆盖缺口、本次范围选择与 Stage B 低预算路由的解释边界见
-[Stage A 拓扑覆盖与 Stage B 低预算路由分析](auto_search_libero_budget.md)。
 
 ## 1. 指标与统计口径
 

@@ -370,10 +370,10 @@ class FoveationNet(nn.Module):
     with a coarsest, finest, per-sample random, or persistent random topology.
     Random mode may provide multiple split ratios; each sample independently
     selects one ratio and shares the resulting topology across its frames.
-    ``random:min-max`` samples a continuous ratio per window, shared across
-    views; each view draws its own topology and shares it across its frames.
+    ``random:min-max`` samples a continuous ratio and topology per window,
+    shared across its observation frames. Separate camera calls are independent.
     ``level:l`` selects a uniform leaf level. Weighted lists combine level and
-    random modes per window, sharing the selection across views and frames.
+    random modes per window, sharing the selection across its observation frames.
     During training, ``random_topology_prob`` can replace each frame's hard tree
     with a random legal tree that preserves its router-selected patch count.
     Router action value ``split_action_value`` determines whether high or low
@@ -396,6 +396,7 @@ class FoveationNet(nn.Module):
         num_levels: int = 3,
         global_level: int = 0,
         global_encoder_type: str = "vjepa2_1_vit_giant_384",
+        global_encoder_resize: Optional[int] = None,
         torch_home: Optional[str] = None,
         global_feature_dim: int = 1408,
         router_layers: int = 4,
@@ -429,6 +430,13 @@ class FoveationNet(nn.Module):
         self.num_levels = int(num_levels)
         self.global_level = int(global_level)
         self.global_encoder_type = str(global_encoder_type)
+        self.global_encoder_resize = (
+            None if global_encoder_resize is None else int(global_encoder_resize)
+        )
+        if self.global_encoder_resize is not None and (
+            self.global_encoder_resize <= 0 or self.global_encoder_resize % 16 != 0
+        ):
+            raise ValueError("global_encoder_resize must be a positive multiple of 16")
         self.torch_home = torch_home
         self.global_feature_dim = int(global_feature_dim)
         self.router_layers = int(router_layers)
@@ -536,9 +544,12 @@ class FoveationNet(nn.Module):
             fixed_split_hard_1_1_M,
         )
 
+        # Fixed-topology policies do not need to construct the expensive global
+        # encoder or a router at all.  This also keeps their parameter set free
+        # of dormant trainable routing weights.
         self.global_encoder = (
             self._load_global_encoder(self.global_encoder_type)
-            if self.num_internal_nodes > 0
+            if self.num_internal_nodes > 0 and self.router_type != "none"
             else None
         )
         if self.global_encoder is not None and (
@@ -547,7 +558,9 @@ class FoveationNet(nn.Module):
             self.global_encoder.requires_grad_(False)
             self.global_encoder.eval()
 
-        if self.router_type == "pooled_global":
+        if self.router_type == "none":
+            self.router = None
+        elif self.router_type == "pooled_global":
             self.router = AdaptiveResolutionRouter(
                 global_feature_dim=self.global_feature_dim,
                 hidden_dim=self.router_hidden_dim,
@@ -577,7 +590,7 @@ class FoveationNet(nn.Module):
                 hidden_dim=self.router_hidden_dim,
                 cond_dim=self.router_cond_dim,
             )
-        if self.freeze_router or self.fix_split_mode is not None:
+        if self.router is not None and (self.freeze_router or self.fix_split_mode is not None):
             self.router.requires_grad_(False)
 
     @staticmethod
@@ -797,18 +810,24 @@ class FoveationNet(nn.Module):
         if self.budget_loss_type == "upper_bound_lagrangian_elu" and not self.budget_elu_tau > 0.0:
             raise ValueError("budget_elu_tau must be positive.")
         if self.router_type not in (
+            "none",
             "pooled_global",
             "node_aligned_fpn",
             "node_aligned_vit",
         ):
             raise ValueError(
-                "router_type must be 'pooled_global', 'node_aligned_fpn', or "
+                "router_type must be 'none', 'pooled_global', 'node_aligned_fpn', or "
                 "'node_aligned_vit'."
             )
+        if self.router_type == "none" and self.fix_split_mode is None:
+            raise ValueError("router_type='none' requires fix_split_mode.")
         if self.router_type == "node_aligned_fpn":
-            if self.num_levels < 2 or self.patch_size != 16:
+            if self.num_levels < 2 or (
+                self.patch_size != 16
+                and not (self.patch_size == 14 and self.global_encoder_resize == 64)
+            ):
                 raise ValueError(
-                    "node_aligned_fpn requires at least two levels and patch_size=16."
+                    "node_aligned_fpn requires patch16, or Pi05 patch14 with resize64."
                 )
             if self.global_encoder_type != "resnet10":
                 raise ValueError("node_aligned_fpn currently requires resnet10.")
@@ -1076,17 +1095,33 @@ class FoveationNet(nn.Module):
         self,
         global_images_B_C_T_H_W: torch.Tensor,
     ) -> torch.Tensor:
+        encoder_images_B_C_T_H_W = global_images_B_C_T_H_W
+        if self.global_encoder_type in JEPAHelper.MODEL_NAMES and self.global_encoder_resize is not None:
+            B, C, T, H, W = global_images_B_C_T_H_W.shape
+            resize = self.global_encoder_resize
+            images_BT_C_H_W = global_images_B_C_T_H_W.permute(
+                0, 2, 1, 3, 4
+            ).reshape(B * T, C, H, W)
+            images_BT_C_H_W = F.interpolate(
+                images_BT_C_H_W,
+                size=(resize, resize),
+                mode="bilinear",
+                align_corners=False,
+            )
+            encoder_images_B_C_T_H_W = images_BT_C_H_W.reshape(
+                B, T, C, resize, resize
+            ).permute(0, 2, 1, 3, 4).contiguous()
         encoder_context = (
             torch.no_grad() if self.freeze_global_encoder else nullcontext()
         )
         with encoder_context:
             global_features = self.global_encoder(
-                global_images_B_C_T_H_W
+                encoder_images_B_C_T_H_W
             )
         if not isinstance(global_features, torch.Tensor):
             raise TypeError("The global encoder must return a tensor.")
 
-        B, _, T, H, W = global_images_B_C_T_H_W.shape
+        B, _, T, H, W = encoder_images_B_C_T_H_W.shape
 
         if global_features.ndim == 3:
             if H % 16 != 0 or W % 16 != 0:
@@ -1142,12 +1177,29 @@ class FoveationNet(nn.Module):
         self,
         global_images_B_C_T_H_W: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        encoder_images_B_C_T_H_W = global_images_B_C_T_H_W
+        if self.global_encoder_resize is not None:
+            B, C, T, H, W = global_images_B_C_T_H_W.shape
+            resize = self.global_encoder_resize
+            if (H, W) != (resize, resize):
+                images_BT_C_H_W = global_images_B_C_T_H_W.permute(
+                    0, 2, 1, 3, 4
+                ).reshape(B * T, C, H, W)
+                images_BT_C_H_W = F.interpolate(
+                    images_BT_C_H_W,
+                    size=(resize, resize),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                encoder_images_B_C_T_H_W = images_BT_C_H_W.reshape(
+                    B, T, C, resize, resize
+                ).permute(0, 2, 1, 3, 4).contiguous()
         encoder_context = (
             torch.no_grad() if self.freeze_global_encoder else nullcontext()
         )
         with encoder_context:
             stage_features = self.global_encoder.forward_stages(
-                global_images_B_C_T_H_W
+                encoder_images_B_C_T_H_W
             )
         return stage_features
 
@@ -1186,25 +1238,20 @@ class FoveationNet(nn.Module):
         return self.router.condition_projection(cond_B_T_D)
 
     def _sample_mixed_split_mask(
-        self, merged_batch_size: int, num_views: int, device: torch.device,
+        self, batch_size: int, device: torch.device,
     ) -> torch.Tensor:
-        batch_size = merged_batch_size // num_views
         weights_L = torch.tensor(
             [weight for weight, _, _ in self.mixed_split_modes], device=device,
             dtype=torch.float32,
         )
         mode_indices_B = torch.multinomial(weights_L, batch_size, replacement=True)
-        # Policy concatenates complete camera batches: [view0 B, view1 B, ...].
-        mode_indices_VB = mode_indices_B.repeat(num_views)
-        split_hard_VB_1_M = torch.zeros(
-            (merged_batch_size, 1, self.num_internal_nodes),
-            dtype=torch.bool, device=device,
+        split_hard_B_1_M = torch.zeros(
+            (batch_size, 1, self.num_internal_nodes), dtype=torch.bool, device=device,
         )
         for mode_index, (_, kind, value) in enumerate(self.mixed_split_modes):
             selected_B = mode_indices_B == mode_index
-            selected_VB = mode_indices_VB == mode_index
             if kind == "level":
-                split_hard_VB_1_M[selected_VB, :, :self.internal_level_offsets[value]] = True
+                split_hard_B_1_M[selected_B, :, :self.internal_level_offsets[value]] = True
                 continue
             num_selected = int(selected_B.sum().item())
             if num_selected == 0:
@@ -1218,11 +1265,8 @@ class FoveationNet(nn.Module):
                 )
                 ratio_indices_R = torch.randint(len(value), (num_selected,), device=device)
                 num_splits_R_1 = split_counts_L[ratio_indices_R, None]
-            # Share the ratio across cameras, but sample their spatial layouts independently.
-            split_hard_VB_1_M[selected_VB] = self._sample_random_split_mask(
-                num_splits_R_1.repeat(num_views, 1)
-            )
-        return split_hard_VB_1_M
+            split_hard_B_1_M[selected_B] = self._sample_random_split_mask(num_splits_R_1)
+        return split_hard_B_1_M
 
     def _sample_range_num_splits(
         self, split_range: Tuple[float, float], batch_size: int, device: torch.device,
@@ -1641,7 +1685,7 @@ class FoveationNet(nn.Module):
             )
         if budget_loss_type == "batch_mean_mse":
             # Average before squaring so observations can compensate each other.
-            # This forward only: local batch x frames x cameras (folded into B),
+            # This forward only: local batch x frames of this camera,
             # without aggregation across GPUs or gradient accumulation steps.
             return F.mse_loss(normalized_expected_B_T.mean(), normalized_target)
         return F.mse_loss(
@@ -1655,17 +1699,12 @@ class FoveationNet(nn.Module):
         cond_B_T_D: Optional[torch.Tensor] = None,
         *,
         return_routing_state: bool = False,
-        num_views: int = 1,
     ) -> Dict[str, torch.Tensor]:
-        """Route images; weighted/range modes share choices across camera batches."""
+        """Route one camera; fixed/random modes share a tree across window frames."""
         ## 1. Validate and normalize the high-resolution input.
         if x_B_C_T_H_W.ndim != 5:
             raise ValueError("Expected x_B_C_T_H_W with shape (B, C, T, H, W).")
         B, C, T, H, W = x_B_C_T_H_W.shape
-        if (
-            self.mixed_split_modes is not None or self.random_split_range is not None
-        ) and (num_views < 1 or B % num_views):
-            raise ValueError("Weighted/range routing requires a batch divisible by num_views >= 1.")
         if C != self.in_channels:
             raise ValueError(f"Expected {self.in_channels} channels, got {C}.")
         if (H, W) != self.input_hw:
@@ -1703,7 +1742,7 @@ class FoveationNet(nn.Module):
             split_shape = (B, T, self.num_internal_nodes)
             if self.mixed_split_modes is not None:
                 split_hard_B_T_M = self._sample_mixed_split_mask(
-                    B, num_views, x_B_C_T_H_W.device,
+                    B, x_B_C_T_H_W.device,
                 ).expand(split_shape)
             elif self.fixed_level is not None:
                 split_hard_B_T_M = torch.zeros(
@@ -1715,13 +1754,12 @@ class FoveationNet(nn.Module):
                     split_shape
                 )
             elif self.random_split_range is not None:
-                num_splits_W_1 = self._sample_range_num_splits(
-                    self.random_split_range, B // num_views, x_B_C_T_H_W.device,
+                num_splits_B_1 = self._sample_range_num_splits(
+                    self.random_split_range, B, x_B_C_T_H_W.device,
                 )
-                # B = views * windows, ordered [view0 W, view1 W, ...]. Share
-                # counts across views, draw independent layouts, then share across T.
+                # Each window samples its own ratio/layout, shared only across T.
                 split_hard_B_T_M = self._sample_random_split_mask(
-                    num_splits_W_1.repeat(num_views, 1)
+                    num_splits_B_1
                 ).expand(split_shape)
             elif self.random_split_ratios is None:
                 should_split = self.fix_split_mode == "finest"
@@ -1865,6 +1903,29 @@ class FoveationNet(nn.Module):
 
         ## 6. Compute the differentiable expected token-budget penalty.
         budget_stats = {}
+        budget_leaf_probs_B_T_K = soft_leaf_probs_B_T_K
+        if self.fix_split_mode is None and self.budget_probability_type == "clean_expected":
+            clean_action_probs_B_T_M = torch.sigmoid(split_logits_B_T_M)
+            clean_split_probs_B_T_M = (
+                clean_action_probs_B_T_M
+                if self.split_action_value == 1
+                else 1.0 - clean_action_probs_B_T_M
+            )
+            budget_split_hard_B_T_M = (
+                split_hard_B_T_M
+                if router_split_hard_B_T_M is None
+                else router_split_hard_B_T_M
+            )
+            budget_leaf_probs_B_T_K, _, _ = (
+                self._build_soft_and_hard_leaf_masks(
+                    clean_split_probs_B_T_M,
+                    budget_split_hard_B_T_M,
+                )
+            )
+        elif router_soft_leaf_probs_B_T_K is not None:
+            # sampled_relaxed budget remains tied to the router sample,
+            # not to a random topology used only by the action policy.
+            budget_leaf_probs_B_T_K = router_soft_leaf_probs_B_T_K
         if (
             self.fix_split_mode is not None
             or self.resolved_target_num_patches is None
@@ -1873,29 +1934,6 @@ class FoveationNet(nn.Module):
         ):
             budget_loss = soft_leaf_probs_B_T_K.sum() * 0.0
         else:
-            budget_leaf_probs_B_T_K = soft_leaf_probs_B_T_K
-            if self.budget_probability_type == "clean_expected":
-                clean_action_probs_B_T_M = torch.sigmoid(split_logits_B_T_M)
-                clean_split_probs_B_T_M = (
-                    clean_action_probs_B_T_M
-                    if self.split_action_value == 1
-                    else 1.0 - clean_action_probs_B_T_M
-                )
-                budget_split_hard_B_T_M = (
-                    split_hard_B_T_M
-                    if router_split_hard_B_T_M is None
-                    else router_split_hard_B_T_M
-                )
-                budget_leaf_probs_B_T_K, _, _ = (
-                    self._build_soft_and_hard_leaf_masks(
-                        clean_split_probs_B_T_M,
-                        budget_split_hard_B_T_M,
-                    )
-                )
-            elif router_soft_leaf_probs_B_T_K is not None:
-                # sampled_relaxed budget remains tied to the router sample,
-                # not to a random topology used only by the action policy.
-                budget_leaf_probs_B_T_K = router_soft_leaf_probs_B_T_K
             budget_loss = self.budget_loss(
                 budget_leaf_probs_B_T_K,
                 self.resolved_target_num_patches,
@@ -1925,6 +1963,7 @@ class FoveationNet(nn.Module):
         out["split_logits_B_T_M"] = split_logits_B_T_M
         out["random_topology_mask_B_T"] = random_topology_mask_B_T
         out["budget_loss"] = budget_loss
+        out["expected_num_patches_B_T"] = budget_leaf_probs_B_T_K.detach().float().sum(-1)
         out.update(budget_stats)
         if return_routing_state:
             out["patch_bank_B_T_K_C_P_P"] = patch_bank_B_T_K_C_P_P

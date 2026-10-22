@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Union
@@ -26,8 +27,9 @@ from robokit.debug_utils.time_profiler import global_time_profiler as gtp
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-export LOG_TIME="2026.09.09-11.13.27"
-CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service:gpu_app --port 6072
+export LOG_TIME="2026-10-15-21-44-36"
+# For a custom training output directory, set TRAIN_PROJECT_DIR instead.
+CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service:gpu_app --port 6080
 """
 gpu_app = FastAPI()
 max_cache_action = 32
@@ -70,14 +72,62 @@ map_time_to_dataset = {
     "2026.09.09-11.13.27": "0417_plastic_egg",
     "2026.09.09-01.18.17": "0417_put_mouse_hard",
     "2026.09.12-01.41.29": "0417_put_mouse_hard",
+    "2026-10-15-21-44-36": "1014_lh_tower_three_blocks",
 }
-# train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
-train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
-train_project_dir = train_project_dir.replace('-', '/')
-# fall back
-if not os.path.exists(train_project_dir):
-    train_project_dir = train_project_dir.replace("image", "images")
-    print(f"[Warning] fallback `xxx_image/` to `xxx_images/`")
+def resolve_train_project_dir(log_time: str) -> Path:
+    """Resolve TCL foveation timestamps or legacy DP run directories."""
+    explicit_dir = os.environ.get("TRAIN_PROJECT_DIR")
+    if explicit_dir:
+        run_dir = Path(explicit_dir).expanduser()
+        if not run_dir.is_dir():
+            raise FileNotFoundError(run_dir)
+        return run_dir
+
+    repo_dir = Path(__file__).resolve().parent
+    candidates = []
+    for time_format in ("%Y-%m-%d-%H-%M-%S", "%Y.%m.%d-%H.%M.%S"):
+        try:
+            timestamp = datetime.strptime(log_time, time_format)
+        except ValueError:
+            continue
+        candidates.append(repo_dir / "outputs" / timestamp.strftime("%Y-%m-%d/%H-%M-%S"))
+        break
+
+    # StageA scripts may put the run below a project name, for example
+    # outputs/tcl_stageA/2026-10-15-21-44-36. Search only two levels so a
+    # typo in LOG_TIME cannot make service startup scan the whole repository.
+    outputs_dir = repo_dir / "outputs"
+    if outputs_dir.is_dir():
+        timestamp_names = {log_time}
+        try:
+            timestamp = datetime.strptime(log_time, "%Y-%m-%d-%H-%M-%S")
+            timestamp_names.update({timestamp.strftime("%Y-%m-%d/%H-%M-%S")})
+        except ValueError:
+            pass
+        for run_dir in outputs_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            directories = [run_dir]
+            directories.extend(child for child in run_dir.iterdir() if child.is_dir())
+            for candidate in directories:
+                relative = candidate.relative_to(outputs_dir).as_posix()
+                if candidate.name in timestamp_names or any(
+                        relative.endswith(name) for name in timestamp_names):
+                    candidates.append(candidate)
+    for suffix in ("image", "images"):
+        legacy_name = f"{log_time}_train_diffusion_transformer_hybrid_pusht_{suffix}"
+        candidates.append(repo_dir / "data/outputs" / legacy_name.replace("-", "/"))
+    for run_dir in candidates:
+        if run_dir.is_dir():
+            return run_dir
+    raise FileNotFoundError(
+        f"No training run for LOG_TIME={log_time}; tried {candidates}. "
+        "Set TRAIN_PROJECT_DIR for a custom output directory."
+    )
+
+
+train_project_dir = str(resolve_train_project_dir(log_time))
+print(f"[gpu_service] train_project_dir={train_project_dir}")
 dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
 dataset_name = map_time_to_dataset.get(log_time, dataset_name)
 
@@ -100,7 +150,16 @@ else:
 # Load dataset statistics
 dataset_statistics_file = f"/home/geyuan/datasets/TCL/{dataset_dir}/statistics.json"
 train_project_statistics_file = os.path.join(train_project_dir, "statistics.json")
-if os.path.exists(dataset_statistics_file):
+dataset_metadata_file = Path(train_project_dir) / "dataset_metadata.json"
+if dataset_metadata_file.is_file():
+    # Foveation runs persist the exact training statistics, including force quantiles.
+    with dataset_metadata_file.open() as json_file:
+        dataset_metadata = json.load(json_file)
+    statistics = {
+        "stats": dataset_metadata["statistics"],
+        "total_len": sum(length for _, length in dataset_metadata["episodes"]),
+    }
+elif os.path.exists(dataset_statistics_file):
     with open(dataset_statistics_file, 'r') as json_file:
         statistics = json.load(json_file)
         dataset_stats = statistics["stats"]
@@ -134,16 +193,18 @@ if os.path.exists(dataset_statistics_file):
         print("[Info] Dumped updated statistics.json to train_project_dir.")
 
 # Load statistics from train project dir (to be compatible with ITX deployment)
-assert os.path.exists(train_project_statistics_file), "[gpu_service] statistics.json not found in train_project_dir."
-with open(train_project_statistics_file, 'r') as json_file:
-    statistics = json.load(json_file)
-    dataset_stats = statistics["stats"]
-    datasets_total_len = statistics["total_len"]
-    dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
-    dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
-    dataset_action_mean = np.array(dataset_stats["rel_actions"]["mean"])
-    dataset_stats['force_torque']['p01'] = np.array(dataset_stats["force_torque"]['p01'])
-    dataset_stats['force_torque']['p99'] = np.array(dataset_stats["force_torque"]['p99'])
+if not dataset_metadata_file.is_file():
+    assert os.path.exists(train_project_statistics_file), "[gpu_service] statistics.json not found in train_project_dir."
+    with open(train_project_statistics_file, 'r') as json_file:
+        statistics = json.load(json_file)
+
+dataset_stats = statistics["stats"]
+datasets_total_len = statistics["total_len"]
+dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
+dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
+dataset_action_mean = np.array(dataset_stats["rel_actions"]["mean"])
+dataset_stats['force_torque']['p01'] = np.array(dataset_stats["force_torque"]['p01'])
+dataset_stats['force_torque']['p99'] = np.array(dataset_stats["force_torque"]['p99'])
 
 
 @lru_cache()
@@ -276,7 +337,8 @@ def model_step(step_request: StepRequestFromEvaluator):
     with gtp("cpu_norm_input", group="process_request"):
         # Norm input states
         force_B_T_D = TCLImageDataset.norm_state_or_force(
-            force_B_T_D, norm_type="quantile", meta_data=dataset_stats['force_torque']
+            force_B_T_D, norm_type=hydra_config.task.dataset.get("norm_force_type", "quantile"),
+            meta_data=dataset_stats['force_torque']
         )
         zero_force = getattr(hydra_config.task.dataset, "zero_force", False)
         if zero_force:

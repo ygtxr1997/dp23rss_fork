@@ -37,7 +37,13 @@ from torch.utils.data import DataLoader
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.checkpoint_selection import select_pretrained_checkpoint
 from diffusion_policy.common.json_logger import JsonLogger
+from diffusion_policy.common.foveation_video_util import make_foveation_vis_log
+from diffusion_policy.common.foveation_training_util import (
+    cosine_schedule_value, projected_dual_ascent,
+)
 from diffusion_policy.common.libero_task_util import LIBERO_TASK_NAMES
+from diffusion_policy.common.tcl_data_util import configure_dp_action_clipping
+from diffusion_policy.common.foveation_pretrained import make_foveation_artifact, save_foveation_artifact
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
@@ -57,12 +63,23 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         "global_step", "epoch", "next_epoch", "downstream_finetune_started", "budget_lambda",
         "dataset_metadata"
     )
-    _GLOBAL_MARKER = "foveation_net.global_encoder."
     _ROUTING_PREFIXES = ("foveation_net.", "router_condition_projection.")
+
+    @staticmethod
+    def _validate_pretrained_weights_only(cfg):
+        if not cfg.get("pretrained_weights_only", False):
+            return
+        if not cfg.get("pretrained_ckpt"):
+            raise ValueError("pretrained_weights_only requires pretrained_ckpt")
+        for key in ("training.resume", "training.router_only",
+                    "reuse_pretrained_dataset_config", "data_seed_from_ckpt"):
+            if OmegaConf.select(cfg, key, default=False):
+                raise ValueError(f"pretrained_weights_only requires {key}=false")
 
     @classmethod
     def prepare_config(cls, cfg: OmegaConf):
         """Select pretrained weights and inherit data before resolving configuration."""
+        cls._validate_pretrained_weights_only(cfg)
         mode = cfg.get("pretrained_ckpt_mode")
         reuse_dataset = cfg.get("reuse_pretrained_dataset_config", False)
         pretrained_ckpt = cfg.get("pretrained_ckpt")
@@ -71,7 +88,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 raise ValueError(
                     "pretrained_ckpt_mode and reuse_pretrained_dataset_config require pretrained_ckpt"
                 )
-            return cfg
+            return configure_dp_action_clipping(cfg)
 
         # Hydra may change cwd; source paths remain relative to the launch directory.
         source = hydra.utils.to_absolute_path(str(pathlib.Path(pretrained_ckpt).expanduser()))
@@ -88,10 +105,13 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 OmegaConf.to_container(source_dataset, resolve=True)
             )
             print(f"[Dataset config] Inherited task.dataset from {source_path}")
-        return cfg
+        return configure_dp_action_clipping(cfg)
 
     def __init__(self, cfg: OmegaConf, output_dir: Optional[str] = None):
+        self._validate_pretrained_weights_only(cfg)
         super().__init__(cfg, output_dir=output_dir)
+        # Keep direct Workspace construction consistent with Hydra entrypoints.
+        configure_dp_action_clipping(cfg)
         ddp_timeout = int(self._cfg_get(cfg, "training.ddp_timeout_seconds", 7200))
         process_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=ddp_timeout))
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -100,10 +120,26 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             gradient_accumulation_steps=int(self._cfg_get(cfg, "training.gradient_accumulate_every", 1)),
         )
 
+        reserve_gb = float(self._cfg_get(cfg, "training.reserve_gpu_memory_gb", 0))
+        if not math.isfinite(reserve_gb) or reserve_gb < 0:
+            raise ValueError("training.reserve_gpu_memory_gb must be finite and non-negative")
+        if reserve_gb > 0:
+            if self.accelerator.device.type != "cuda":
+                raise ValueError("GPU memory reservation requires a CUDA device")
+            # Each rank holds its own byte buffer; not a model buffer or checkpoint state.
+            reserve_bytes = int(reserve_gb * 1024 ** 3)
+            self._reserved_gpu_memory_N = torch.empty(
+                reserve_bytes, dtype=torch.uint8, device=self.accelerator.device,
+            )
+            print(f"[GPU reservation] rank={self.accelerator.process_index} "
+                  f"device={self.accelerator.device} "
+                  f"holding {reserve_bytes / 1024 ** 3:.3f} GiB ({reserve_bytes} bytes)", flush=True)
+
         seed = int(self._cfg_get(cfg, "training.seed", 0))
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
+        self._is_libero = str(cfg.task.dataset._target_).endswith(".LiberoFTDataset")
         self.vis_rot_image = bool(self._cfg_get(cfg, "vis_rot_image", False))
 
         self.model: FoveationDPTransformerPolicy = hydra.utils.instantiate(cfg.policy)
@@ -140,10 +176,9 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             foveation_net = self.model.foveation_net
             if (
                 foveation_net is None
-                or foveation_net.global_encoder is None
-                or foveation_net.fix_split_mode is not None
-                or foveation_net.freeze_global_encoder
-                or foveation_net.freeze_router
+                or any(net.global_encoder is None or net.fix_split_mode is not None
+                       or net.freeze_global_encoder or net.freeze_router
+                       for net in foveation_net.nets.values())
                 or bool(self._cfg_get(cfg, "policy.en_freeze_obs_encoder", False))
             ):
                 raise ValueError(
@@ -160,21 +195,27 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             foveation_net = self.model.foveation_net
             if (
                 not bool(self._cfg_get(cfg, "training.router_only", False))
-                or foveation_net.random_topology_prob != 0.0
+                or foveation_net is None
+                or any(net.random_topology_prob != 0.0 for net in foveation_net.nets.values())
             ):
                 raise ValueError(
                     "Paired routing requires router_only=true and "
                     "random_topology_prob=0."
                 )
 
-        encoder = self._global_encoder(self.model)
-        self._share_global_encoder = encoder is not None and not any(
-            param.requires_grad for param in encoder.parameters()
+        encoders = self._global_encoders(self.model)
+        self._shared_encoder_keys = {
+            key for key, encoder in encoders.items()
+            if not any(param.requires_grad for param in encoder.parameters())
+        }
+        self._shared_encoder_prefixes = tuple(
+            f"foveation_net.nets.{key}.global_encoder." for key in self.model.rgb_keys
+            if key in self._shared_encoder_keys
         )
         self.ema_model: Optional[FoveationDPTransformerPolicy] = None
         if bool(self._cfg_get(cfg, "training.use_ema", False)):
             # Only frozen encoders are shared; trainable encoders need an EMA copy.
-            memo = {id(encoder): encoder} if self._share_global_encoder else {}
+            memo = {id(encoders[key]): encoders[key] for key in self._shared_encoder_keys}
             self.ema_model = copy.deepcopy(self.model, memo)
             self._rebind_shared_encoder()
         self._assert_encoder_state()
@@ -189,86 +230,137 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         self._assert_encoder_optimizer()
         self.global_step = 0
         self.epoch = 0
-        self.budget_lambda = float(self._cfg_get(cfg, "training.budget_lambda_init", 0.0))
+        lambda_init = float(self._cfg_get(cfg, "training.budget_lambda_init", 0.0))
+        self.budget_lambda = {key: lambda_init for key in self.model.rgb_keys}
         self.budget_lambda_lr = float(self._cfg_get(cfg, "training.budget_lambda_lr", 0.01))
-        if self.budget_lambda < 0.0 or self.budget_lambda_lr < 0.0:
+        if lambda_init < 0.0 or self.budget_lambda_lr < 0.0:
             raise ValueError("budget_lambda_init and budget_lambda_lr must be non-negative.")
         self._sync_budget_lambda()
 
     def _sync_budget_lambda(self) -> None:
-        # A plain attribute avoids changing old model state dicts or averaging dual state.
         for policy in (self.model, self.ema_model):
             if policy is not None and self._unwrap(policy).foveation_net is not None:
-                self._unwrap(policy).foveation_net.budget_lambda = self.budget_lambda
+                for key, net in self._unwrap(policy).foveation_net.nets.items():
+                    net.budget_lambda = self.budget_lambda[key]
 
-    def _update_budget_lambda(self, budget_stats_2: torch.Tensor) -> Dict[str, float]:
-        """Update the shared price from global [expected-count sum, observation count]."""
-        net = self._unwrap(self.model).foveation_net
-        expected_mean = (budget_stats_2[0] / budget_stats_2[1]).item()
-        metrics = {
-            "train/budget_lambda": self.budget_lambda,
-            "train/expected_num_patches_mean": expected_mean,
-        }
-        normalized_gap = (expected_mean - net.resolved_target_num_patches) / (
-            net.max_num_patches - net.min_num_patches
-        )
-        # LR is in relative-price units; budget_loss_weight scales the router cost only.
-        self.budget_lambda = max(0.0, self.budget_lambda + self.budget_lambda_lr * normalized_gap)
+    def _update_budget_lambda(self, budget_stats_V_2: torch.Tensor) -> Dict[str, float]:
+        """Update each camera's dual price once from the optimizer step's global counts."""
+        metrics = {}
+        for view, (key, net) in enumerate(self._unwrap(self.model).foveation_net.nets.items()):
+            expected_mean = (budget_stats_V_2[view, 0] / budget_stats_V_2[view, 1]).item()
+            gap = expected_mean - net.resolved_target_num_patches
+            metrics[f"train/views/{key}/budget_lambda"] = self.budget_lambda[key]
+            metrics[f"train/views/{key}/expected_num_patches_mean"] = expected_mean
+            metrics[f"train/views/{key}/budget_gap"] = gap
+            self.budget_lambda[key] = projected_dual_ascent(
+                self.budget_lambda[key], expected_mean, net.resolved_target_num_patches,
+                self.budget_lambda_lr, net.max_num_patches - net.min_num_patches,
+            )
         self._sync_budget_lambda()
         return metrics
 
+    def _reduce_sum(self, value_X: torch.Tensor) -> torch.Tensor:
+        # Bypass old Accelerate's single-process vector reduction; distributed
+        # reduction preserves the tensor shape and batches all camera statistics.
+        if self.accelerator.num_processes == 1:
+            return value_X
+        return self.accelerator.reduce(value_X, reduction="sum")
+
     def _globalize_elu_budget(self, policy, losses) -> None:
-        """Replace local ELU cost with the current forward's global-mean cost."""
         if "_budget_normalized_mean" not in losses:
             return
-        net = self._unwrap(policy).foveation_net
-        local_mean_scalar = losses["_budget_normalized_mean"]
-        # Reduce detached sums/counts, not nonlinear per-rank losses. Keep collectives
-        # in the workspace: rollout and video routing may run on the main rank only.
-        global_sum_scalar = self.accelerator.reduce(
-            losses["_budget_expected_sum"].double(), reduction="sum"
+        nets = self._unwrap(policy).foveation_net.nets
+        local_mean_V = losses["_budget_normalized_mean"]
+        global_sum_V = self._reduce_sum(losses["_budget_expected_sum"].double())
+        global_count_V = self._reduce_sum(losses["_budget_observation_count"].double())
+        budget_losses = []
+        for view, (key, net) in enumerate(nets.items()):
+            budget_range = net.max_num_patches - net.min_num_patches
+            global_mean_scalar = (
+                (global_sum_V[view] / global_count_V[view] - net.min_num_patches) / budget_range
+            ).to(local_mean_V.dtype)
+            # Forward uses each camera's global mean; batch weighting/DDP supply
+            # the observation weighting of its local differentiable contribution.
+            mean_proxy_scalar = global_mean_scalar + (local_mean_V[view] - local_mean_V[view].detach())
+            normalized_target = (net.resolved_target_num_patches - net.min_num_patches) / budget_range
+            budget_loss_scalar = net.upper_bound_budget_loss(
+                mean_proxy_scalar, normalized_target, net.budget_loss_type,
+                net.budget_base_cost_weight, net.budget_lambda, net.budget_elu_tau,
+            ) * net.budget_loss_weight
+            budget_losses.append(budget_loss_scalar)
+            losses[f"views/{key}/budget_loss"] = budget_loss_scalar
+        # Accumulation averages per-forward ELU objectives; lambda uses the whole step.
+        budget_loss_V = torch.stack(budget_losses)
+        losses["_view_metric_sums"]["budget_loss"] = (
+            budget_loss_V.detach().double() * losses["_view_metric_counts"]["budget_loss"]
         )
-        global_count_scalar = self.accelerator.reduce(
-            losses["_budget_observation_count"].double(), reduction="sum"
-        )
-        budget_range = net.max_num_patches - net.min_num_patches
-        global_mean_scalar = (
-            (global_sum_scalar / global_count_scalar - net.min_num_patches) / budget_range
-        ).to(local_mean_scalar.dtype)
-        # Forward uses the global mean; backward retains the local mean gradient.
-        # Existing batch weighting/DDP normalization supplies observation weights.
-        mean_proxy_scalar = global_mean_scalar + (local_mean_scalar - local_mean_scalar.detach())
-        normalized_target = (net.resolved_target_num_patches - net.min_num_patches) / budget_range
-        budget_loss_scalar = net.upper_bound_budget_loss(
-            mean_proxy_scalar, normalized_target, net.budget_loss_type,
-            net.budget_base_cost_weight, net.budget_lambda, net.budget_elu_tau,
-        ) * net.budget_loss_weight
-        # With accumulation > 1, this averages per-forward nonlinear objectives;
-        # it is not ELU of the entire optimizer window's mean. Lambda still uses
-        # that window's mean. Current Stage B uses accumulation=1.
+        budget_loss_scalar = budget_loss_V.mean()
         losses["total_loss"] = losses["total_loss"] - losses["budget_loss"] + budget_loss_scalar
         losses["budget_loss"] = budget_loss_scalar
+
+    def _view_metrics(self, policy, losses) -> Dict[str, float]:
+        metrics = {}
+        keys = self._unwrap(policy).rgb_keys
+        names = list(losses.get("_view_metric_sums", {}))
+        if names:
+            sums_M_V = torch.stack([losses["_view_metric_sums"][name].detach().double() for name in names])
+            counts_M_V = torch.stack([losses["_view_metric_counts"][name].detach().double() for name in names])
+            # One collective for all per-camera metric sums/counts.
+            stats_2_M_V = self._reduce_sum(torch.stack([sums_M_V, counts_M_V])).cpu()
+            for index, name in enumerate(names):
+                for view, key in enumerate(keys):
+                    if stats_2_M_V[1, index, view].item() > 0:
+                        metrics[f"views/{key}/{name}"] = (
+                            stats_2_M_V[0, index, view] / stats_2_M_V[1, index, view]
+                        ).item()
+        for field, name in (("_view_sample_count", "sample_count"),
+                            ("_view_valid_count", "valid_pair_count"),
+                            ("_view_matched_count", "matched_pair_count")):
+            if field in losses:
+                count_V = self._reduce_sum(losses[field].detach().double()).cpu()
+                metrics.update({f"views/{key}/{name}": count_V[view].item() for view, key in enumerate(keys)})
+        net_group = self._unwrap(policy).foveation_net
+        if net_group is not None:
+            for key, net in net_group.nets.items():
+                metrics[f"views/{key}/budget_lambda"] = net.budget_lambda
+                expected = metrics.get(f"views/{key}/expected_num_patches_mean")
+                if expected is not None and net.resolved_target_num_patches is not None:
+                    metrics[f"views/{key}/budget_gap"] = expected - net.resolved_target_num_patches
+        return metrics
 
     def _load_pretrained_weights(self, pretrained_ckpt: str) -> None:
         """Load EMA weights, completing the shared encoder from the live state."""
         payload = torch.load(pretrained_ckpt, map_location="cpu", pickle_module=dill)
+        self._check_view_order(payload["cfg"])
         if (str(self.cfg.task.dataset._target_).endswith((".LiberoFTDataset", ".TCLFoveationDataset"))
                 and self._cfg_get(self.cfg, "training.router_only", False)):
             self._check_pretrained_config(payload["cfg"])
-        if "dataset_metadata" in payload["pickles"]:
+        weights_only = self.cfg.get("pretrained_weights_only", False)
+        if not weights_only and "dataset_metadata" in payload["pickles"]:
             self.dataset_metadata = dill.loads(payload["pickles"]["dataset_metadata"])
         state = payload["state_dicts"]["ema_model"].copy()
         live_state = payload["state_dicts"]["model"]
         # Stage A stores its shared, frozen encoder only in the live model.
         # All other weights (including the untrained router) retain their EMA source.
         for name in live_state:
-            if name.startswith(self._GLOBAL_MARKER):
+            if self._is_global_state_key(name):
                 state.setdefault(name, live_state[name])
         self.model.load_state_dict(state, strict=True)
         if self.accelerator.is_main_process:
             print(f"[FoveationWorkspace] Loaded pretrained EMA weights: {pretrained_ckpt}")
+            if weights_only:
+                print("[FoveationWorkspace] Weights-only initialization; "
+                      "using current dataset configuration and statistics.")
+
+    def _check_view_order(self, source_cfg) -> None:
+        obs_meta = self._cfg_get(source_cfg, "policy.shape_meta.obs", {})
+        source_keys = [key for key, meta in obs_meta.items() if meta.get("type", "low_dim") == "rgb"]
+        if source_keys != self._unwrap(self.model).rgb_keys:
+            raise ValueError(f"Checkpoint RGB key order differs: {source_keys} vs {self._unwrap(self.model).rgb_keys}")
 
     def _check_pretrained_config(self, stage_a):
+        # Compare effective sampling settings for legacy quantile checkpoints too.
+        stage_a = configure_dp_action_clipping(copy.deepcopy(stage_a))
         # Constructor defaults make omitted legacy options comparable without
         # constructing a second network or downloading pretrained encoders.
         stage_b = self.cfg
@@ -362,68 +454,46 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         return policy.module if hasattr(policy, "module") else policy
 
     @classmethod
-    def _global_encoder(cls, policy):
-        policy = cls._unwrap(policy)
-        foveation_net = getattr(policy, "foveation_net", None)
-        return (
-            None
-            if foveation_net is None
-            else getattr(foveation_net, "global_encoder", None)
-        )
+    def _global_encoders(cls, policy):
+        group = cls._unwrap(policy).foveation_net
+        return {} if group is None else {
+            key: net.global_encoder for key, net in group.nets.items() if net.global_encoder is not None
+        }
 
     def _rebind_shared_encoder(self) -> None:
-        if not self._share_global_encoder or self.ema_model is None:
+        if self.ema_model is None:
             return
         live = self._unwrap(self.model)
         ema = self._unwrap(self.ema_model)
-        live_net = getattr(live, "foveation_net", None)
-        ema_net = getattr(ema, "foveation_net", None)
-        if live_net is None or ema_net is None:
-            return
-        ema_net.global_encoder = live_net.global_encoder
+        for key in self._shared_encoder_keys:
+            ema.foveation_net.nets[key].global_encoder = live.foveation_net.nets[key].global_encoder
 
     def _assert_encoder_state(self) -> None:
-        live_encoder = self._global_encoder(self.model)
-        if live_encoder is None:
-            return
-        if self.ema_model is not None:
-            ema_encoder = self._global_encoder(self.ema_model)
-            if self._share_global_encoder and ema_encoder is not live_encoder:
-                raise RuntimeError("Frozen global encoders must be shared with EMA.")
-            if not self._share_global_encoder and ema_encoder is live_encoder:
-                raise RuntimeError("Trainable global encoders need a separate EMA copy.")
-        if self._share_global_encoder:
-            if any(param.requires_grad for param in live_encoder.parameters()):
-                raise RuntimeError("A shared global encoder must remain frozen.")
-            if live_encoder.training:
-                raise RuntimeError("A frozen global encoder must remain in eval mode.")
+        live_encoders = self._global_encoders(self.model)
+        ema_encoders = self._global_encoders(self.ema_model) if self.ema_model is not None else {}
+        for key, encoder in live_encoders.items():
+            shared = key in self._shared_encoder_keys
+            if self.ema_model is not None and (ema_encoders[key] is encoder) != shared:
+                raise RuntimeError(f"{key}: only frozen encoders may share live/EMA weights.")
+            if shared and (encoder.training or any(p.requires_grad for p in encoder.parameters())):
+                raise RuntimeError(f"{key}: shared encoder must remain frozen and in eval mode.")
 
     def _assert_encoder_optimizer(self) -> None:
-        encoder = self._global_encoder(self.model)
-        if encoder is None:
-            return
-        encoder_ids = {id(param) for param in encoder.parameters()}
-        trainable_encoder_ids = {
-            id(param) for param in encoder.parameters() if param.requires_grad
-        }
-        optimizer_ids = {
-            id(param)
-            for group in self.optimizer.param_groups
-            for param in group["params"]
-        }
-        if (encoder_ids & optimizer_ids) != trainable_encoder_ids:
-            raise RuntimeError(
-                "Optimizer must contain exactly the trainable global encoder parameters."
-            )
+        optimizer_ids = {id(param) for group in self.optimizer.param_groups for param in group["params"]}
+        for key, encoder in self._global_encoders(self.model).items():
+            encoder_ids = {id(param) for param in encoder.parameters()}
+            trainable_ids = {id(param) for param in encoder.parameters() if param.requires_grad}
+            if (encoder_ids & optimizer_ids) != trainable_ids:
+                raise RuntimeError(f"{key}: optimizer must contain exactly the trainable encoder parameters.")
 
-    @classmethod
-    def _is_global_state_key(cls, key: str) -> bool:
-        return cls._GLOBAL_MARKER in key or key.startswith("global_encoder.")
+    @staticmethod
+    def _is_global_state_key(key: str) -> bool:
+        return key.startswith("foveation_net.nets.") and ".global_encoder." in key
 
     def _state_dict_of(self, key, value, use_thread=True):
         state = super()._state_dict_of(key, value, use_thread=use_thread)
         if (
-            self._share_global_encoder
+            self._shared_encoder_keys
             and key == "ema_model"
             and isinstance(state, dict)
         ):
@@ -431,13 +501,13 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             state = {
                 name: tensor
                 for name, tensor in state.items()
-                if not self._is_global_state_key(name)
+                if not name.startswith(self._shared_encoder_prefixes)
             }
         return state
 
     def _load_state_dict_into(self, key, obj, state, **kwargs):
         if (
-            self._share_global_encoder
+            self._shared_encoder_keys
             and key == "ema_model"
             and isinstance(state, dict)
         ):
@@ -445,7 +515,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             missing = [
                 name
                 for name in incompatible.missing_keys
-                if not self._is_global_state_key(name)
+                if not name.startswith(self._shared_encoder_prefixes)
             ]
             if incompatible.unexpected_keys or missing:
                 raise RuntimeError(
@@ -457,6 +527,11 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         super()._load_state_dict_into(key, obj, state, **kwargs)
 
     def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
+        self._check_view_order(payload["cfg"])
+        # Missing legacy input orientation means raw, regardless of old display flags.
+        saved_orientation = self._cfg_get(payload["cfg"], "policy.render_image_orientation", "raw")
+        if saved_orientation != self._unwrap(self.model).render_image_orientation:
+            raise ValueError("Resume requires matching policy.render_image_orientation")
         restore_optimizer = "optimizer" in payload["state_dicts"] and "optimizer" not in (exclude_keys or ())
         if restore_optimizer:
             old_start = self._cfg_get(payload["cfg"], "training.downstream_finetune_start_epoch", None)
@@ -534,7 +609,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             self.ema_model.eval()
         if ema is not None:
             # Frozen branches must not drift through EMA arithmetic either.
-            inactive = self._ROUTING_PREFIXES if self.downstream_finetune_started else ("obs_encoder.", "model.")
+            inactive = self._ROUTING_PREFIXES if self.downstream_finetune_started else ("obs_encoders.", "model.")
             ema.exclude_prefixes = tuple(dict.fromkeys((*base_ema_exclude_prefixes, *inactive)))
 
     def _temperature_at(self, step: int) -> Optional[float]:
@@ -611,11 +686,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         if start_patches is None or final_patches is None:
             raise ValueError("Scheduled target_num_patches requires both endpoints.")
 
-        progress = min(1.0, max(0.0, float(self.epoch) / decay_epochs))
-        cosine_progress = 0.5 - 0.5 * math.cos(math.pi * progress)
-        target_patches = start_patches + (
-            final_patches - start_patches
-        ) * cosine_progress
+        target_patches = cosine_schedule_value(
+            start_patches, final_patches, self.epoch, decay_epochs)
 
         # Attributes are not EMA parameters, so keep both policy copies in sync.
         live.set_target_num_patches(target_patches)
@@ -643,19 +715,18 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         }
 
     @classmethod
-    def _router_grad_norm(cls, policy) -> float:
+    def _router_parameters(cls, policy):
         live = cls._unwrap(policy)
-        foveation_net = getattr(live, "foveation_net", None)
-        router = (
-            None
-            if foveation_net is None
-            else getattr(foveation_net, "router", None)
-        )
-        if router is None:
-            return 0.0
+        modules = [] if live.foveation_net is None else [net.router for net in live.foveation_net.nets.values()]
+        modules.append(live.router_condition_projection)
+        return tuple(param for module in modules if module is not None
+                     for param in module.parameters() if param.requires_grad)
 
+    @classmethod
+    def _router_grad_norm(cls, policy) -> float:
+        router_params = cls._router_parameters(policy)
         squared_norm_scalar = None
-        for param in router.parameters():
+        for param in router_params:
             if param.grad is None:
                 continue
             param_squared_norm_scalar = param.grad.detach().float().square().sum()
@@ -670,18 +741,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
 
     @classmethod
     def _router_loss_grad_stats(cls, policy, losses, accelerator) -> Dict[str, float]:
-        live = cls._unwrap(policy)
-        foveation_net = getattr(live, "foveation_net", None)
-        router = (
-            None
-            if foveation_net is None
-            else getattr(foveation_net, "router", None)
-        )
-        router_params = (
-            ()
-            if router is None
-            else tuple(param for param in router.parameters() if param.requires_grad)
-        )
+        router_params = cls._router_parameters(policy)
         if not router_params:
             return {
                 "grad/router_diffusion_grad_norm": 0.0,
@@ -808,11 +868,15 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         sampling_seed = diagnostic_seed + self.epoch if sample_resample else diagnostic_seed
         is_libero = str(self.cfg.task.dataset._target_).endswith(".LiberoFTDataset")
         resolution_enabled = bool(self._cfg_get(self.cfg, "training.sample_resolution_advantage", False))
+        task_names = ({value: name for name, value in dataset.task_mapping.items()}
+                      if getattr(dataset, "_multi_source", False) else {})
         metrics = {}
         task_distances = []
         task_losses = []
         rng_devices = [device] if device.type == "cuda" else []
         for task_id, batch in dataset.iter_task_diagnostic_batches(samples_per_task, sampling_seed):
+            task_name = (LIBERO_TASK_NAMES[task_id] if is_libero
+                         and 0 <= task_id < len(LIBERO_TASK_NAMES) else task_names.get(task_id))
             batch_size = batch["task_id"].shape[0]
             if batch_size == 0 or (batch_size < 2 and not resolution_enabled):
                 continue
@@ -826,7 +890,14 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 if resolution_enabled:
                     diagnostics = policy.compute_resolution_diagnostics(batch, seed=diagnostic_seed + task_id)
                     outputs = diagnostics["foveation_outputs"]
-                    task_losses.append(diagnostics["loss_B_L"].mean(dim=0))
+                    loss_L = diagnostics["loss_B_L"].mean(dim=0)
+                    task_losses.append(loss_L)
+                    if task_name is not None:
+                        advantage_L = loss_L[:-1] - loss_L[1:]
+                        metrics.update({
+                            f"sample/resolution_advantage_{level}_to_{level + 1}_{task_name}": value
+                            for level, value in enumerate(advantage_L.tolist())
+                        })
                     del diagnostics
                 else:
                     obs = {
@@ -838,8 +909,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 if outputs and batch_size >= 2:
                     distance = self._topology_diversity(outputs, policy.foveation_net.num_bank_patches)
                     task_distances.append(distance)
-                    if is_libero and 0 <= task_id < len(LIBERO_TASK_NAMES):
-                        metrics[f"sample/topology_div_{LIBERO_TASK_NAMES[task_id]}"] = distance
+                    if task_name is not None:
+                        metrics[f"sample/topology_div_{task_name}"] = distance
             del outputs, batch
         if task_distances:
             metrics["sample/topology_div"] = float(np.mean(task_distances))
@@ -854,39 +925,6 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 for level, advantage in enumerate(advantage_L.tolist())
             })
         return metrics
-
-    @staticmethod
-    def _make_foveation_vis_log(
-        policy,
-        foveation_outputs,
-        max_batch: int = 8,
-        vis_rot_image: bool = False,
-    ):
-        """Build wandb images for the first few samples of every RGB stream."""
-        import wandb
-
-        vis_log = {}
-        for rgb_key, foveation_out in foveation_outputs.items():
-            vis_B_T_H_W_C = policy.foveation_net.vis_ar_tokens(foveation_out)
-            if vis_rot_image and rgb_key == "image":
-                vis_B_T_H_W_C = np.flip(vis_B_T_H_W_C, axis=(2, 3)).copy()
-            num_patches_B_T = foveation_out["num_patches_B_T"].detach().cpu()
-            images = []
-            for batch_idx in range(min(max_batch, vis_B_T_H_W_C.shape[0])):
-                for time_idx in range(vis_B_T_H_W_C.shape[1]):
-                    caption = (
-                        f"b={batch_idx}, t={time_idx}, "
-                        f"num_patches={int(num_patches_B_T[batch_idx, time_idx])}"
-                    )
-                    images.append(
-                        wandb.Image(
-                            vis_B_T_H_W_C[batch_idx, time_idx],
-                            caption=caption,
-                        )
-                    )
-            if images:
-                vis_log[f"vis/train_foveation/{rgb_key}"] = images
-        return vis_log
 
     def _build_logger(self):
         os.makedirs(self.output_dir, exist_ok=True)
@@ -1012,8 +1050,37 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             raise RuntimeError("LIBERO rollout aggregation failed: " + status[0])
         return env_runner, log
 
+    def _export_foveation_artifact(self):
+        path = self._cfg_get(self.cfg, "foveation_export_path", None)
+        if path is None:
+            return
+        if self.ema_model is None:
+            raise ValueError("DP routing export requires training.use_ema=true")
+        is_tcl = str(self.cfg.task.dataset._target_).endswith(".TCLFoveationDataset")
+        if is_tcl:
+            # Keep legacy identity fields; new TCL consumers use the saved state_normalization contract.
+            state_mean = np.zeros(6, dtype=np.float32)
+            state_std = np.ones(6, dtype=np.float32)
+            task_mapping = self.dataset_metadata.get("task_mapping", {})
+        else:
+            # LiberoFTDataset normalizes states before the policy's identity normalizer.
+            statistics = self.dataset_metadata["statistics"]["obs.ee_states"]
+            state_mean = statistics["mean"][:6]
+            state_std = statistics["std"][:6]
+            task_mapping = None
+        artifact = make_foveation_artifact(
+            self.ema_model, state_mean, state_std,
+            task_mapping=task_mapping,
+            split_metadata=self.dataset_metadata,
+        )
+        path = pathlib.Path(path).expanduser()
+        if not path.is_absolute():
+            path = pathlib.Path(self.output_dir) / path
+        save_foveation_artifact(path, artifact)
+
     def _validation(self, policy, val_dataloader, max_steps: Optional[int]):
         sums: Dict[str, torch.Tensor] = {}
+        view_sums, view_counts = {}, {}
         count = torch.tensor(0.0, device=self.accelerator.device)
         policy.eval()
         with torch.no_grad():
@@ -1022,6 +1089,9 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     break
                 losses = policy.compute_loss(batch)
                 self._globalize_elu_budget(policy, losses)
+                for name, sum_V in losses.get("_view_metric_sums", {}).items():
+                    view_sums[name] = view_sums.get(name, 0) + sum_V.detach().double()
+                    view_counts[name] = view_counts.get(name, 0) + losses["_view_metric_counts"][name].detach().double()
                 for key, value in losses.items():
                     if key.startswith("_") or not torch.is_tensor(value) or value.ndim != 0:
                         continue
@@ -1038,16 +1108,17 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
         )
         denominator = reduced[-1].clamp_min(1.0)
         keys = list(sums.keys())
-        return {
-            f"val/{key}": (reduced[idx] / denominator).item()
-            for idx, key in enumerate(keys)
-        }
+        metrics = {f"val/{key}": (reduced[idx] / denominator).item() for idx, key in enumerate(keys)}
+        view_metrics = self._view_metrics(policy, {"_view_metric_sums": view_sums, "_view_metric_counts": view_counts})
+        metrics.update({f"val/{key}": value for key, value in view_metrics.items()})
+        return metrics
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
         accelerator = self.accelerator
         device = accelerator.device
         resume_payload = None
+        weights_only = cfg.get("pretrained_weights_only", False)
 
         if bool(self._cfg_get(cfg, "training.resume", False)):
             path = self.get_checkpoint_path()
@@ -1060,7 +1131,9 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
 
         dataset_kwargs = {}
         if str(cfg.task.dataset._target_).endswith((".LiberoFTDataset", ".TCLFoveationDataset")):
-            if (resume_payload is not None or self._cfg_get(cfg, "pretrained_ckpt", None)) and self.dataset_metadata is None:
+            requires_metadata = (resume_payload is not None or
+                                 (self._cfg_get(cfg, "pretrained_ckpt", None) and not weights_only))
+            if requires_metadata and self.dataset_metadata is None:
                 raise ValueError("Checkpoint lacks dataset_metadata; cannot recover splits and statistics")
             if (str(cfg.task.dataset._target_).endswith(".LiberoFTDataset")
                     and self._cfg_get(cfg, "task.dataset.split_mode", "legacy") == "two_by_two"
@@ -1083,7 +1156,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 # Persist the effective data seed without changing training randomness.
                 restored_keys = ["seed"]
                 if str(cfg.task.dataset._target_).endswith(".TCLFoveationDataset"):
-                    restored_keys += ["val_ratio", "max_train_episodes"]
+                    restored_keys += [key for key in ("val_ratio", "max_train_episodes")
+                                      if key in self.dataset_metadata]
                 for key in restored_keys:
                     cfg.task.dataset[key] = self.dataset_metadata[key]
                     self.cfg.task.dataset[key] = cfg.task.dataset[key]
@@ -1098,16 +1172,36 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
             self._cfg_get(cfg, "reuse_pretrained_dataset_config", False)
             or self._cfg_get(cfg, "pretrained_ckpt_mode", None) is not None
             or self._cfg_get(cfg, "data_seed_from_ckpt", False)
+            or weights_only
+            or self._cfg_get(cfg, "task.dataset.norm.action", None) == "quantile"
         ):
-            # Hydra saved before preparation; persist the selected file, dataset and effective seed.
+            # Hydra saved before preparation; persist effective data and sampling settings.
             config_path = pathlib.Path(self.output_dir) / ".hydra" / "config.yaml"
             config_path.parent.mkdir(parents=True, exist_ok=True)
             OmegaConf.save(self.cfg, config_path, resolve=True)
+        asset_dir = self._cfg_get(cfg, 'task.dataset.asset_dir', None)
+        if asset_dir is not None:
+            resolved_asset = hydra.utils.to_absolute_path(str(pathlib.Path(asset_dir).expanduser()))
+            cfg.task.dataset.asset_dir = self.cfg.task.dataset.asset_dir = resolved_asset
+            if 'asset_dir' in cfg:
+                cfg.asset_dir = self.cfg.asset_dir = resolved_asset
+            if accelerator.is_main_process:
+                config_path = pathlib.Path(self.output_dir) / '.hydra' / 'config.yaml'
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                OmegaConf.save(self.cfg, config_path, resolve=True)
         dataset: BaseImageDataset = hydra.utils.instantiate(cfg.task.dataset, **dataset_kwargs)
         if hasattr(dataset, "get_dataset_metadata"):
             self.dataset_metadata = dataset.get_dataset_metadata()
-            if self.dataset_metadata["contract"]["n_obs_steps"] != self.model.n_obs_steps:
-                raise ValueError("Dataset pad_before+1 must match policy.n_obs_steps")
+            contract = self.dataset_metadata.get("contract")
+            if contract is None:
+                raise ValueError(
+                    "TCL dataset metadata is missing the required contract. "
+                    "The dataset code and metadata are out of sync for the DP training path; "
+                    "for a Pi0.5 asset, rerun scripts/pi05/prepare_tcl_data.sh to regenerate "
+                    "dataset_metadata.json."
+                )
+            if contract.get("n_obs_steps") != self.model.n_obs_steps:
+                raise ValueError("Dataset contract n_obs_steps must match policy.n_obs_steps")
             if accelerator.is_main_process:
                 metadata_path = pathlib.Path(self.output_dir) / "dataset_metadata.json"
                 metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1143,8 +1237,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 and self.epoch >= self.downstream_finetune_start_epoch
             )
             dataset.set_temporal_pairing(not downstream)
-        # A frozen action path must keep the normalization used by its checkpoint.
-        if resume_payload is None and not self._cfg_get(cfg, "pretrained_ckpt", None):
+        # Weights-only finetuning adopts new scaling; frozen action paths keep checkpoint scaling.
+        if resume_payload is None and (weights_only or not self._cfg_get(cfg, "pretrained_ckpt", None)):
             normalizer = dataset.get_normalizer()
             self.model.set_normalizer(normalizer)
             if self.ema_model is not None:
@@ -1184,10 +1278,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 ema = hydra.utils.instantiate(ema_cfg, model=self.ema_model)
             # Shared frozen encoders already track live state through object identity;
             # trainable encoders own an independent EMA copy and must be updated.
-            if self._share_global_encoder and hasattr(ema, "exclude_prefixes"):
-                ema.exclude_prefixes = tuple(getattr(ema, "exclude_prefixes", ())) + (
-                    self._GLOBAL_MARKER,
-                )
+            if self._shared_encoder_keys and hasattr(ema, "exclude_prefixes"):
+                ema.exclude_prefixes = tuple(getattr(ema, "exclude_prefixes", ())) + self._shared_encoder_prefixes
             ema.optimization_step = int(self.global_step)
             base_ema_exclude_prefixes = tuple(ema.exclude_prefixes)
 
@@ -1232,7 +1324,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                 epoch_losses = []
                 step_log = {"epoch": self.epoch, "global_step": self.global_step}
                 wandb_vis_log = {}
-                budget_stats_2 = torch.zeros(2, device=device, dtype=torch.float64)
+                budget_stats_V_2 = torch.zeros((len(self._unwrap(self.model).rgb_keys), 2), device=device, dtype=torch.float64)
+                sample_count_scalar = torch.zeros((), device=device, dtype=torch.float64)
                 # Each epoch starts a fresh window, including after max_train_steps truncation.
                 accelerator.step = 0
                 for batch_idx, batch in enumerate(
@@ -1256,17 +1349,13 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                         has_budget_stats = "_budget_expected_sum" in losses
                         backward_loss_scalar = raw_loss
                         if has_budget_stats:
-                            observation_count_scalar = losses["_budget_observation_count"]
-                            budget_stats_2[0] += losses["_budget_expected_sum"]
-                            budget_stats_2[1] += observation_count_scalar
-                            # Fixed T/views and windows per sample: weighting by the original
-                            # B also weights observations (2B for temporal). The doubled count
-                            # cancels in reference_count/global_count below, including for
-                            # the pair-mean temporal objective. Count only free routing here.
-                            # Use the nominal batch size to avoid a large summed loss under AMP.
+                            budget_stats_V_2[:, 0] += losses["_budget_expected_sum"]
+                            budget_stats_V_2[:, 1] += losses["_budget_observation_count"]
+                            sample_count_scalar += batch["action"].shape[0]
+                            # Each dataset sample contributes one window or one temporal
+                            # pair, regardless of V. Keep the summed AMP loss near its mean.
                             batch_weight = batch["action"].shape[0] / loader_cfg["batch_size"]
                             backward_loss_scalar = raw_loss * batch_weight
-                            reference_count_scalar = observation_count_scalar / batch_weight
                         if (
                             accelerator.sync_gradients
                             and not self.downstream_finetune_started
@@ -1283,16 +1372,13 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                             if router_grad_stats is not None or has_budget_stats:
                                 accelerator.unscale_gradients(self.optimizer)
                             if has_budget_stats:
-                                # Reduce scalars separately for older Accelerate versions.
-                                global_budget_stats_2 = torch.stack([
-                                    accelerator.reduce(value_scalar, reduction="sum")
-                                    for value_scalar in budget_stats_2
-                                ])
-                                # Undo DDP and Accelerate averaging, then normalize by the
-                                # actual global count (also handles a short final window).
+                                global_budget_stats_V_2 = self._reduce_sum(budget_stats_V_2)
+                                global_sample_count_scalar = accelerator.reduce(sample_count_scalar, reduction="sum")
+                                # B counts dataset samples (pairs for temporal), not cameras.
+                                # Undo DDP/accumulation averaging, including a short final step.
                                 grad_scale_scalar = (
-                                    grad_accum * accelerator.num_processes * reference_count_scalar
-                                    / global_budget_stats_2[1]
+                                    grad_accum * accelerator.num_processes * loader_cfg["batch_size"]
+                                    / global_sample_count_scalar
                                 )
                                 for param in self.model.parameters():
                                     if param.grad is not None:
@@ -1308,11 +1394,13 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                                 if ema is not None:
                                     ema.step(accelerator.unwrap_model(self.model))
                                 if has_budget_stats:
-                                    budget_metrics = self._update_budget_lambda(global_budget_stats_2)
-                            budget_stats_2.zero_()
+                                    budget_metrics = self._update_budget_lambda(global_budget_stats_V_2)
+                            budget_stats_V_2.zero_()
+                            sample_count_scalar.zero_()
                     loss_value = float(raw_loss.detach().item())
                     epoch_losses.append(loss_value)
                     train_metrics = self._scalar_losses(losses)
+                    train_metrics.update(self._view_metrics(self.model, losses))
                     if "temporal_loss" in losses:
                         # Log this forward's unweighted global pair mean, including invalid
                         # pairs in the denominator. Reduce scalars for older Accelerate.
@@ -1395,6 +1483,8 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                                     runner_kwargs = {}
                                     if str(env_runner_cfg._target_).endswith(".TCLFoveationVideoRunner"):
                                         runner_kwargs["dataset"] = val_dataset
+                                        runner_kwargs["log_wandb"] = (wandb_run is not None
+                                            and self._cfg_get(cfg, "logging.mode", "online") != "disabled")
                                     env_runner = hydra.utils.instantiate(
                                         env_runner_cfg, output_dir=self.output_dir, **runner_kwargs)
                                 if hasattr(env_runner, "set_context"):
@@ -1441,10 +1531,11 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                             step_log["sample/topology_div"] = self._topology_diversity(
                                 foveation_outputs, policy_sample.foveation_net.num_bank_patches)
                     if wandb_run is not None:
-                        wandb_vis_log = self._make_foveation_vis_log(
+                        wandb_vis_log = make_foveation_vis_log(
                             policy_sample,
                             foveation_outputs,
-                            vis_rot_image=self.vis_rot_image,
+                            vis_rot_image=(policy_sample.render_image_orientation == "raw"
+                                           if self._is_libero else self.vis_rot_image),
                         )
                     target_action = train_sampling_batch["action"].to(device)
                     metric_action = result["action_pred"]
@@ -1463,6 +1554,7 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                         self._cfg_get(cfg, "checkpoint.save_last_ckpt", True)
                     ):
                         self.save_checkpoint()
+                        self._export_foveation_artifact()
                     if (
                         accelerator.is_main_process
                         and accelerator.num_processes == 1
@@ -1492,6 +1584,10 @@ class TrainFoveationDPTransformerWorkspace(BaseWorkspace):
                     json_logger.log(step_log)
                 self.epoch += 1
                 accelerator.wait_for_everyone()
+
+        if accelerator.is_main_process:
+            self._export_foveation_artifact()
+        accelerator.wait_for_everyone()
 
 
 # Aliases make Hydra target names less brittle while retaining one implementation.

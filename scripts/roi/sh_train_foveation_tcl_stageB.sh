@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Requires new per-camera Stage A weights with the same ordered RGB keys.
+# Paired samples one camera per window/pair; ELU budgets and lambdas are per camera.
 # Stage A EMA -> paired routing with frozen visual/action weights.
 # CUDA_VISIBLE_DEVICES=0,1 PRETRAINED_CKPT=/path/to/stageA/checkpoints/latest.ckpt \
 #   bash scripts/roi/sh_train_foveation_tcl_stageB.sh
@@ -34,13 +36,13 @@ accelerate launch "${LAUNCH_ARGS[@]}" train.py \
   task.dataset.seed="${DATASET_SPLIT_SEED:-42}" \
   data_seed_from_ckpt="${DATA_SEED_FROM_CKPT:-true}" \
   horizon="${HORIZON:-32}" \
-  training.num_epochs="${NUM_EPOCHS:-300}" \
+  training.num_epochs="${NUM_EPOCHS:-900}" \
   training.router_only=true \
   training.budget_lambda_init="${BUDGET_LAMBDA_INIT:-0.0}" \
   training.budget_lambda_lr="${BUDGET_LAMBDA_LR:-0.01}" \
   training.downstream_finetune_start_epoch="${DOWNSTREAM_FINETUNE_START_EPOCH:-null}" \
   training.target_num_patches_start="${TARGET_NUM_PATCHES_START:-0.75}" \
-  training.target_num_patches_decay_epochs="${TARGET_NUM_PATCHES_DECAY_EPOCHS:-200}" \
+  training.target_num_patches_decay_epochs="${TARGET_NUM_PATCHES_DECAY_EPOCHS:-600}" \
   policy.router_loss_type=paired \
   policy.paired_loss_weight="${PAIRED_LOSS_WEIGHT:-1.0}" \
   policy.paired_node_sampling="${PAIRED_NODE_SAMPLING:-reachable}" \

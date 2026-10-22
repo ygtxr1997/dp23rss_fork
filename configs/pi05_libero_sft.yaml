@@ -1,0 +1,123 @@
+defaults:
+  - runner: pi05_libero
+  - _self_
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+_target_: diffusion_policy.workspace.train_pi05_workspace.TrainPi05Workspace
+base_dir: ${oc.env:HOME}/pretrained/pi05/converted_base
+asset_dir: outputs/pi05_data/libero10_seed42
+dataset_root: ${oc.env:HOME}/code/LIBERO-FT/libero/datasets
+resume: null
+pretrained_ckpt: null
+pretrained_ckpt_mode: latest
+foveation_pretrained_path: null
+libero_root: ${oc.env:HOME}/code/LIBERO-FT
+rollout:
+  enabled: true
+  every: 1500
+  first_step: 0  # Extra rollout after this optimizer step; 0 disables it, regular cadence stays unchanged.
+runner:
+  dataset_root: ${dataset_root}
+  hdf5_fns: null  # All prepared training sources; override to evaluate a subset.
+model:
+  render_image_orientation: rot180
+  dtype: bfloat16
+  # Shared dense/Stage A/Stage B configuration. Stage scripts override mode at launch.
+  image_size: 224
+  visual_input_mode: dense
+  foveation_patch_size: 14
+  foveation_num_levels: 3
+  foveation_split_mode: level:2
+  foveation_position_encoding: siglip_multiscale
+  foveation_level_embedding: true
+  foveation_level_adapter: false
+  foveation_patch_level_adapter: false
+  foveation_patch_level_adapter_channels: 64
+  foveation_apt_position_encoding: false
+  foveation_random_seed: 42
+  foveation_router_type: none
+  foveation_global_encoder_type: resnet10
+  foveation_global_feature_dim: 512
+  foveation_global_encoder_resize: null
+  foveation_torch_home: ${oc.env:TORCH_HOME,/home/geyuan/pretrained/torch}
+  foveation_freeze_global_encoder: true
+  foveation_router_layers: 4
+  foveation_router_hidden_dim: 512
+  foveation_router_heads: 8
+  foveation_router_cond_dim: 512
+  foveation_router_temperature: 1.0
+  foveation_random_topology_prob: 0.0
+  foveation_target_num_patches: null
+  foveation_budget_loss_weight: 0.0
+  foveation_budget_loss_type: per_observation_mse
+  foveation_budget_base_cost_weight: 0.01
+  foveation_budget_probability_type: sampled_relaxed
+  foveation_budget_elu_tau: 0.025
+  gradient_checkpointing: true
+  attention_backend: math
+training:
+  stage_b: false
+  seed: 42
+  global_batch: 256
+  micro_batch: 1
+  max_steps: 30000
+  gradient_clip: 1.0
+  log_every: 5
+  diagnose_first_update: true
+  ddp_timeout_seconds: 3600
+  sample_every: 90  # Optimizer steps; 0 disables foveation sampling, dense mode skips it.
+  sample_batch_size: 8  # Maximum images from the first local training microbatch.
+  sample_resample: true  # Resample task windows; keep task routing/noise/time seeds fixed.
+  sample_resolution_advantage: true  # Run with task topology diagnostics on every sample.
+  topology_samples_per_task: 32  # Too large will make training too slow
+  sample_diagnostic_batch_size: 8  # Maximum model forward batch for resolution diagnostics.
+  downstream_finetune_start_step: null
+  target_num_patches_start: null
+  target_num_patches_decay_steps: 600
+  paired_loss_weight: 1.0
+  temporal_loss_weight: 1.0
+  temporal_adaptive: false
+  paired_node_sampling: reachable
+  pairing_seed: ${training.seed}
+  budget_lambda_init: 0.0
+  budget_lambda_lr: 0.01
+optimizer:
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  warmup_steps: 200
+ema_decay: 0.999
+dataloader:
+  num_workers: 2
+validation:
+  every: 1000
+  seed: 1042
+  batch_size: 1
+  max_batches: 32
+checkpoint:
+  monitor: success_rate
+  save_full: false
+  full_every: 1500
+hydra:
+  run:
+    dir: ${oc.env:PI05_OUTPUT_DIR,outputs/pi05_sft/manual}
+  output_subdir: null
+  job:
+    chdir: false
+logging:
+  mode: online
+  project: diffusion_policy_libero
+  entity: null
+  name: null
+  group: null
+  tags: [pi05, sft]
+
+# Raw dataset; policy preprocessing applies this declared contract.
+task:
+  dataset:
+    norm:
+      state: quantile
+      action: quantile
+      force: quantile

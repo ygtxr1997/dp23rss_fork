@@ -1,0 +1,57 @@
+# Dedicated DP source for Pi05: one model, two cameras, all LIBERO-10 tasks.
+defaults:
+  - liberoft_foveation_dp
+  - _self_
+
+foveation_export_path: null  # Relative paths are resolved inside the run directory.
+
+policy:
+  render_image_orientation: rot180
+  router_condition_key: [joint_state, task_id]
+  foveation_net:
+    router_type: node_aligned_fpn
+    global_encoder_type: resnet10
+    global_feature_dim: 512
+    global_encoder_resize: 64
+    router_hidden_dim: 128
+    router_cond_dim: 512
+    router_temperature: 1.0
+    freeze_global_encoder: false
+    freeze_router: false
+
+shape_meta:
+  obs:
+    gripper:
+      shape: [3, 256, 256]
+      type: rgb
+
+task:
+  dataset:
+    split_mode: legacy
+    hdf5_fns:
+      - LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket_demo_wrench.hdf5
+      - LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket_demo_wrench.hdf5
+      - KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo_wrench.hdf5
+      - KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo_wrench.hdf5
+      - LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate_demo_wrench.hdf5
+      - STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_demo_wrench.hdf5
+      - LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate_demo_wrench.hdf5
+      - LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket_demo_wrench.hdf5
+      - KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_demo_wrench.hdf5
+      - KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it_demo_wrench.hdf5
+  env_runner:
+    n_test: 8  # just for quick debug
+    n_envs: 8
+
+dataloader:
+  num_workers: 8
+
+training:
+  reserve_gpu_memory_gb: 0  # Extra fixed GiB per GPU, held outside training computations.
+  use_ema: true
+  router_temperature_start: 1.0
+  router_temperature_end: 1.0
+  router_temperature_schedule: constant
+  val_every: 90
+  sample_every: 90
+

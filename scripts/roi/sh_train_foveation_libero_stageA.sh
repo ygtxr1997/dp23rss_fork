@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Each camera independently samples mode/ratio/tree; window frames share the tree.
 # Weighted Stage A example (keep the other required launch variables):
 # FIX_SPLIT_MODE='["10%level:0","25%level:1","50%level:2","15%random:0.25,0.5,0.75"]' \
 # RANDOM_TOPOLOGY_PROB=0.0 bash scripts/roi/sh_train_foveation_libero_stageA.sh

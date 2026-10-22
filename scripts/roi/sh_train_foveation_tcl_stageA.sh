@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Each camera independently samples mode/ratio/tree; window frames share the tree.
 # Stage A: random/legal trees train the visual encoder and diffusion policy.
 # CUDA_VISIBLE_DEVICES=0,1 DATA_ROOT=/path/to/recordings H5_PATH=/path/to/data.h5 \
 #   bash scripts/roi/sh_train_foveation_tcl_stageA.sh

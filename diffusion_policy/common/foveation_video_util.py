@@ -7,6 +7,56 @@ import cv2
 import numpy as np
 import torch
 
+
+def observation_rgb_to_uint8(images, *, normalized):
+    """Convert Tensor/NumPy RGB: last normalized [B,T,C,H,W] or raw uint8 [B,H,W,C]."""
+    if normalized:
+        images_B_T_C_H_W = images
+        images_B_C_H_W = images_B_T_C_H_W[:, -1]
+        if torch.is_tensor(images_B_C_H_W):
+            images_B_C_H_W = images_B_C_H_W.detach().cpu().numpy()
+        images_B_H_W_C = images_B_C_H_W.transpose(0, 2, 3, 1)
+        # Preserve the renderer's rounding after mapping [-1, 1] to [0, 255].
+        return np.rint(np.clip((images_B_H_W_C + 1) * 127.5, 0, 255)).astype(np.uint8)
+    images_B_H_W_C = images
+    if torch.is_tensor(images_B_H_W_C):
+        images_B_H_W_C = images_B_H_W_C.detach().cpu().numpy()
+    return images_B_H_W_C
+
+
+def make_foveation_video_log(
+        raw_path, tree_path, *, raw_key, tree_key, caption, tree_caption=None):
+    """Build raw/tree W&B videos, sharing the caption unless overridden."""
+    import wandb
+
+    return {
+        raw_key: wandb.Video(str(raw_path), format="mp4", caption=caption),
+        tree_key: wandb.Video(str(tree_path), format="mp4",
+                              caption=caption if tree_caption is None else tree_caption),
+    }
+
+
+def make_foveation_vis_log(policy, foveation_outputs, max_batch=8, vis_rot_image=False):
+    """Build WandB images from each camera's native routing metadata."""
+    import wandb
+
+    vis_log = {}
+    for rgb_key, foveation_out in foveation_outputs.items():
+        vis_B_T_H_W_C = policy.foveation_net.nets[rgb_key].vis_ar_tokens(foveation_out)
+        if vis_rot_image and rgb_key == "image":
+            vis_B_T_H_W_C = np.flip(vis_B_T_H_W_C, axis=(2, 3)).copy()
+        num_patches_B_T = foveation_out["num_patches_B_T"].detach().cpu()
+        images = []
+        for batch_idx in range(min(max_batch, vis_B_T_H_W_C.shape[0])):
+            for time_idx in range(vis_B_T_H_W_C.shape[1]):
+                caption = (f"b={batch_idx}, t={time_idx}, "
+                           f"num_patches={int(num_patches_B_T[batch_idx, time_idx])}")
+                images.append(wandb.Image(vis_B_T_H_W_C[batch_idx, time_idx], caption=caption))
+        if images:
+            vis_log[f"vis/train_foveation/{rgb_key}"] = images
+    return vis_log
+
+
 def draw_patch_history(
         frame_H_W_C, steps_F, counts_F, first_step, last_step, min_patches, max_patches):
     """Overlay a fixed-axis history of the trees displayed so far in this episode."""
@@ -50,12 +100,19 @@ def draw_patch_history(
 
 def render_foveation_episode_video(
         policy, image_keys, frame_count, get_batch, raw_path, tree_path,
-        batch_size=16, fps=20, crf=22, rotate_keys=(), seed=None):
-    """Write videos from get_batch(indices_B) -> (obs, {camera: uint8[B,H,W,3]})."""
+        batch_size=16, fps=20, crf=22, rotate_keys=(), seed=None,
+        raw_rotate_keys=None, tree_rotate_keys=None):
+    """Write raw/tree videos, allowing separate camera rotations for each source."""
     # Import encoding only when writing video; overlay-only consumers do not need it.
     from diffusion_policy.real_world.video_recorder import VideoRecorder
 
     assert frame_count > 0 and batch_size > 0 and fps > 0
+    # ``rotate_keys`` keeps the old API, where raw and tree frames shared a transform.
+    if raw_rotate_keys is None and tree_rotate_keys is None:
+        raw_rotate_keys = tree_rotate_keys = set(rotate_keys)
+    else:
+        raw_rotate_keys = set(() if raw_rotate_keys is None else raw_rotate_keys)
+        tree_rotate_keys = set(() if tree_rotate_keys is None else tree_rotate_keys)
     counts_by_key = {key: np.empty(frame_count, dtype=np.int64) for key in image_keys}
     device = torch.device(policy.device)
     rng_devices = [device] if device.type == "cuda" else []
@@ -84,25 +141,28 @@ def render_foveation_episode_video(
         for start in range(0, frame_count, batch_size):
             indices_B = np.arange(start, min(start + batch_size, frame_count))
             obs, raw_by_key = get_batch(indices_B)
-            obs = {key: value_B_T_X.to(device=device) for key, value_B_T_X in obs.items()}
+            # Keep language prompts as Python strings; only tensors belong on the model device.
+            obs = {key: (value_B_T_X.to(device=device) if torch.is_tensor(value_B_T_X) else value_B_T_X)
+                   for key, value_B_T_X in obs.items()}
             outputs = policy.get_foveation_outputs(obs)
             visualizations = {}
             for key in image_keys:
                 last = {name: value_B_T_X[:, -1:] for name, value_B_T_X in outputs[key].items()}
-                visualizations[key] = policy.foveation_net.vis_ar_tokens(last)[:, 0]
+                visualizations[key] = policy.foveation_net.nets[key].vis_ar_tokens(last)[:, 0]
                 counts_by_key[key][indices_B] = last["num_patches_B_T"][:, 0].cpu().numpy()
             for offset, index in enumerate(indices_B):
                 raw_views, tree_views = [], []
                 for key in image_keys:
                     raw_H_W_C = raw_by_key[key][offset].copy()
                     tree_H_W_C = visualizations[key][offset].copy()
-                    if key in rotate_keys:
+                    if key in raw_rotate_keys:
                         raw_H_W_C = np.flip(raw_H_W_C, axis=(0, 1)).copy()
+                    if key in tree_rotate_keys:
                         tree_H_W_C = np.flip(tree_H_W_C, axis=(0, 1)).copy()
                     tree_H_W_C = draw_patch_history(
                         tree_H_W_C, np.arange(index + 1), counts_by_key[key][:index + 1],
-                        0, frame_count - 1, policy.foveation_net.min_num_patches,
-                        policy.foveation_net.max_num_patches)
+                        0, frame_count - 1, policy.foveation_net.nets[key].min_num_patches,
+                        policy.foveation_net.nets[key].max_num_patches)
                     raw_views.append(raw_H_W_C)
                     tree_views.append(tree_H_W_C)
                 recorders[0].write_frame(np.concatenate(raw_views, axis=1))

@@ -7,7 +7,6 @@ horizon: 32
 n_obs_steps: 1
 n_action_steps: 8
 obs_as_cond: true
-vis_rot_image: true  # rotate LIBERO image visualizations for readability
 
 checkpoint:
   save_last_ckpt: true
@@ -55,6 +54,7 @@ optimizer:
   obs_encoder_weight_decay: 0.01
 
 policy:
+  render_image_orientation: raw
   _target_: diffusion_policy.policy.foveation_dp_transformer_policy.FoveationTransformerHybridImagePolicy
   shape_meta: ${shape_meta}
   horizon: ${horizon}
@@ -97,6 +97,7 @@ policy:
   visual_encoder_dropout: 0.0
   position_encoding_types: [apt_interpolated, level_embedding]
   patch_embedding_type: conv
+  # Single-camera template; policy creates independent routing/visual modules per RGB key.
   foveation_net:
     _target_: diffusion_policy.model.roi.foveation_net.FoveationNet
     in_channels: 3
@@ -121,7 +122,8 @@ policy:
     # Random legal trees are also used during evaluation.
     # Uniform leaves: "level:1". Weighted window sampling (also during eval):
     # ["20%level:0", "25%level:1", "35%level:2", "20%random:0.25,0.5,0.75"]
-    # Weights sum to 100%; views/frames share the mode. Requires random_topology_prob=0.
+    # Weights sum to 100%; requires random_topology_prob=0.
+    # Each view samples independently; frames within a window share its tree.
     fix_split_mode: "random:0.0,0.25,0.5,0.75,1.0"
     random_topology_prob: 0.0
     budget_loss_weight: 0.0
@@ -154,6 +156,10 @@ shape_meta: &shape_meta
 
 task:
   dataset:
+    norm:
+      state: mean_std
+      action: minmax
+      force: quantile
     _target_: diffusion_policy.dataset.libero_dataset.LiberoFTDataset
     shape_meta: ${shape_meta}
     horizon: ${horizon}
@@ -205,7 +211,6 @@ task:
     fps: 20
     crf: 22
     foveation_vis_batch_size: 16
-    vis_rot_image: ${vis_rot_image}
     n_test: 50  # Episodes per task; four tasks give 200 episodes per rollout.
     n_envs: 16
     auto_render_device: true  # Match EGL to the policy's physical GPU unless explicitly overridden.
@@ -237,7 +242,7 @@ training:
   downstream_finetune_start_epoch: null
   target_num_patches_start: null
   target_num_patches_decay_epochs: 400
-  budget_lambda_init: 0.0
+  budget_lambda_init: 0.0  # Same initial price, independently updated per camera.
   budget_lambda_lr: 0.01
   rollout_every: 100
   distributed_rollout: true  # Rendering automatically follows each rank's policy GPU.

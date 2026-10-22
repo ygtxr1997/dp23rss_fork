@@ -1,0 +1,15 @@
+# User-maintained TCL task mapping.  Keep task_id stable across runs.
+ tasks:
+   - task_id: 0
+     task_dir: 1014_lh_tower_three_blocks
+   - task_id: 1
+     task_dir: 260514_ethernet
+   - task_id: 2
+     task_dir: 1014_insert_two_batteries
+   - task_id: 3
+     task_dir: 0417_brush_reversed
+
+# Example:
+# tasks:
+#   - task_id: 0
+#     task_dir: 1014_lh_tower_three_block

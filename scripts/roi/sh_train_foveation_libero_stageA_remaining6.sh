@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Each camera independently samples mode/ratio/tree; window frames share the tree.
 # Train the remaining six LIBERO-10 tasks sequentially, one task per Stage A run.
 # Example: bash scripts/roi/sh_train_foveation_libero_stageA_remaining6.sh
 # Environment variables override defaults; trailing Hydra arguments reach every run.
@@ -9,8 +10,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,2,3,1}"
 # Keep 15% mixed trees, with continuous ratios covering low-budget transitions.
 #export FIX_SPLIT_MODE="${FIX_SPLIT_MODE:-[\"100%level:0\"]}"
-#export FIX_SPLIT_MODE="${FIX_SPLIT_MODE:-[\"40%level:2\",\"60%random:0.05-0.99\"]}"
-export FIX_SPLIT_MODE="${FIX_SPLIT_MODE:-[\"80%level:2\",\"20%random:0.05-0.99\"]}"
+export FIX_SPLIT_MODE="${FIX_SPLIT_MODE:-[\"40%level:2\",\"60%random:0.05-0.99\"]}"
+#export FIX_SPLIT_MODE="${FIX_SPLIT_MODE:-[\"80%level:2\",\"20%random:0.05-0.99\"]}"
 export HORIZON="${HORIZON:-10}"
 export SEED="${SEED:-42}"
 export VIS_ENC_LAYERS="${VIS_ENC_LAYERS:-4}"

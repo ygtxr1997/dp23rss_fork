@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -52,12 +52,12 @@ class ResNetHelper(nn.Module):
     def _reshape_frames(
         self,
         x_B_C_T_H_W: torch.Tensor,
-        spatial_divisor: int,
+        spatial_divisor: Optional[int],
     ) -> Tuple[torch.Tensor, int, int]:
         B, C, T, H, W = x_B_C_T_H_W.shape
         if C != 3:
             raise ValueError("ResNetHelper expects three-channel RGB input.")
-        if H % spatial_divisor != 0 or W % spatial_divisor != 0:
+        if spatial_divisor is not None and (H % spatial_divisor != 0 or W % spatial_divisor != 0):
             raise ValueError(
                 "ResNet input height and width must be divisible by "
                 f"{spatial_divisor}."
@@ -116,7 +116,9 @@ class ResNetHelper(nn.Module):
         """Return per-frame spatial tokens with shape (B, T, N, D)."""
         x_BT_C_H_W, B, T = self._reshape_frames(
             x_B_C_T_H_W,
-            spatial_divisor=32,
+            # Pooled routing only needs a valid convolutional feature map;
+            # unlike the node-aligned FPN it does not require a fixed grid.
+            spatial_divisor=None,
         )
         stages = self._forward_backbone_stages(x_BT_C_H_W)
         # Keep layer4 spatial structure so the pooled router receives image tokens.

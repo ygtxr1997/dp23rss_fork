@@ -146,7 +146,7 @@ def _load_source(args):
     if weights == "ema":
         # Frozen shared encoders are saved only once, in the live model state.
         for name, weight_X in payload["state_dicts"]["model"].items():
-            if name.startswith("foveation_net.global_encoder."):
+            if name.startswith("foveation_net.nets.") and ".global_encoder." in name:
                 state.setdefault(name, weight_X)
     return cfg, state, {
         "config": "checkpoint:cfg", "checkpoint": str(checkpoint.resolve()), "weights": weights,
@@ -337,13 +337,17 @@ class _CudaTimings:
     def __enter__(self):
         try:
             self._wrap(self.policy, "predict_action", "predict_action")
-            self._wrap(self.policy.obs_encoder, "forward", "visual_encoder")
+            encoders = (self.policy.obs_encoders.values() if hasattr(self.policy, "obs_encoders")
+                        else [self.policy.obs_encoder])
+            for encoder in encoders:
+                self._wrap(encoder, "forward", "visual_encoder")
             self._wrap(self.policy.model, "forward", "denoiser_step")
             self._wrap(self.policy.noise_scheduler, "step", "scheduler_step")
-            net = getattr(self.policy, "foveation_net", None)
-            if net is not None:
+            group = getattr(self.policy, "foveation_net", None)
+            for net in (() if group is None else group.nets.values()):
                 self._wrap(net, "forward", "foveation")
-                self._wrap(net.router, "forward", "router")
+                if net.router is not None:
+                    self._wrap(net.router, "forward", "router")
                 # FPN calls forward_stages directly, bypassing encoder.forward hooks.
                 for method in ("_encode_global_images", "_encode_global_stages", "_encode_quadtree_features"):
                     self._wrap(net, method, "global_encoder")
@@ -545,8 +549,8 @@ def main() -> None:
             current_cfg.foveation_net.fix_split_mode = None if args.include_router else f"random:{ratio}"
         policy = _make_policy(current_cfg, state, args, device)
         if ratio is not None:
-            _install_fixed_random_topology(policy.foveation_net, ratio, args.batch_size,
-                                           device, args.include_router)
+            for net in policy.foveation_net.nets.values():
+                _install_fixed_random_topology(net, ratio, args.batch_size, device, args.include_router)
         current_metadata = {
             **metadata, "ratio": "" if ratio is None else ratio,
             "inference_steps": policy.num_inference_steps,

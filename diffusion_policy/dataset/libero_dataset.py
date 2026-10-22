@@ -1,5 +1,8 @@
 import os
 import copy
+import hashlib
+import json
+from pathlib import Path
 from omegaconf import OmegaConf
 import numpy as np
 import torch
@@ -9,7 +12,8 @@ import torch.nn.functional as F
 
 from robokit.datasets.libero.libero_force import LiberoH5FrameDataset, MergeDataset
 
-from diffusion_policy.common.libero_task_util import LIBERO_TASK_NAMES, libero_task_id
+from diffusion_policy.common.libero_task_util import LIBERO_TASK_NAMES, libero_task_id, libero_task_language
+from diffusion_policy.common.tcl_data_util import norm_methods
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
 
@@ -128,8 +132,25 @@ class LiberoFTDataset(BaseImageDataset):
         transform_color_jitter=True, load_future_obs=False, zero_force=False,
         transform_resize_crop=True, random_shift_pad=4, wrist_dropout_prob=0.3,
         dataset_metadata=None, split="train", split_mode="legacy", split_stage="a",
+        output_mode="normalized", asset_dir=None, pairing_seed=42, temporal_pairing=False, norm=None,
     ):
         super().__init__()
+        expected_norm = dict(state='mean_std', action='minmax', force=norm_force_type)
+        if output_mode == 'raw':
+            expected_norm = dict(state='quantile', action='quantile', force='quantile')
+        if norm_methods(norm, expected_norm) != norm_methods(None, expected_norm):
+            raise ValueError('LIBERO norm configuration must match its existing normalization algorithms')
+        self.output_mode = str(output_mode)
+        if self.output_mode not in ("normalized", "raw"):
+            raise ValueError("LiberoFTDataset output_mode must be normalized or raw")
+        if self.output_mode == "raw":
+            self._init_raw(
+                dataset_root=dataset_root, dataset_subname=dataset_subname,
+                hdf5_fns=hdf5_fns, horizon=horizon, dataset_metadata=dataset_metadata,
+                asset_dir=asset_dir, split=split, pairing_seed=pairing_seed,
+                temporal_pairing=temporal_pairing,
+            )
+            return
         shape_meta = (OmegaConf.to_container(shape_meta, resolve=True)
                       if OmegaConf.is_config(shape_meta) else copy.deepcopy(shape_meta))
         self.shape_meta = shape_meta
@@ -155,6 +176,7 @@ class LiberoFTDataset(BaseImageDataset):
             transform_color_jitter=transform_color_jitter,
             transform_resize_crop=transform_resize_crop, random_shift_pad=random_shift_pad,
             wrist_dropout_prob=wrist_dropout_prob,
+            output_mode="normalized",
         )
         subnames = ([dataset_subname] * len(hdf5_fns)
                     if isinstance(dataset_subname, str) else list(dataset_subname))
@@ -299,21 +321,91 @@ class LiberoFTDataset(BaseImageDataset):
         print(f"[LiberoFTDataset] split={split}, episodes={len(metadata[split])}, "
               f"windows={len(self)}, sources={sources}")
 
+    def _init_raw(self, *, dataset_root, dataset_subname, hdf5_fns, horizon,
+                  dataset_metadata, asset_dir, split, pairing_seed, temporal_pairing):
+        """Initialize the raw observation contract used by Pi0.5."""
+        if dataset_metadata is None:
+            if asset_dir is None:
+                raise ValueError("raw LIBERO mode requires asset_dir or dataset_metadata")
+            assets = Path(asset_dir).expanduser().resolve()
+            dataset_metadata = json.loads((assets / "dataset_metadata.json").read_text())
+            stats_bytes = (assets / "norm_stats.json").read_bytes()
+            if hashlib.sha256(stats_bytes).hexdigest() != dataset_metadata["norm_stats_sha256"]:
+                raise ValueError("Normalization asset differs from LIBERO dataset metadata")
+        metadata = copy.deepcopy(dataset_metadata)
+        if split not in ("train", "val") or metadata.get("version") != 1:
+            raise ValueError("Unsupported raw LIBERO dataset metadata")
+        root = Path(dataset_root).expanduser().resolve()
+        configured_sources = None if hdf5_fns is None else {
+            str((Path(dataset_subname) / filename).as_posix()) for filename in hdf5_fns
+        }
+        sources = metadata["sources"]
+        if configured_sources is not None and set(sources) != configured_sources:
+            raise ValueError("LIBERO sources differ from prepared raw dataset metadata")
+        self.dataset_root = str(root)
+        self.dataset_metadata = metadata
+        self.split = split
+        self.temporal_pairing_enabled = bool(temporal_pairing and split == "train")
+        self.temporal_pairing_seed = int(pairing_seed)
+        self.temporal_pairing_epoch = 0
+        self.readers, self.prompts, self.reader_task_ids = [], [], []
+        for source in sources:
+            demo_keys = [key for origin, key in metadata[split] if origin == source]
+            if not demo_keys:
+                continue
+            reader = LiberoH5FrameDataset(str(root / source), demo_keys=demo_keys)
+            expected = metadata["source_info"][source]
+            if any(length != expected["episode_lengths"][key]
+                   for key, length in zip(reader.demo_keys, reader.demo_lengths)):
+                raise ValueError(f"Episode lengths changed since preparation: {source}")
+            self.readers.append(reader)
+            self.prompts.append(expected["prompt"])
+            self.reader_task_ids.append(libero_task_id(expected["task_name"]))
+        if not self.readers:
+            raise ValueError(f"Empty raw LIBERO {split} split")
+        self.merge_dataset = MergeDataset(
+            self.readers, n_obs=1, chunk_size=int(horizon),
+            obs_keys=["agentview_rgb", "eye_in_hand_rgb", "ee_states", "gripper_states"],
+            state_keys=[], load_future_obs=False, drop_cross_demo=False,
+        )
+        self._ends_R = np.cumsum([len(reader) for reader in self.readers])
+        self._episode_ranges = []
+        global_start = 0
+        for reader in self.readers:
+            for length in reader.demo_lengths:
+                length = int(length)
+                self._episode_ranges.append((global_start, global_start + length))
+                global_start += length
+        self._episode_starts = np.asarray([start for start, _ in self._episode_ranges], dtype=np.int64)
+        self._episode_ends = np.asarray([end for _, end in self._episode_ranges], dtype=np.int64)
+        self._raw_init_kwargs = dict(
+            dataset_root=str(root), dataset_subname=dataset_subname,
+            hdf5_fns=hdf5_fns, horizon=horizon, asset_dir=asset_dir,
+            output_mode="raw",
+        )
+        for reader in self.readers:
+            reader.close()
+
     def get_dataset_metadata(self):
         """Return the exact split, preprocessing contract and training statistics."""
+        if self.output_mode == "raw":
+            return copy.deepcopy(self.dataset_metadata)
         return copy.deepcopy(self.dataset_metadata)
 
     def get_validation_dataset(self):
-        """Build held-out windows without fitting statistics or applying augmentation."""
+        """Build a validation view without refitting statistics."""
+        if self.output_mode == "raw":
+            return type(self)(**self._raw_init_kwargs,
+                              dataset_metadata=self.dataset_metadata, split="val")
         return self.create_val_dataset(self)
 
-    @classmethod
-    def create_val_dataset(cls, instance):
-        """Reuse a training dataset's saved split and statistics."""
-        return cls(**instance._init_kwargs, dataset_metadata=instance.dataset_metadata, split="val")
-
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
-        """Dataset and socket adapter own scaling; the policy normalizer is identity."""
+        if self.output_mode == "raw":
+            del kwargs
+            normalizer = LinearNormalizer()
+            for key in ("image", "gripper", "joint_state", "action"):
+                normalizer[key] = EmptyNormalizer.create_identity()
+            return normalizer
         normalizer = LinearNormalizer()
         for key in (*self.shape_meta["obs"], "action"):
             normalizer[key] = EmptyNormalizer.create_identity()
@@ -322,37 +414,108 @@ class LiberoFTDataset(BaseImageDataset):
     def __len__(self):
         return len(self.merge_dataset)
 
-    def set_temporal_pairing(self, enabled: bool) -> None:
-        """Toggle episode-local pairing; prepare ranges before starting workers."""
-        if enabled and self._temporal_ranges_E_2 is None:
-            ranges = []
-            for offset, reader in zip(self.merge_dataset.prefix, self.merge_dataset.datasets):
-                for start, length in zip(reader.prefix, reader.demo_lengths):
-                    start = offset + start
-                    end = min(start + length, len(self))
-                    if start < end:
-                        ranges.append((start, end))
-            # File-local demo ranges remain distinct; max_len limits both A and B.
-            self._temporal_ranges_E_2 = np.asarray(ranges, dtype=np.int64).reshape(-1, 2)
-        self._temporal_pairing_scalar.fill_(enabled)
+    def set_temporal_pairing(self, enabled: bool, seed=None, epoch=None) -> None:
+        """Toggle episode-local pairing for normalized or raw LIBERO windows."""
+        if self.output_mode != "raw":
+            if enabled and self._temporal_ranges_E_2 is None:
+                ranges = []
+                for offset, reader in zip(self.merge_dataset.prefix, self.merge_dataset.datasets):
+                    for start, length in zip(reader.prefix, reader.demo_lengths):
+                        start = offset + start
+                        end = min(start + length, len(self))
+                        if start < end:
+                            ranges.append((start, end))
+                self._temporal_ranges_E_2 = np.asarray(ranges, dtype=np.int64).reshape(-1, 2)
+            self._temporal_pairing_scalar.fill_(enabled)
+            return
+        self.temporal_pairing_enabled = bool(enabled and self.split == "train")
+        if seed is not None:
+            self.temporal_pairing_seed = int(seed)
+        if epoch is not None:
+            self.temporal_pairing_epoch = int(epoch)
+
+    def set_pairing_epoch(self, epoch: int):
+        """Set the deterministic epoch component for raw temporal pairing."""
+        if self.output_mode == "raw":
+            self.temporal_pairing_epoch = int(epoch)
+
+    def get_pairing_state(self):
+        """Return pairing settings for raw LIBERO checkpoint metadata."""
+        if self.output_mode == "raw":
+            return dict(enabled=self.temporal_pairing_enabled, seed=self.temporal_pairing_seed,
+                        epoch=self.temporal_pairing_epoch, split=self.split,
+                        episode_ranges=list(self._episode_ranges))
+        return dict(enabled=bool(self._temporal_pairing_scalar), split=self.split)
+
+    def _raw_format_sample(self, sample, index):
+        """Convert one MergeDataset window to raw Pi0.5 observations."""
+        obs = sample["history"]["obs"]
+        reader_index = int(np.searchsorted(self._ends_R, index, side="right"))
+        state_D = np.concatenate((obs["ee_states"][0], obs["gripper_states"][0])).astype(np.float32)
+        return dict(obs=dict(image=obs["agentview_rgb"][0], gripper=obs["eye_in_hand_rgb"][0],
+                             joint_state=state_D, prompt=self.prompts[reader_index]),
+                    action=sample["action"].astype(np.float32),
+                    task_id=np.int64(self.reader_task_ids[reader_index]))
 
     def __getitem__(self, idx):
-        data = self._get_single_window(idx)
-        if bool(self._temporal_pairing_scalar):
-            episode = int(np.searchsorted(self._temporal_ranges_E_2[:, 1], idx, side="right"))
-            start, end = map(int, self._temporal_ranges_E_2[episode])
-            pair_valid = end - start > 1
-            if pair_valid:
-                # Uniformly skip A without rejection sampling or resetting worker RNG.
-                pair_idx = start + np.random.randint(end - start - 1)
-                pair_idx += pair_idx >= idx
-                pair_data = self._get_single_window(pair_idx)
-            else:
-                # Reuse augmented A as a placeholder, before adding nested pair fields.
-                pair_data = dict(data)
-            data["temporal_pair"] = pair_data
-            data["temporal_pair_valid"] = torch.tensor(pair_valid, dtype=torch.bool)
-        return data
+        if self.output_mode != "raw":
+            data = self._get_single_window(idx)
+            if bool(self._temporal_pairing_scalar):
+                episode = int(np.searchsorted(self._temporal_ranges_E_2[:, 1], idx, side="right"))
+                start, end = map(int, self._temporal_ranges_E_2[episode])
+                valid = end - start > 1
+                pair_idx = start + np.random.randint(end - start - 1) if valid else idx
+                pair_idx += int(valid and pair_idx >= idx)
+                data["temporal_pair"] = self._get_single_window(pair_idx if valid else idx)
+                data["temporal_pair_valid"] = torch.tensor(valid, dtype=torch.bool)
+            return data
+        index = int(idx)
+        sample = self._raw_format_sample(self.merge_dataset[index], index)
+        if not self.temporal_pairing_enabled:
+            return sample
+        episode = int(np.searchsorted(self._episode_ends, index, side="right"))
+        start, end = map(int, self._episode_ranges[episode])
+        valid = end - start > 1
+        if valid:
+            seed_words = [self.temporal_pairing_seed & 0xffffffff,
+                          self.temporal_pairing_epoch & 0xffffffff, index & 0xffffffff]
+            rng = np.random.default_rng(np.random.SeedSequence(seed_words))
+            offset = int(rng.integers(end - start - 1))
+            pair_index = start + offset + int(offset >= index - start)
+            pair = self._raw_format_sample(self.merge_dataset[pair_index], pair_index)
+        else:
+            pair = copy.deepcopy(sample)
+        sample["temporal_pair"] = pair
+        sample["temporal_pair_valid"] = torch.tensor(valid, dtype=torch.bool)
+        return sample
+
+    def close(self):
+        """Close raw LIBERO readers before worker recreation."""
+        for reader in getattr(self, "readers", []):
+            reader.close()
+
+    def iter_task_diagnostic_batches(self, samples_per_task: int, seed: int):
+        """Yield deterministic task-local raw batches."""
+        if self.output_mode != "raw":
+            yield from self._old_iter_task_diagnostic_batches(samples_per_task, seed)
+            return
+        if samples_per_task < 2:
+            raise ValueError("topology_samples_per_task must be at least 2")
+        ranges_by_task = {}
+        for start, reader, task_id in zip(self.merge_dataset.prefix, self.merge_dataset.datasets,
+                                          self.reader_task_ids):
+            end = min(start + len(reader), len(self))
+            ranges_by_task.setdefault(int(task_id), []).append((start, end))
+        for task_id, ranges in sorted(ranges_by_task.items()):
+            candidates = [index for start, end in ranges for index in range(start, end)]
+            rng = np.random.RandomState(seed + task_id)
+            indices = rng.choice(candidates, min(samples_per_task, len(candidates)), replace=False)
+            yield task_id, default_collate([self[int(index)] for index in indices])
+
+    @classmethod
+    def create_val_dataset(cls, instance):
+        """Reuse a training dataset's saved split and statistics."""
+        return cls(**instance._init_kwargs, dataset_metadata=instance.dataset_metadata, split="val")
 
     def _get_single_window(self, idx):
         data = self._sample_to_data(self.merge_dataset[idx])
@@ -365,7 +528,7 @@ class LiberoFTDataset(BaseImageDataset):
             data["obs"]["task_id"] = task_T_C
         return data
 
-    def iter_task_diagnostic_batches(self, samples_per_task: int, seed: int):
+    def _old_iter_task_diagnostic_batches(self, samples_per_task: int, seed: int):
         """Yield fixed task-local batches without Temporal pairing or RNG side effects."""
         if samples_per_task < 2:
             raise ValueError("topology_samples_per_task must be at least 2")
